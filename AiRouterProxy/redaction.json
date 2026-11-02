@@ -1,0 +1,16 @@
+{
+  "Proxy": {
+    "Redaction": {
+      "enabled": true,
+      "mask": "••••••",
+      "notifyInResponse": true,
+      "warnTemplate": "",
+      "detect": {
+        "byFieldName": true,
+        "byFormats": true,
+        "byKeyValueContext": true,
+        "byLongStrings": true
+      }
+    }
+  }
+}
