@@ -1,0 +1,32 @@
+{
+  "Proxy": {
+    "Routes": [
+      {
+        "name": "airouter",
+        "prefix": "",
+        "upstream": "https://api.airrouter.ch",
+        "keyRef": "",
+        "allowedPaths": [
+          "/v1/models",
+          "/v1/chat/completions",
+          "/v1/completions",
+          "/v1/embeddings",
+          "/v1/audio/transcriptions",
+          "/v1/audio/speech",
+          "/v1/audio/voices"
+        ],
+        "requestTimeoutMs": 300000
+      },
+      {
+        "name": "openrouter",
+        "prefix": "/openrouter",
+        "upstream": "https://openrouter.ai/api",
+        "keyRef": "OPENROUTER",
+        "allowedPaths": [
+          "/v1/*"
+        ],
+        "requestTimeoutMs": 300000
+      }
+    ]
+  }
+}

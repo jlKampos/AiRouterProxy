@@ -55,3 +55,36 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# ============================================================
+# AIRouterProxy - security (never version secrets/certs)
+# ============================================================
+
+# Real key config (only the .example.json is versioned)
+**/appsettings.Server.json
+**/appsettings.Production.json
+**/appsettings.{Environment}.json
+
+# Proxy TLS certificates
+**/proxy-cert.pem
+**/proxy-key.pem
+**/*.pfx
+**/*.p12
+**/*.pem
+**/*.key
+**/*.crt
+
+# Generated local keys
+**/LOCAL_KEY.txt
+
+# Config preserved across redeploys (temporary backups)
+**/*.prev
+**/*.bak
+
+# Local deploy (contains the real appsettings.Server.json + certs) - stays out of the repo
+deploy/
+publish-tmp/
+
+# Logs
+*.log
+deploy-update.log
