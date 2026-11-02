@@ -427,9 +427,6 @@ powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir "C:\Omni
    sc.exe start AIRouterProxy
    Get-NetTCPConnection -LocalPort 4000 -State Listen       # should show listening
    ```
-5. **Delete the old folder only after** the new service is Running and responding:
-   ```powershell
-   Remove-Item -Recurse -Force "C:\Omni\AIRouterProxy"
-   ```
+   
 
 > The service runs under LocalSystem; the new deploy path must be readable by it (a plain user folder is fine).
