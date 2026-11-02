@@ -23,6 +23,9 @@ public static class SecretRedactor
     private const string KindLongString = "suspicious_key";
     private const int LongStringMinLength = 28;
 
+    /// <summary>A masked preview of a single detected value, used in the response notice.</summary>
+    public sealed record RedactionPreview(string Kind, string Preview);
+
     public sealed class RedactionStats
     {
         public int FieldRedactions { get; internal set; }
@@ -31,6 +34,9 @@ public static class SecretRedactor
         public int LongStringRedactions { get; internal set; }
         public int Total => FieldRedactions + FormatRedactions + ContextRedactions + LongStringRedactions;
         public Dictionary<string, int> ByKind { get; } = new(StringComparer.Ordinal);
+
+        /// <summary>Masked previews of detected values (never the full value). Capped.</summary>
+        public List<RedactionPreview> Previews { get; } = new();
     }
 
     public sealed class Result
@@ -134,6 +140,38 @@ public static class SecretRedactor
         "suspicious_key" => "suspicious key",
         _ => kind,
     };
+
+    private const int PreviewMax = 6;
+    private const int PreviewPrefixLength = 4;
+
+    /// <summary>Masks a detected value into a short preview (first N chars + "…").</summary>
+    private static void AddPreview(RedactionStats stats, string kind, string? value)
+    {
+        if (stats.Previews.Count >= PreviewMax || string.IsNullOrEmpty(value))
+        {
+            return;
+        }
+
+        var prefix = value.Length <= PreviewPrefixLength ? value : value[..PreviewPrefixLength];
+        stats.Previews.Add(new RedactionPreview(kind, prefix + "\u2026"));
+    }
+
+    /// <summary>Formats the previews for the response notice (e.g. `sk-4C…` (OpenAI key)).</summary>
+    public static string FormatPreviews(IReadOnlyList<RedactionPreview>? previews)
+    {
+        if (previews is null || previews.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string>(previews.Count);
+        foreach (var preview in previews)
+        {
+            parts.Add($"`{preview.Preview}` ({Humanize(preview.Kind)})");
+        }
+
+        return string.Join(", ", parts);
+    }
 
     // ------------------------------------------------------------------
     // Layer 1 — FIELD NAME (JSON properties)
@@ -404,6 +442,7 @@ public static class SecretRedactor
                     var kind = FieldKind(parentName);
                     stats.FieldRedactions++;
                     stats.ByKind[kind] = stats.ByKind.TryGetValue(kind, out var count) ? count + 1 : 1;
+                    AddPreview(stats, kind, text);
                 }
                 else
                 {
@@ -459,6 +498,8 @@ public static class SecretRedactor
             current = pattern.Regex.Replace(current, m =>
             {
                 matches++;
+                var sample = pattern.PrefixGroup is null ? m.Value : m.Groups[2].Value;
+                AddPreview(stats, pattern.Kind, sample);
                 return pattern.PrefixGroup is null
                     ? mask
                     : m.Groups[pattern.PrefixGroup].Value + mask;
@@ -489,6 +530,7 @@ public static class SecretRedactor
 
             var start = value.Index - m.Index;
             matches++;
+            AddPreview(stats, KindKeyValue, value.Value);
             return m.Value[..start] + mask + m.Value[(start + value.Length)..];
         });
 
@@ -513,6 +555,7 @@ public static class SecretRedactor
             }
 
             matches++;
+            AddPreview(stats, KindLongString, m.Value);
             return mask;
         });
 

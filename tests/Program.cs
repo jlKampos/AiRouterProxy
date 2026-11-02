@@ -28,6 +28,7 @@ class Program
         TestSummarize();
         TestNotices();
         TestExtendedDetection();
+        TestPreviews();
         TestRouting();
         Console.WriteLine();
         Console.WriteLine($"RESULT: {_passed} PASS, {_failed} FAIL");
@@ -304,6 +305,50 @@ class Program
         var c1 = SecretRedactor.RedactJson(Bytes("{\"c\":\"api_key=\\\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\\\"\"}"));
         CheckTrue("context+long not duplicated", () => c1.Changed && c1.Stats.ByKind.GetValueOrDefault("key_in_text") == 1
             && c1.Stats.ByKind.GetValueOrDefault("suspicious_key") == 0);
+    }
+
+    // --------------------------------------------------------------
+    static void TestPreviews()
+    {
+        // Format detection collects a masked preview, never the full value
+        var r1 = SecretRedactor.RedactJson(Bytes("{\"content\":\"use sk-abcdefghijklmnop123 x\"}"));
+        CheckTrue("preview format masked", () => r1.Stats.Previews.Count == 1
+            && r1.Stats.Previews[0].Kind == "openai"
+            && r1.Stats.Previews[0].Preview == "sk-a\u2026"
+            && !r1.Stats.Previews[0].Preview.Contains("abcdefghijklmnop123"));
+
+        // Field-name detection preview
+        var r2 = SecretRedactor.RedactJson(Bytes("{\"password\":\"supersecret123\"}"));
+        CheckTrue("preview field masked", () => r2.Stats.Previews.Count == 1
+            && r2.Stats.Previews[0].Kind == "password"
+            && r2.Stats.Previews[0].Preview == "supe\u2026");
+
+        // key=value context preview
+        var r3 = SecretRedactor.RedactJson(Bytes("{\"c\":\"use LOCAL_KEY=abcdefgh1234 and continue\"}"));
+        CheckTrue("preview context masked", () => r3.Stats.Previews.Count == 1
+            && r3.Stats.Previews[0].Kind == "key_in_text"
+            && r3.Stats.Previews[0].Preview == "abcd\u2026");
+
+        // Long-string preview (layer still works when enabled)
+        var r4 = SecretRedactor.RedactJson(Bytes("{\"c\":\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\"}"));
+        CheckTrue("preview longString masked", () => r4.Stats.Previews.Count == 1
+            && r4.Stats.Previews[0].Kind == "suspicious_key"
+            && r4.Stats.Previews[0].Preview == "4v_w\u2026");
+
+        // Long strings disabled -> no detection, no preview (current default config)
+        var r5 = SecretRedactor.RedactJson(Bytes("{\"c\":\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\"}"), detectByLongStrings: false);
+        CheckTrue("preview longString off none", () => !r5.Changed && r5.Stats.Previews.Count == 0);
+
+        // Previews capped at 6 even with many detections
+        var builder = new StringBuilder();
+        for (var i = 0; i < 9; i++) { builder.Append("sk-key").Append(i + 1).Append("abcdefghijklmnopqrs "); }
+        var many = builder.ToString().TrimEnd();
+        var r6 = SecretRedactor.RedactJson(Bytes("{\"c\":\"" + many + "\"}"));
+        CheckTrue("previews capped at 6", () => r6.Stats.Total == 9 && r6.Stats.Previews.Count == 6);
+
+        // FormatPreviews renders readable text
+        var text = SecretRedactor.FormatPreviews(r1.Stats.Previews);
+        CheckTrue("FormatPreviews text", () => text.Contains("sk-a\u2026") && text.Contains("OpenAI key"));
     }
 
     // --------------------------------------------------------------

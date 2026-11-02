@@ -1,7 +1,47 @@
 # AiRouterProxy
 
-Local HTTPS proxy for the AI Router (api.airrouter.ch) with a **multi-upstream router**: a per-path
+Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
+
+## Why: a security layer for development environments
+
+AiRouterProxy exists to **enforce that secrets never leave the machine** to AI model providers -
+in both **personal and corporate development environments**. It is a local HTTPS guardrail that
+sits between your AI coding agent and the model provider.
+
+### Defense in depth
+
+A safe agent setup has three layers:
+
+1. **Instructions** - `AGENTS.md` / `CLAUDE.md` tell the agent not to read secret files.
+2. **Client-side blocking** - permissions/hooks deny reading `appsettings.*.json`, `.env`,
+   `*.pem`, etc.
+3. **Edge filter (this proxy)** - the last line of defense. It inspects every outgoing request
+   and masks sensitive content before it is forwarded, catching what slips past the first two
+   layers: a key pasted in free text, a secret in a code block, a config pasted into a prompt.
+
+The proxy is **provider-agnostic**: it works with any OpenAI-compatible upstream, so it fits
+corporate policies that require EU-resident / zero-data-retention gateways.
+
+### What it masks
+
+- by **field name** (`api_key`, `password`, `token`, ...),
+- by **known format** (`sk-...`, `ghp_`, `AIza`, `JWT`, `Bearer`, PEM private keys, ...),
+- by **`key=value` / `"key": "value"` context**,
+- and optionally by **long high-entropy tokens** (configurable).
+
+The mask is a fixed 6-character string (it never reveals the real length), and the JSON structure
+is never changed.
+
+### In action
+
+The agent gets a visible notice when a request was censored:
+
+![Proxy notice when a request contained censored content](images/proxy_guardrails.png)
+
+And the model only ever sees the masked value - never the real secret:
+
+![The request as it reaches the model, sensitive value masked](images/proxy_guardrails_II.png)
 
 ## Stack
 
@@ -206,35 +246,130 @@ then restart the service. The trusted CA stays valid.
 
 ## Using from OpenCode (opencode.json)
 
-Local clients send the proxy's **LocalKey** (Bearer); the proxy authenticates the request with it and
-injects the correct upstream key per route. Configure two providers pointing at the local proxy:
+Local clients talk to the proxy with the **LocalKey** (Bearer); the proxy authenticates the request and
+injects the correct upstream key per route. The `apiKey` in the client config MUST be the proxy's
+**LocalKey** (`LOCAL_KEY.txt`, also `Proxy:Keys:LocalKey` in `appsettings.Server.json`) - **never** the
+upstream OpenRouter key, which only exists server-side (as `Proxy:RouteKeys:OPENROUTER`) and never goes
+into a client config.
+
+### OpenRouter route - working example
+
+Use a **custom provider ID** such as `openrouter-local`, not the reserved `openrouter` ID: the custom ID
+forces the agent to honor the proxy `baseURL` and keeps the model list limited to what you define (the
+reserved ID merges the whole models.dev catalog and may ignore `baseURL`).
 
 ```jsonc
 {
-  "provider": {
-    "airouter-local": {
-      "name": "airouter-local",
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "https://localhost:4000/v1",          // default route -> aiRouter
-        "apiKey": "sk-...your-LocalKey..."               // the proxy's LOCAL key, not the upstream one
-      },
-      "models": { /* same model list as a direct aiRouter provider */ }
-    },
+  "$schema": "https://opencode.ai/config.json",
+  "model": "openrouter-local/v4-flash",
+  "providers": {
     "openrouter-local": {
-      "name": "openrouter-local",
-      "npm": "@ai-sdk/openai-compatible",
-      "options": {
-        "baseURL": "https://localhost:4000/openrouter/v1", // /openrouter route -> OpenRouter
-        "apiKey": "sk-...your-LocalKey..."
+      "name": "OpenRouter via proxy",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "https://localhost:4000/openrouter/v1",
+        "apiKey": "sk-...your-LocalKey..."               // proxy LOCAL key, NOT the OpenRouter key
       },
-      "models": { /* the OpenRouter models you want */ }
+      "models": {
+        "v4-flash": {
+          "modelID": "deepseek/deepseek-v4-flash-0731",  // OpenRouter model slug sent upstream
+          "name": "DeepSeek V4 Flash 0731"
+        }
+      }
     }
   }
 }
 ```
 
-Then use them as `airouter-local/Model-Id` or `openrouter-local/Model-Id`.
+- `apiKey`: the proxy's **LocalKey** - never the OpenRouter key.
+- `baseURL`: the `/openrouter` route (prefix is stripped before forwarding).
+- `modelID`: the OpenRouter model slug; requests reach `.../openrouter/v1/chat/completions` with it.
+- Pin routing with a provider/model `body`, e.g.
+  `"body": { "provider": { "order": ["DeepInfra"], "allow_fallbacks": false } }`.
+- Use the model as `openrouter-local/v4-flash`.
+
+### aiRouter route - example config
+
+Separate provider for the default route (`/v1` -> aiRouter). This is the provider block used in the
+working setup (legacy `provider`/`npm`/`options` form; the schema accepts both this and the V2 form
+shown above for OpenRouter):
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "airouter/DeepSeek-V4-Flash",
+  "provider": {
+    "airouter": {
+      "name": "airouter-proxy",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://localhost:4000/v1",
+        "apiKey": "sk-...your-LocalKey..."               // proxy LOCAL key, NOT the upstream key
+      },
+      "models": {
+        "Qwen3.8": {
+          "name": "Qwen3.8 (local)",
+          "variants": {
+            "none":    { "reasoningEffort": "none" },
+            "low":     { "reasoningEffort": "low" },
+            "medium":  { "reasoningEffort": "medium" },
+            "xhigh":   { "reasoningEffort": "xhigh" }
+          },
+          "limit": {
+            "context": 262144,
+            "input": 196608,
+            "output": 65536
+          },
+          "modalities": {
+            "input":  ["text", "image"],
+            "output": ["text"]
+          },
+          "reasoning": true,
+          "tool_call": true,
+          "options": {
+            "reasoningEffort": "xhigh",
+            "temperature": 0.6,
+            "topP": 0.95,
+            "topK": 20,
+            "minP": 0.0,
+            "presencePenalty": 0.0,
+            "repetitionPenalty": 1.0
+          }
+        },
+        "DeepSeek-V4-Flash": {
+          "name": "DeepSeek-V4-Flash (local)",
+          "variants": {
+            "none":     { "reasoningEffort": "none" },
+            "minimal":  { "reasoningEffort": "minimal" },
+            "low":      { "reasoningEffort": "low" },
+            "medium":   { "reasoningEffort": "medium" },
+            "high":     { "reasoningEffort": "high" },
+            "xhigh":    { "reasoningEffort": "xhigh" }
+          },
+          "limit": {
+            "context": 262144,
+            "input": 229376,
+            "output": 32768
+          },
+          "modalities": {
+            "input":  ["text", "image"],
+            "output": ["text"]
+          },
+          "reasoning": true,
+          "tool_call": true,
+          "options": {
+            "reasoningEffort": "xhigh",
+            "textVerbosity": "low",
+            "reasoningSummary": "auto"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Use the models as `airouter/Qwen3.8` or `airouter/DeepSeek-V4-Flash`.
 
 ### Troubleshooting
 

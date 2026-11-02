@@ -45,6 +45,7 @@ public sealed class ProxyMiddleware
         var authRefused = false;
         var redactionCount = 0;
         var redactionKinds = string.Empty;
+        List<SecretRedactor.RedactionPreview>? redactionPreviews = null;
         string? routeName = null;
 
         try
@@ -251,6 +252,7 @@ public sealed class ProxyMiddleware
                 forwardedBody = redacted.Data;
                 redactionCount = redacted.Stats.Total;
                 redactionKinds = SecretRedactor.Summarize(redacted.Stats);
+                redactionPreviews = redacted.Stats.Previews;
 
                 if (options.Verbose)
                 {
@@ -332,7 +334,7 @@ public sealed class ProxyMiddleware
                     || mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
                 {
                     var fullBody = await upstreamResponse.Content.ReadAsByteArrayAsync(context.RequestAborted);
-                    var notice = BuildRedactionNotice(redactionCount, redactionKinds, options.Redaction);
+                    var notice = BuildRedactionNotice(redactionCount, redactionKinds, options.Redaction, redactionPreviews);
                     var injected = NoticeInjector.Inject(fullBody, mediaType, notice);
                     await context.Response.Body.WriteAsync(injected ?? fullBody, context.RequestAborted);
                 }
@@ -452,13 +454,15 @@ public sealed class ProxyMiddleware
         return buffer.ToArray();
     }
 
-    private static string BuildRedactionNotice(int count, string kinds, RedactionOptions opts)
+    private static string BuildRedactionNotice(int count, string kinds, RedactionOptions opts,
+        IReadOnlyList<SecretRedactor.RedactionPreview>? previews)
     {
         if (!string.IsNullOrWhiteSpace(opts.WarnTemplate))
         {
             return opts.WarnTemplate
                 .Replace("{Count}", count.ToString(), StringComparison.Ordinal)
-                .Replace("{Kinds}", kinds, StringComparison.Ordinal);
+                .Replace("{Kinds}", kinds, StringComparison.Ordinal)
+                .Replace("{Previews}", SecretRedactor.FormatPreviews(previews), StringComparison.Ordinal);
         }
 
         var what = count == 1
@@ -468,6 +472,12 @@ public sealed class ProxyMiddleware
         if (!string.IsNullOrWhiteSpace(kinds))
         {
             what += $" ({kinds})";
+        }
+
+        var previewText = SecretRedactor.FormatPreviews(previews);
+        if (!string.IsNullOrWhiteSpace(previewText))
+        {
+            what += $". Detected values: {previewText}";
         }
 
         return $"⚠️ **Proxy notice:** the request contained sensitive content which was redacted before being sent to the AI Router ({what}).";

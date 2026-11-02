@@ -9,7 +9,7 @@
         "byFieldName": true,
         "byFormats": true,
         "byKeyValueContext": true,
-        "byLongStrings": true
+        "byLongStrings": false
       }
     }
   }
