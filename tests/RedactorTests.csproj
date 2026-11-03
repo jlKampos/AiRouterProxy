@@ -19,7 +19,10 @@
     <Compile Include="..\AiRouterProxy\SecretDetector.cs" Link="SecretDetector.cs" />
     <Compile Include="..\AiRouterProxy\SecurityHelpers.cs" Link="SecurityHelpers.cs" />
     <Compile Include="..\AiRouterProxy\AuthenticationPolicy.cs" Link="AuthenticationPolicy.cs" />
-    <Compile Include="..\AiRouterProxy\RateLimiter.cs" Link="RateLimiter.cs" />  
+    <Compile Include="..\AiRouterProxy\RateLimiter.cs" Link="RateLimiter.cs" />
+    <Compile Include="..\AiRouterProxy\SseEvent.cs" Link="SseEvent.cs" />
+    <Compile Include="..\AiRouterProxy\SseParser.cs" Link="SseParser.cs" />
+    <Compile Include="..\AiRouterProxy\SseStreamProcessor.cs" Link="SseStreamProcessor.cs" />  
   </ItemGroup>
 
 </Project>

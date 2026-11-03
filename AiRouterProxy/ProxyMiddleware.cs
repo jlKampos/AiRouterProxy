@@ -398,8 +398,16 @@ public sealed class ProxyMiddleware
             if (redactionCount > 0 && options.Redaction.NotifyInResponse)
             {
                 var mediaType = contentType ?? string.Empty;
-                if (mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase)
-                    || mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
+
+                if (mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Incremental SSE: the notice is streamed in just before "[DONE]" without
+                    // buffering the response body (only the current event is held back).
+                    var notice = BuildRedactionNotice(redactionCount, redactionKinds, options.Redaction, redactionPreviews);
+                    await using var sseStream = await upstreamResponse.Content.ReadAsStreamAsync(context.RequestAborted);
+                    await SseStreamProcessor.ProcessAsync(sseStream, context.Response.Body, notice, context.RequestAborted);
+                }
+                else if (mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
                 {
                     var fullBody = await upstreamResponse.Content.ReadAsByteArrayAsync(context.RequestAborted);
                     var notice = BuildRedactionNotice(redactionCount, redactionKinds, options.Redaction, redactionPreviews);

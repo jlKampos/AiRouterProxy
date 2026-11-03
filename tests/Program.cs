@@ -32,6 +32,8 @@ class Program
         TestDetector();
         TestAuthenticationPolicy();
         TestRateLimiter();
+        TestSseParser();
+        TestSseProcessor();
         TestRouting();
         TestInspectionPolicy();
         Console.WriteLine();
@@ -494,6 +496,142 @@ class Program
         var noticeSource = SecretRedactor.RedactJson(Bytes("{\"content\":\"key sk-abcdefghijklmnop123 x\"}"));
         var notice = SecretRedactor.FormatPreviews(noticeSource.Stats.Previews);
         CheckTrue("notice leaks no content", () => notice.Contains("OpenAI key") && !notice.Contains("sk-"));
+    }
+
+    // --------------------------------------------------------------
+    // Incremental SSE parser + streaming processor (Sprint 4)
+    // --------------------------------------------------------------
+    static List<SseEvent> ParseSse(string raw, int chunkSize)
+    {
+        var parser = new SseParser();
+        var all = new List<SseEvent>();
+        var bytes = Encoding.UTF8.GetBytes(raw);
+
+        for (var i = 0; i < bytes.Length; i += chunkSize)
+        {
+            var count = Math.Min(chunkSize, bytes.Length - i);
+            all.AddRange(parser.Feed(bytes.AsSpan(i, count)));
+        }
+
+        var final = parser.EndOfStream();
+        if (final is not null)
+        {
+            all.Add(final);
+        }
+
+        return all;
+    }
+
+    static void TestSseParser()
+    {
+        var sse = "data: hello\n\ndata: world\n\n";
+        var whole = ParseSse(sse, 100);
+        CheckTrue("sse two events", () => whole.Count == 2
+            && whole[0].Data == "hello" && whole[1].Data == "world"
+            && whole[0].StartOffset == 0 && whole[0].EndOffset == 13
+            && whole[1].StartOffset == 13 && whole[1].EndOffset == 26);
+
+        var chunked = ParseSse(sse, 1);
+        CheckTrue("sse chunked 1B identical", () => chunked.Count == whole.Count
+            && chunked.Select(e => e.Data).SequenceEqual(whole.Select(e => e.Data)));
+
+        var crlf = ParseSse("data: a\r\n\r\n", 100);
+        CheckTrue("sse CRLF", () => crlf.Count == 1 && crlf[0].Data == "a");
+
+        var multi = ParseSse("data: a\ndata: b\n\n", 100);
+        CheckTrue("sse multi-line data", () => multi.Count == 1 && multi[0].Data == "a\nb");
+
+        var named = ParseSse("event: ping\ndata: payload\n\n", 100);
+        CheckTrue("sse event name", () => named.Count == 1 && named[0].EventName == "ping" && named[0].Data == "payload");
+
+        var fields = ParseSse("id: 42\nretry: 3000\ndata: z\n\n", 100);
+        CheckTrue("sse id/retry", () => fields.Count == 1 && fields[0].Id == "42" && fields[0].Retry == 3000);
+
+        CheckTrue("sse comments no event", () => ParseSse(": keep-alive\n\n", 100).Count == 0);
+        CheckTrue("sse empty input", () => ParseSse("", 100).Count == 0);
+
+        var done = ParseSse("data: [DONE]\n\n", 100);
+        CheckTrue("sse done", () => done.Count == 1 && done[0].IsDone && done[0].Data == "[DONE]");
+
+        var doneNoBlank = ParseSse("data: [DONE]", 100);
+        CheckTrue("sse done at EOF no blank", () => doneNoBlank.Count == 1 && doneNoBlank[0].IsDone);
+
+        var partial = ParseSse("data: hi", 100);
+        CheckTrue("sse partial at EOF", () => partial.Count == 1 && partial[0].Data == "hi" && !partial[0].IsDone);
+
+        CheckTrue("sse cut at every boundary", () =>
+        {
+            const string tricky = "data: [DONE]\n\n";
+            for (var size = 1; size <= tricky.Length; size++)
+            {
+                var evts = ParseSse(tricky, size);
+                if (evts.Count != 1 || !evts[0].IsDone || evts[0].EndOffset != tricky.Length)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        CheckTrue("sse unicode split", () =>
+        {
+            const string emoji = "data: olá 👋\ndata: fim\n\n";
+            var evts = ParseSse(emoji, 3); // splits mid-multibyte on purpose
+            return evts.Count == 1 && evts[0].Data == "olá 👋\nfim";
+        });
+    }
+
+    static async Task<string> ProcessSseAsync(string input, string notice, int chunk = 1 << 20)
+    {
+        using var source = new MemoryStream(Encoding.UTF8.GetBytes(input));
+        using var result = new MemoryStream();
+        await SseStreamProcessor.ProcessAsync(source, result, notice, CancellationToken.None, chunk);
+        return Encoding.UTF8.GetString(result.ToArray());
+    }
+
+    static void TestSseProcessor()
+    {
+        const string chat = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        var outp = ProcessSseAsync(chat, "⚠️ notice").GetAwaiter().GetResult();
+
+        CheckTrue("proc notice before done", () =>
+        {
+            var idx = outp.IndexOf("⚠️ notice", StringComparison.Ordinal);
+            var done = outp.IndexOf("data: [DONE]", StringComparison.Ordinal);
+            return idx >= 0 && idx < done && outp.EndsWith("data: [DONE]\n\n");
+        });
+
+        CheckTrue("proc notice chunk valid JSON", () =>
+        {
+            var lastData = outp.LastIndexOf("data: {", StringComparison.Ordinal);
+            var chunk = outp[(lastData + 6)..];
+            chunk = chunk[..chunk.IndexOf("\n\n", StringComparison.Ordinal)];
+            return JsonNode.Parse(chunk) is JsonObject o && o["choices"] is JsonArray;
+        });
+
+        var small = ProcessSseAsync(chat, "⚠️ notice", 4).GetAwaiter().GetResult();
+        CheckTrue("proc chunking identical", () => small == outp);
+
+        const string noDone = "data: {}\n\n";
+        var nd = ProcessSseAsync(noDone, "XX").GetAwaiter().GetResult();
+        CheckTrue("proc append when no done", () => nd.StartsWith(noDone) && nd.IndexOf("XX") > nd.IndexOf("data: {}"));
+        CheckTrue("proc append exact format", () => nd == noDone + "\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n\\nXX\"}}]}\n\n");
+
+        const string resp = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"oi\"}\n\ndata: [DONE]\n\n";
+        var ro = ProcessSseAsync(resp, "R").GetAwaiter().GetResult();
+        CheckTrue("proc responses event", () => ro.Contains("event: response.output_text.delta\ndata: ")
+            && ro.IndexOf("R") < ro.IndexOf("data: [DONE]")
+            && ro.EndsWith("data: [DONE]\n\n"));
+
+        const string anth = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\ndata: [DONE]\n\n";
+        var ao = ProcessSseAsync(anth, "A").GetAwaiter().GetResult();
+        CheckTrue("proc anthropic event", () => ao.Contains("event: content_block_delta\ndata: ")
+            && ao.IndexOf("A") < ao.IndexOf("data: [DONE]"));
+
+        const string raw = "data: 1\n\ndata: 2\n\n";
+        var pt = ProcessSseAsync(raw, string.Empty).GetAwaiter().GetResult();
+        CheckTrue("proc passthrough identical", () => pt == raw);
     }
 
     // --------------------------------------------------------------
