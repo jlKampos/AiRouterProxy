@@ -252,15 +252,76 @@ injects the correct upstream key per route. The `apiKey` in the client config MU
 upstream OpenRouter key, which only exists server-side (as `Proxy:RouteKeys:OPENROUTER`) and never goes
 into a client config.
 
-### OpenRouter route - working example
+### OpenRouter route - working example (full OpenCode config)
 
 Use a **custom provider ID** such as `openrouter-local`, not the reserved `openrouter` ID: the custom ID
 forces the agent to honor the proxy `baseURL` and keeps the model list limited to what you define (the
 reserved ID merges the whole models.dev catalog and may ignore `baseURL`).
 
+The example below is a complete `opencode.json` for this setup: the `watcher` ignore list and the
+`permissions` block are the **client-side layer** of the defense in depth, and the `providers` block
+sends OpenRouter traffic through the proxy.
+
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
+  "watcher": {
+    "ignore": [
+      "**/appsettings.json",
+      "**/appsettings.*.json",
+      "**/secrets.json",
+      "**/.microsoft/usersecrets/**",
+      "**/.env",
+      "**/.env.*",
+      "**/google-services.json",
+      "**/GoogleService-Info.plist",
+      "**/firebase-config.json",
+      "**/firebase-secrets.json",
+      "**/firebase*.json",
+      "**/*cloud_services_config.json",
+      "cloud_services_config.json",
+      "**/*.keystore",
+      "**/*.jks",
+      "**/*.p12",
+      "**/*.pfx",
+      "**/*.pem",
+      "**/*.key",
+      "**/*.crt",
+      "**/*.cer",
+      "**/bin/**",
+      "**/obj/**",
+      "**/.vs/**",
+      "**/.vscode/**",
+      "**/publish/**",
+      "**/*.suo",
+      "**/*.user",
+      "**/*.userprefs",
+      "**/logs/**",
+      "**/*.log",
+      "**/*.db",
+      "**/*.sqlite",
+      "**/*.sqlite3",
+      "**/Properties/PublishProfiles/**",
+      "**/AndroidManifest.xml",
+      "**/Platforms/Android/google-services.json",
+      "**/node_modules/**",
+      "**/.git/**",
+      "**/.idea/**"
+    ]
+  },
+  "permissions": [
+    { "action": "read",  "resource": "**/appsettings*.json",                      "effect": "deny" },
+    { "action": "read",  "resource": "**/{secrets.json,credentials.json}",        "effect": "deny" },
+    { "action": "read",  "resource": "**/.env*",                                  "effect": "deny" },
+    { "action": "read",  "resource": "**/*.{pem,key,crt,cer,p12,pfx,jks,keystore}","effect": "deny" },
+    { "action": "read",  "resource": "**/connectionstrings.config",               "effect": "deny" },
+    { "action": "read",  "resource": "**/{bin,obj,node_modules,logs,Logs}/**",     "effect": "deny" },
+    { "action": "edit",  "resource": "**/*.Designer.cs",                          "effect": "deny" },
+    { "action": "edit",  "resource": "**/*.resx",                                 "effect": "deny" },
+    { "action": "shell", "resource": "git push *",                                "effect": "deny" },
+    { "action": "shell", "resource": "git fetch *",                               "effect": "deny" },
+    { "action": "shell", "resource": "*{sqlcmd,sqlplus,sql,sqsh,psql}*",           "effect": "deny" }
+  ],
   "model": "openrouter-local/v4-flash",
   "providers": {
     "openrouter-local": {
@@ -287,6 +348,28 @@ reserved ID merges the whole models.dev catalog and may ignore `baseURL`).
 - Pin routing with a provider/model `body`, e.g.
   `"body": { "provider": { "order": ["DeepInfra"], "allow_fallbacks": false } }`.
 - Use the model as `openrouter-local/v4-flash`.
+
+#### What `watcher.ignore` and `permissions` do
+
+These two blocks are the **client-side guardrail** (layer 2 of the defense in depth). They do not
+replace the proxy - they stop secret files from being read, edited or sent in the first place.
+
+- **`watcher.ignore`** - a glob list of files and folders the agent's file watcher/snapshot should never
+  index. `**/appsettings.*.json`, `**/*.pem`, `**/.env*`, etc. are excluded from context, so the agent
+  does not even see these paths as readable content.
+- **`permissions`** - hard deny rules the agent must ask for (or is blocked from) before any action:
+  - **read** deny for `appsettings*.json`, `{secrets.json,credentials.json}`, `.env*`,
+    `*.{pem,key,crt,cer,p12,pfx,jks,keystore}`, `connectionstrings.config`, `bin/obj/node_modules/logs`;
+  - **edit** deny for `*.Designer.cs` and `*.resx` (generated/designer files, not for the agent to change);
+  - **shell** deny for `git push`, `git fetch` (no remote changes from the agent) and for SQL clients
+    (`sqlcmd`, `sqlplus`, `psql`, ...) so the agent never touches a database.
+
+If the agent tries any of these, the request is refused - nothing is read, nothing is sent. The proxy
+remains the last layer in case a secret still sneaks into a prompt.
+
+A denied read shows the agent a clear "access denied" notice - the file content is never touched:
+
+![Access to secret files blocked by permissions](images/opencode_file_permissions.png)
 
 ### aiRouter route - example config
 
@@ -388,19 +471,32 @@ dotnet run --project tests/RedactorTests.csproj
 
 ## Deploy (installed service)
 
+The service runs as a Windows Service (`AIRouterProxy`) whose executable is deployed to a service
+folder. The recommended layout puts it under `C:\Services` (outside any repo), e.g.
+`C:\Services\AiRouterProxy\`. Config, certs, `routes.json` and `redaction.json` live next to the exe.
+
 ### Regular update of an existing service
 
 ```powershell
 dotnet publish AiRouterProxy/AIRouterProxy.csproj -c Release -r win-x64 --self-contained true -o publish-tmp
 # elevated (UAC); deploys to the project's deploy/ folder by default (override with -DeployDir)
 powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1
-# existing install elsewhere:
-powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir "C:\Omni\AIRouterProxy\deploy"
+# installed service under C:\Services:
+powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir "C:\Services\AiRouterProxy"
 ```
 
 `deploy-update.ps1` preserves config/certs on the destination and restarts the service (when installed as a Windows Service).
 
-### Moving the deployed service to a new folder (e.g. from C:\Omni to the repo)
+### Moving the deployed service to a new folder (generic)
+
+These steps move an existing install from one folder to another (e.g. from the repo's `deploy/` or an
+old location to a fresh layout under `C:\Services`). Define `$From` (old) and `$To` (new) once and use
+them in every step - adjust only those two values.
+
+```powershell
+$From = "C:\Path\To\Old\AiRouterProxy"   # old install folder
+$To   = "C:\Services\AiRouterProxy"      # new install folder
+```
 
 1. **Stop the old service** (elevated):
    ```powershell
@@ -409,24 +505,28 @@ powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir "C:\Omni
 2. **Build and deploy into the new folder** (from the repo root):
    ```powershell
    dotnet publish AiRouterProxy/AIRouterProxy.csproj -c Release -r win-x64 --self-contained true -o publish-tmp
-   powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1
+   powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir $To
    ```
-   The publish does not include secrets. Copy them manually once into `deploy/`:
+   The publish does not include secrets. Copy them manually once into the new folder:
    ```powershell
-   Copy-Item "C:\Omni\AIRouterProxy\deploy\appsettings.Server.json" deploy\
-   Copy-Item "C:\Omni\AIRouterProxy\deploy\proxy-cert.pem" deploy\
-   Copy-Item "C:\Omni\AIRouterProxy\deploy\proxy-key.pem" deploy\
+   Copy-Item "$From\appsettings.Server.json" $To\
+   Copy-Item "$From\proxy-cert.pem"          $To\
+   Copy-Item "$From\proxy-key.pem"           $To\
    ```
    (`deploy-update.ps1` preserves these files on future updates, so you only do this once.)
 3. **Point the Windows Service at the new path** (elevated):
    ```powershell
-   sc.exe config AIRouterProxy binPath= "C:\Users\jlkampos\Documents\GitHub\AiRouterProxy\deploy\AIRouterProxy.exe"
+   sc.exe config AIRouterProxy binPath= "$To\AIRouterProxy.exe"
    ```
 4. **Start and verify** (elevated):
    ```powershell
    sc.exe start AIRouterProxy
    Get-NetTCPConnection -LocalPort 4000 -State Listen       # should show listening
    ```
-   
+5. **Delete the old folder only after** the new service is Running and responding - and only after also
+   removing the old `appsettings.Server.json` reference from any other consumer:
+   ```powershell
+   Remove-Item -Recurse -Force $From
+   ```
 
-> The service runs under LocalSystem; the new deploy path must be readable by it (a plain user folder is fine).
+> The service runs under LocalSystem; the new deploy path must be readable by it (a plain user folder under `C:\Services` is fine).
