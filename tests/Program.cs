@@ -29,6 +29,7 @@ class Program
         TestNotices();
         TestExtendedDetection();
         TestRedactionGaps();
+        TestConfigPaths();
         TestPreviews();
         TestDetector();
         TestAuthenticationPolicy();
@@ -376,6 +377,38 @@ class Program
             && !Str(g7.Data).Contains("ctest-")
             && g7.Stats.ByKind.GetValueOrDefault("key_in_text") == 1
             && g7.Stats.ByKind.GetValueOrDefault("suspicious_key") == 0);
+    }
+
+    // --------------------------------------------------------------
+    static void TestConfigPaths()
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), "airproxy-cfgtest-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(tmp);
+
+            // No config/ folder -> the base dir itself is used (legacy/dev layout)
+            CheckTrue("cfg falls back to base", () => ConfigPaths.ResolveConfigDir(tmp) == tmp);
+
+            // config/ present -> it wins (deploy layout)
+            var cfg = Path.Combine(tmp, "config");
+            Directory.CreateDirectory(cfg);
+            CheckTrue("cfg detected", () => ConfigPaths.ResolveConfigDir(tmp) == cfg);
+
+            // Relative config file names resolve under the config folder
+            CheckTrue("cfg relative file", () => ConfigPaths.ResolveFile("redaction.json", cfg) == Path.Combine(cfg, "redaction.json"));
+
+            // Absolute paths are returned untouched
+            var abs = Path.Combine(tmp, "other", "cert.pem");
+            CheckTrue("cfg absolute untouched", () => ConfigPaths.ResolveFile(abs, cfg) == abs);
+
+            // "../" escapes back to the deploy root (one level above config)
+            CheckTrue("cfg ../ escapes to root", () => ConfigPaths.ResolveFile("..\\proxy-cert.pem", cfg) == Path.Combine(tmp, "proxy-cert.pem"));
+        }
+        finally
+        {
+            try { Directory.Delete(tmp, recursive: true); } catch { }
+        }
     }
 
     // --------------------------------------------------------------

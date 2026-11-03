@@ -7,10 +7,13 @@ using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi;
 
+var baseDir = AppContext.BaseDirectory;
+var configDir = ConfigPaths.ResolveConfigDir(baseDir);
+
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
     Args = args,
-    ContentRootPath = AppContext.BaseDirectory,
+    ContentRootPath = configDir,
 });
 
 // Server-specific config (keys/certificates) - lives only on the target machine.
@@ -79,7 +82,7 @@ if (string.IsNullOrWhiteSpace(proxyOptions.Keys.UpstreamKey)
 
 ValidateRoutes(proxyOptions);
 
-var certificate = LoadServerCertificate(proxyOptions);
+var certificate = LoadServerCertificate(proxyOptions, configDir);
 
 builder.WebHost.ConfigureKestrel(kestrel =>
 {
@@ -403,14 +406,13 @@ static void ValidateRoutes(ProxyOptions options)
     }
 }
 
-static X509Certificate2 LoadServerCertificate(ProxyOptions options)
+static X509Certificate2 LoadServerCertificate(ProxyOptions options, string configDir)
 {
     var cert = options.Cert;
-    var baseDir = AppContext.BaseDirectory;
 
     if (!string.IsNullOrWhiteSpace(cert.PfxPath))
     {
-        var pfx = Path.GetFullPath(cert.PfxPath, baseDir);
+        var pfx = ConfigPaths.ResolveFile(cert.PfxPath, configDir);
 
         if (!File.Exists(pfx))
         {
@@ -422,8 +424,8 @@ static X509Certificate2 LoadServerCertificate(ProxyOptions options)
             : X509CertificateLoader.LoadPkcs12FromFile(pfx, cert.PfxPassword.AsSpan());
     }
 
-    var certPem = Path.GetFullPath(cert.PemCert ?? "proxy-cert.pem", baseDir);
-    var keyPem = Path.GetFullPath(cert.PemKey ?? "proxy-key.pem", baseDir);
+    var certPem = ConfigPaths.ResolveFile(cert.PemCert ?? "proxy-cert.pem", configDir);
+    var keyPem = ConfigPaths.ResolveFile(cert.PemKey ?? "proxy-key.pem", configDir);
 
     if (!File.Exists(certPem))
     {
