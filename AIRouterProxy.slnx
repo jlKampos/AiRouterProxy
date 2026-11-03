@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="AiRouterProxy/AIRouterProxy.csproj" />
+  <Project Path="tests/Integration/Integration.csproj" />
+  <Project Path="tests/RedactorTests.csproj" />
+</Solution>

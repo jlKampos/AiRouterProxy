@@ -18,6 +18,17 @@ public sealed class ProxyOptions
     public RedactionOptions Redaction { get; set; } = new();
 
     /// <summary>
+    /// Fail-closed body inspection policy: decides what to do with each Content-Type
+    /// before anything is forwarded (see <see cref="InspectionOptions"/>).
+    /// </summary>
+    public InspectionOptions Inspection { get; set; } = new();
+
+    /// <summary>
+    /// Per-client rate limiting and brute-force protection (see <see cref="RateLimitOptions"/>).
+    /// </summary>
+    public RateLimitOptions RateLimit { get; set; } = new();
+
+    /// <summary>
     /// Route table (Item 2). If empty, the proxy works as before:
     /// 1 fixed upstream (<see cref="Upstream"/>) + <see cref="AllowedPaths"/>.
     /// </summary>
@@ -90,6 +101,38 @@ public sealed class RedactionOptions
     public DetectOptions Detect { get; set; } = new();
 }
 
+/// <summary>
+/// Fail-closed inspection of request bodies. "Security must fail closed": an uninspected
+/// request is never forwarded, regardless of format, parse errors or size.
+/// </summary>
+public sealed class InspectionOptions
+{
+    /// <summary>Master switch for body inspection (default: on).</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Action for Content-Types not present in <see cref="ByContentType"/>.
+    /// Default: "block" (415) - fail closed.
+    /// </summary>
+    public string DefaultAction { get; set; } = "block";
+
+    /// <summary>
+    /// Handling of a JSON body that does not parse: "block" (400, default) or "warn".
+    /// "warn" forwards the body anyway (opt-in escape hatch - do not use without review).
+    /// </summary>
+    public string InvalidJson { get; set; } = "block";
+
+    /// <summary>
+    /// Media type (without parameters) -> action. "inspect" = parse + redact (only supported
+    /// for JSON in this iteration); "block" = reject with 415. Unknown types use
+    /// <see cref="DefaultAction"/>.
+    /// </summary>
+    public Dictionary<string, string> ByContentType { get; set; } = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["application/json"] = "inspect",
+    };
+}
+
 public sealed class DetectOptions
 {
     /// <summary>Value of properties with sensitive names (api_key, password, senha, token...).</summary>
@@ -103,6 +146,40 @@ public sealed class DetectOptions
 
     /// <summary>Long URL-safe tokens (>= 28 chars) with mixed classes.</summary>
     public bool ByLongStrings { get; set; } = true;
+
+    /// <summary>
+    /// Minimum Shannon entropy (bits/char) for the long-string scanner (default 3.0).
+    /// Entropy is never the only signal - a token must also look random (wide alphabet
+    /// or mixed classes) and not be a hex/uuid-like value.
+    /// </summary>
+    public double EntropyThreshold { get; set; } = 3.0;
+}
+
+/// <summary>
+/// Rate limiting and brute-force protection, both per client IP.
+/// - Requests beyond <see cref="MaxRequestsPerWindow"/> in <see cref="RequestWindowSeconds"/> -> 429.
+/// - After <see cref="MaxFailuresPerWindow"/> failed local-key attempts in
+///   <see cref="FailureWindowSeconds"/>, the client is locked out for <see cref="LockoutSeconds"/> (429).
+/// </summary>
+public sealed class RateLimitOptions
+{
+    /// <summary>Turns per-client rate limiting on/off (default: on - fail closed).</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Maximum requests per client in the window (default: 120).</summary>
+    public int MaxRequestsPerWindow { get; set; } = 120;
+
+    /// <summary>Sliding window for the request limit, in seconds (default: 60).</summary>
+    public int RequestWindowSeconds { get; set; } = 60;
+
+    /// <summary>Failed authentication attempts tolerated before a lockout (default: 10).</summary>
+    public int MaxFailuresPerWindow { get; set; } = 10;
+
+    /// <summary>Sliding window for the failure count, in seconds (default: 300 = 5 min).</summary>
+    public int FailureWindowSeconds { get; set; } = 300;
+
+    /// <summary>How long a client stays locked out after too many failures, in seconds (default: 300 = 5 min).</summary>
+    public int LockoutSeconds { get; set; } = 300;
 }
 
 public sealed class CertOptions
@@ -116,5 +193,14 @@ public sealed class CertOptions
 public sealed class KeyOptions
 {
     public string? UpstreamKey { get; set; }
+
+    /// <summary>The primary local key (compatibility).</summary>
     public string? LocalKey { get; set; }
+
+    /// <summary>
+    /// Additional accepted local keys (e.g. rotation or multiple clients). A request is
+    /// authenticated if it matches <see cref="LocalKey"/> or any entry here.
+    /// Values live only in appsettings.Server.json / environment (never in non-secret files).
+    /// </summary>
+    public List<string> LocalKeys { get; set; } = new();
 }

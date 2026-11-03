@@ -12,6 +12,7 @@ public sealed class ProxyMiddleware
     private readonly IOptionsMonitor<ProxyOptions> _options;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ActivityStore _activity;
+    private readonly RateLimiter _rateLimiter;
 
     private static readonly string[] HeadersToForward =
         { "content-type", "cache-control", "retry-after", "x-request-id" };
@@ -21,12 +22,14 @@ public sealed class ProxyMiddleware
         ILogger<ProxyMiddleware> logger,
         IOptionsMonitor<ProxyOptions> options,
         IHttpClientFactory httpClientFactory,
-        ActivityStore activity)
+        ActivityStore activity,
+        RateLimiter rateLimiter)
     {
         _logger = logger;
         _options = options;
         _httpClientFactory = httpClientFactory;
         _activity = activity;
+        _rateLimiter = rateLimiter;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -58,7 +61,74 @@ public sealed class ProxyMiddleware
                 requestId, context.Request.Method, context.Request.Path, clientIp);
         }
 
-        // 1. HTTP method
+        // Rate limiting (per client) - cheap, fail-closed, runs before local authentication
+        // so it also protects against unauthenticated floods and brute-force lockouts.
+        if (options.RateLimit is { Enabled: true })
+        {
+            var verdict = _rateLimiter.Check(clientIp);
+            if (verdict != RateLimiter.Verdict.Allow)
+            {
+                finalStatus = StatusCodes.Status429TooManyRequests;
+                context.Response.Headers.RetryAfter =
+                    Math.Max(1, _rateLimiter.RetryAfterSeconds(clientIp)).ToString();
+
+                _logger.LogWarning("Rate limit exceeded | Id={Id} Client={Client} Verdict={Verdict}",
+                    requestId, clientIp, verdict);
+
+                await SendErrorAsync(context, StatusCodes.Status429TooManyRequests,
+                    verdict == RateLimiter.Verdict.LockedOut
+                        ? "Too many failed attempts. Try again later."
+                        : "Too many requests.",
+                    "rate_limit_error");
+                return;
+            }
+        }
+
+        // 1. Local authentication - always first, before any routing/method logic.
+        //    Unauthenticated clients must never see route/upstream information.
+        var clientKey = SecurityHelpers.ExtractBearerToken(context.Request.Headers.Authorization.ToString());
+        if (!AuthenticationPolicy.IsValidLocalKey(clientKey, options.Keys))
+        {
+            var keyCount = AuthenticationPolicy.LocalKeyCount(options.Keys);
+
+            if (options.RateLimit is { Enabled: true })
+            {
+                _rateLimiter.RecordFailure(clientIp); // brute-force counter
+            }
+
+            var userAgent = Truncate(context.Request.Headers.UserAgent.ToString(), 120);
+
+            presentedHash = string.IsNullOrEmpty(clientKey)
+                ? "(empty)"
+                : SecurityHelpers.HashShort(SecurityHelpers.Sha256Hex(clientKey));
+            expectedHash = keyCount == 1
+                ? SecurityHelpers.HashShort(SecurityHelpers.Sha256Hex(options.Keys.LocalKey ?? string.Empty))
+                : null;
+            finalStatus = StatusCodes.Status401Unauthorized;
+            authRefused = true;
+
+            try
+            {
+                _logger.LogWarning(
+                    "Authentication refused | Id={Id} Client={Client} Path={Path} " +
+                    "PresentedLen={PresentedLen} PresentedHash={PresentedHash} ExpectedHash={ExpectedHash} KeyCount={KeyCount} UA={UA}",
+                    requestId, clientIp, context.Request.Path.Value ?? "/",
+                    clientKey?.Length ?? 0,
+                    presentedHash,
+                    expectedHash ?? "(multiple keys)",
+                    keyCount,
+                    userAgent);
+            }
+            catch
+            {
+                // Logging failures must never block the client response.
+            }
+            await SendErrorAsync(context, StatusCodes.Status401Unauthorized,
+                "Invalid or missing local key.", "authentication_error");
+            return;
+        }
+
+        // 2. HTTP method
         if (context.Request.Method != HttpMethods.Get && context.Request.Method != HttpMethods.Post)
         {
             context.Response.Headers.Allow = "GET, POST";
@@ -68,7 +138,7 @@ public sealed class ProxyMiddleware
             return;
         }
 
-        // 2. Resolve route (multi-upstream) and validate endpoint
+        // 3. Resolve route (multi-upstream) and validate endpoint
         var pathname = context.Request.Path.Value ?? "/";
         string upstreamBase;
         string upstreamPath;
@@ -92,8 +162,7 @@ public sealed class ProxyMiddleware
                 _logger.LogWarning("Route without a configured key | Id={Id} Route={Route} KeyRef={KeyRef}",
                     requestId, resolved.Route.Name, resolved.Route.KeyRef);
                 await SendErrorAsync(context, StatusCodes.Status502BadGateway,
-                    $"Route '{resolved.Route.Name}' has no API key configured (keyRef '{resolved.Route.KeyRef}').",
-                    "proxy_error");
+                    "Upstream not configured.", "proxy_error");
                 return;
             }
 
@@ -130,58 +199,42 @@ public sealed class ProxyMiddleware
             }
         }
 
-        // 3. Local authentication
-        var clientKey = SecurityHelpers.ExtractBearerToken(context.Request.Headers.Authorization.ToString());
-        if (!SecurityHelpers.SecureEquals(clientKey, options.Keys.LocalKey))
-        {
-            var userAgent = context.Request.Headers.UserAgent.ToString();
-            if (userAgent.Length > 120)
-            {
-                userAgent = userAgent[..120];
-            }
-
-            presentedHash = string.IsNullOrEmpty(clientKey)
-                ? "(empty)"
-                : SecurityHelpers.HashShort(SecurityHelpers.Sha256Hex(clientKey));
-            expectedHash = SecurityHelpers.HashShort(SecurityHelpers.Sha256Hex(options.Keys.LocalKey ?? string.Empty));
-            finalStatus = StatusCodes.Status401Unauthorized;
-            authRefused = true;
-
-            try
-            {
-                _logger.LogWarning(
-                    "Authentication refused | Id={Id} Client={Client} Path={Path} " +
-                    "PresentedLen={PresentedLen} PresentedHash={PresentedHash} ExpectedHash={ExpectedHash} UA={UA}",
-                    requestId, clientIp, pathname,
-                    clientKey?.Length ?? 0,
-                    string.IsNullOrEmpty(clientKey) ? "(empty)" : SecurityHelpers.Sha256Hex(clientKey),
-                    SecurityHelpers.Sha256Hex(options.Keys.LocalKey ?? string.Empty),
-                    userAgent);
-            }
-            catch
-            {
-                // Logging failures must never block the client response.
-            }
-            await SendErrorAsync(context, StatusCodes.Status401Unauthorized,
-                "Invalid or missing local key.", "authentication_error");
-            return;
-        }
-
-        // 4. Request body
+        // 4. Request body - fail-closed inspection.
+        //    No body is ever forwarded unless it passed inspection (Content-Type policy + JSON parse).
         byte[] bodyBytes = Array.Empty<byte>();
         if (context.Request.Method == HttpMethods.Post)
         {
+            var hasBody = context.Request.ContentLength is > 0
+                || context.Request.Headers.TransferEncoding.Count > 0;
+            var inspectAction = InspectionPolicy.Decide(
+                options.Inspection, methodAllowsBody: true, context.Request.ContentType, hasBody);
+
+            if (!string.Equals(inspectAction, InspectionPolicy.ActionInspect, StringComparison.OrdinalIgnoreCase))
+            {
+                finalStatus = StatusCodes.Status415UnsupportedMediaType;
+                if (options.Verbose)
+                {
+                    _logger.LogWarning(
+                        "Request body content-type blocked by policy | Id={Id} ContentType={ContentType}",
+                        requestId, InspectionPolicy.NormalizeMediaType(context.Request.ContentType));
+                }
+                await SendErrorAsync(context, StatusCodes.Status415UnsupportedMediaType,
+                    "Unsupported content type.", "invalid_request_error");
+                return;
+            }
+
             try
             {
                 bodyBytes = await ReadBodyWithLimitAsync(
                     context.Request.Body, options.MaxBodySize, context.RequestAborted);
 
                 if (bodyBytes.Length > 0
-                    && context.Request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true)
+                    && InspectionPolicy.IsJson(context.Request.ContentType))
                 {
                     try
                     {
-                        using var doc = JsonDocument.Parse(bodyBytes);
+                        using var doc = JsonDocument.Parse(bodyBytes,
+                            new JsonDocumentOptions { MaxDepth = 128 });
 
                         // For the activity log: extract only the "model", without storing content.
                         if (doc.RootElement.ValueKind == JsonValueKind.Object
@@ -201,12 +254,26 @@ public sealed class ProxyMiddleware
                             }
                         }
                     }
-                    catch
+                    catch (JsonException) when (
+                        !options.Inspection.Enabled
+                        || string.Equals(options.Inspection.InvalidJson, "warn", StringComparison.OrdinalIgnoreCase))
                     {
+                        // Escape hatch (Inspection disabled, or InvalidJson = "warn"): the body is
+                        // forwarded without a successful parse. Default ("block") never does this.
                         if (options.Verbose)
                         {
-                            _logger.LogWarning("Request body not recognized as valid JSON | Id={Id}", requestId);
+                            _logger.LogWarning(
+                                "Request body not recognized as valid JSON (non-blocking) | Id={Id}", requestId);
                         }
+                    }
+                    catch (JsonException)
+                    {
+                        // Fail closed: an invalid JSON body is never forwarded.
+                        finalStatus = StatusCodes.Status400BadRequest;
+                        _logger.LogWarning("Request body failed JSON inspection | Id={Id}", requestId);
+                        await SendErrorAsync(context, StatusCodes.Status400BadRequest,
+                            "Request body could not be inspected.", "invalid_request_error");
+                        return;
                     }
                 }
             }
@@ -238,7 +305,7 @@ public sealed class ProxyMiddleware
         if (HttpMethods.IsPost(context.Request.Method)
             && bodyBytes.Length > 0
             && options.Redaction.Enabled
-            && context.Request.ContentType?.Contains("application/json", StringComparison.OrdinalIgnoreCase) == true)
+            && InspectionPolicy.IsJson(context.Request.ContentType))
         {
             var redacted = SecretRedactor.RedactJson(
                 bodyBytes,
@@ -246,7 +313,8 @@ public sealed class ProxyMiddleware
                 detectByFieldName: options.Redaction.Detect?.ByFieldName ?? true,
                 detectByFormats: options.Redaction.Detect?.ByFormats ?? true,
                 detectByKeyValueContext: options.Redaction.Detect?.ByKeyValueContext ?? true,
-                detectByLongStrings: options.Redaction.Detect?.ByLongStrings ?? true);
+                detectByLongStrings: options.Redaction.Detect?.ByLongStrings ?? true,
+                detectEntropyThreshold: options.Redaction.Detect?.EntropyThreshold ?? 3.0);
             if (redacted.Changed)
             {
                 forwardedBody = redacted.Data;
@@ -330,8 +398,16 @@ public sealed class ProxyMiddleware
             if (redactionCount > 0 && options.Redaction.NotifyInResponse)
             {
                 var mediaType = contentType ?? string.Empty;
-                if (mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase)
-                    || mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
+
+                if (mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Incremental SSE: the notice is streamed in just before "[DONE]" without
+                    // buffering the response body (only the current event is held back).
+                    var notice = BuildRedactionNotice(redactionCount, redactionKinds, options.Redaction, redactionPreviews);
+                    await using var sseStream = await upstreamResponse.Content.ReadAsStreamAsync(context.RequestAborted);
+                    await SseStreamProcessor.ProcessAsync(sseStream, context.Response.Body, notice, context.RequestAborted);
+                }
+                else if (mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
                 {
                     var fullBody = await upstreamResponse.Content.ReadAsByteArrayAsync(context.RequestAborted);
                     var notice = BuildRedactionNotice(redactionCount, redactionKinds, options.Redaction, redactionPreviews);

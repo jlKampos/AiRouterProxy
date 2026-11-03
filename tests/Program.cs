@@ -29,7 +29,15 @@ class Program
         TestNotices();
         TestExtendedDetection();
         TestPreviews();
+        TestDetector();
+        TestAuthenticationPolicy();
+        TestRateLimiter();
+        TestSseParser();
+        TestSseProcessor();
+        TestSseProtocolAdapters();
+        TestSecurityEdges();
         TestRouting();
+        TestInspectionPolicy();
         Console.WriteLine();
         Console.WriteLine($"RESULT: {_passed} PASS, {_failed} FAIL");
         Environment.ExitCode = _failed == 0 ? 0 : 1;
@@ -49,7 +57,7 @@ class Program
         CheckTrue("multiple inline keys", () => r2.Changed
             && !s2.Contains("sk-ant-") && !s2.Contains("ghp_") && !s2.Contains("AIza")
             && !s2.Contains("npm_") && !s2.Contains("xoxb-") && !s2.Contains("AKIA")
-            && r2.Stats.ByKind.GetValueOrDefault("openai") >= 1
+            && r2.Stats.ByKind.GetValueOrDefault("anthropic") >= 1
             && r2.Stats.ByKind.GetValueOrDefault("github") >= 1
             && r2.Stats.ByKind.GetValueOrDefault("google") >= 1
             && r2.Stats.ByKind.GetValueOrDefault("npm") >= 1
@@ -310,30 +318,25 @@ class Program
     // --------------------------------------------------------------
     static void TestPreviews()
     {
-        // Format detection collects a masked preview, never the full value
+        // Format detection collects a category-only preview, never content
         var r1 = SecretRedactor.RedactJson(Bytes("{\"content\":\"use sk-abcdefghijklmnop123 x\"}"));
         CheckTrue("preview format masked", () => r1.Stats.Previews.Count == 1
-            && r1.Stats.Previews[0].Kind == "openai"
-            && r1.Stats.Previews[0].Preview == "sk-a\u2026"
-            && !r1.Stats.Previews[0].Preview.Contains("abcdefghijklmnop123"));
+            && r1.Stats.Previews[0].Kind == "openai");
 
         // Field-name detection preview
         var r2 = SecretRedactor.RedactJson(Bytes("{\"password\":\"supersecret123\"}"));
         CheckTrue("preview field masked", () => r2.Stats.Previews.Count == 1
-            && r2.Stats.Previews[0].Kind == "password"
-            && r2.Stats.Previews[0].Preview == "supe\u2026");
+            && r2.Stats.Previews[0].Kind == "password");
 
         // key=value context preview
         var r3 = SecretRedactor.RedactJson(Bytes("{\"c\":\"use LOCAL_KEY=abcdefgh1234 and continue\"}"));
         CheckTrue("preview context masked", () => r3.Stats.Previews.Count == 1
-            && r3.Stats.Previews[0].Kind == "key_in_text"
-            && r3.Stats.Previews[0].Preview == "abcd\u2026");
+            && r3.Stats.Previews[0].Kind == "key_in_text");
 
         // Long-string preview (layer still works when enabled)
         var r4 = SecretRedactor.RedactJson(Bytes("{\"c\":\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\"}"));
         CheckTrue("preview longString masked", () => r4.Stats.Previews.Count == 1
-            && r4.Stats.Previews[0].Kind == "suspicious_key"
-            && r4.Stats.Previews[0].Preview == "4v_w\u2026");
+            && r4.Stats.Previews[0].Kind == "suspicious_key");
 
         // Long strings disabled -> no detection, no preview (current default config)
         var r5 = SecretRedactor.RedactJson(Bytes("{\"c\":\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\"}"), detectByLongStrings: false);
@@ -346,14 +349,591 @@ class Program
         var r6 = SecretRedactor.RedactJson(Bytes("{\"c\":\"" + many + "\"}"));
         CheckTrue("previews capped at 6", () => r6.Stats.Total == 9 && r6.Stats.Previews.Count == 6);
 
-        // FormatPreviews renders readable text
+        // FormatPreviews renders readable, category-only text (no value prefix)
         var text = SecretRedactor.FormatPreviews(r1.Stats.Previews);
-        CheckTrue("FormatPreviews text", () => text.Contains("sk-a\u2026") && text.Contains("OpenAI key"));
+        CheckTrue("FormatPreviews text", () => text.Contains("OpenAI key") && text.Contains("detected") && !text.Contains("sk-a"));
     }
 
     // --------------------------------------------------------------
     // Multi-upstream router (Item 2)
     // --------------------------------------------------------------
+    // --------------------------------------------------------------
+    // Fail-closed body inspection (Item: InspectionPolicy)
+    // --------------------------------------------------------------
+    static void TestInspectionPolicy()
+    {
+        var def = new InspectionOptions(); // application/json: inspect, default: block
+
+        // Inspect: JSON is allowed.
+        CheckTrue("json -> inspect", () => InspectionPolicy.Decide(def, true, "application/json") == InspectionPolicy.ActionInspect);
+        CheckTrue("json charset -> inspect", () => InspectionPolicy.Decide(def, true, "application/json; charset=utf-8") == InspectionPolicy.ActionInspect);
+        CheckTrue("+json subtype -> inspect", () => InspectionPolicy.Decide(def, true, "application/problem+json") == InspectionPolicy.ActionInspect);
+        CheckTrue("case-insensitive", () => InspectionPolicy.Decide(def, true, "Application/JSON") == InspectionPolicy.ActionInspect);
+
+        // Block: unknown / explicitly blocked types with a body.
+        CheckTrue("xml -> block", () => InspectionPolicy.Decide(def, true, "application/xml") == InspectionPolicy.ActionBlock);
+        CheckTrue("octet-stream -> block", () => InspectionPolicy.Decide(def, true, "application/octet-stream") == InspectionPolicy.ActionBlock);
+        CheckTrue("multipart -> block", () => InspectionPolicy.Decide(def, true, "multipart/form-data; boundary=x") == InspectionPolicy.ActionBlock);
+        CheckTrue("form-urlencoded -> block", () => InspectionPolicy.Decide(def, true, "application/x-www-form-urlencoded") == InspectionPolicy.ActionBlock);
+        CheckTrue("text/plain -> block (default)", () => InspectionPolicy.Decide(def, true, "text/plain") == InspectionPolicy.ActionBlock);
+        CheckTrue("no content-type -> block", () => InspectionPolicy.Decide(def, true, null) == InspectionPolicy.ActionBlock);
+
+        // GET (no body allowed) passes regardless of content-type.
+        CheckTrue("GET never blocked", () => InspectionPolicy.Decide(def, false, "application/xml") == InspectionPolicy.ActionInspect);
+        CheckTrue("no body -> pass", () => InspectionPolicy.Decide(def, true, "application/xml", hasBody: false) == InspectionPolicy.ActionInspect);
+
+        // inspect declared for a non-JSON type fails closed (blocked) in this iteration.
+        var custom = new InspectionOptions();
+        custom.ByContentType["text/plain"] = "inspect";
+        CheckTrue("text/plain inspect -> block (not implemented)", () => InspectionPolicy.Decide(custom, true, "text/plain") == InspectionPolicy.ActionBlock);
+        CheckTrue("custom json override -> inspect", () => InspectionPolicy.Decide(custom, true, "application/json") == InspectionPolicy.ActionInspect);
+
+        // Disabled = everything passes.
+        var off = new InspectionOptions { Enabled = false };
+        CheckTrue("disabled -> inspect", () => InspectionPolicy.Decide(off, true, "application/xml") == InspectionPolicy.ActionInspect);
+    }
+
+    // --------------------------------------------------------------
+    // Unified secret detector (Sprint 2)
+    // --------------------------------------------------------------
+    static void TestDetector()
+    {
+        var opts = new DetectOptions();
+
+        // --- Shannon entropy ---
+        CheckTrue("entropy random high", () => SecretDetector.ShannonEntropy("XyZ0pQr9mN2vW7sT4uL8kK1jH6gF5dS3aBc") > 3.0);
+        CheckTrue("entropy monotone low", () => SecretDetector.ShannonEntropy(new string('a', 40)) < 0.5);
+
+        // --- Known formats: category + confidence + position, never the value ---
+        var openai = SecretDetector.Detect("key sk-abcde12345fghij67890 end", opts);
+        CheckTrue("format openai", () => openai.Count == 1 && openai[0].Category == "openai"
+            && openai[0].Detector == SecretDetector.DetectorFormat
+            && openai[0].Confidence == Confidence.High
+            && openai[0].Start == 4 && openai[0].Length == 23);
+
+        var ant = SecretDetector.Detect("use sk-ant-api03-abcdefghijklmnopqrstuvwxyz12", opts);
+        CheckTrue("format anthropic", () => ant.Count == 1 && ant[0].Category == "anthropic" && ant[0].Length >= 28);
+
+        var stripe = SecretDetector.Detect("sk_live_51AbCdEfGhIjKlMnOpQrStUvWxYz1234567890", opts);
+        CheckTrue("format stripe", () => stripe.Count == 1 && stripe[0].Category == "stripe");
+
+        var gh = SecretDetector.Detect("token ghp_12345678901234567890123456789012345678", opts);
+        CheckTrue("format github", () => gh.Count == 1 && gh[0].Category == "github" && gh[0].Confidence == Confidence.High);
+
+        var gp = SecretDetector.Detect("github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz1234", opts);
+        CheckTrue("format github_pat", () => gp.Count == 1 && gp[0].Category == "github");
+
+        var goog = SecretDetector.Detect("AIzaSyA1234567890abcdefghijklmnopqrstuv", opts);
+        CheckTrue("format google", () => goog.Count == 1 && goog[0].Category == "google");
+
+        var slack = SecretDetector.Detect("xoxb-1234567890-123456789012-abcdefghijklmn", opts);
+        CheckTrue("format slack", () => slack.Count == 1 && slack[0].Category == "slack");
+
+        var npm = SecretDetector.Detect("npm_AbC1234567890abcdefghijklmnopqrstuvwx", opts);
+        CheckTrue("format npm", () => npm.Count == 1 && npm[0].Category == "npm");
+
+        var aws = SecretDetector.Detect("aws AKIAIOSFODNN7EXAMPLE end", opts);
+        CheckTrue("format aws", () => aws.Count == 1 && aws[0].Category == "aws" && aws[0].Length == 20);
+
+        var jwt = SecretDetector.Detect("tok eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSM ABC", opts);
+        CheckTrue("format jwt", () => jwt.Count == 1 && jwt[0].Category == "jwt");
+
+        var pem = "-----BEGIN PRIVATE KEY-----\nMIIEVQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----";
+        var pk = SecretDetector.Detect(pem, opts);
+        CheckTrue("format private_key", () => pk.Count == 1 && pk[0].Category == "private_key");
+
+        var bearer = SecretDetector.Detect("Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456", opts);
+        CheckTrue("format bearer masks only the token", () => bearer.Count == 1
+            && bearer[0].Category == "bearer"
+            && bearer[0].Start == "Authorization: Bearer ".Length);
+
+        // --- Context layer ---
+        var ctx = SecretDetector.Detect("config LocalKey: abcdefgh1234 x", opts);
+        CheckTrue("context LocalKey", () => ctx.Count == 1
+            && ctx[0].Detector == SecretDetector.DetectorContext
+            && ctx[0].Category == SecretDetector.KindKeyValue);
+
+        // --- Entropy layer (never alone: threshold + random-look guard) ---
+        var ent = SecretDetector.Detect("tok 4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4 end", opts);
+        CheckTrue("entropy long string", () => ent.Count == 1
+            && ent[0].Detector == SecretDetector.DetectorEntropy
+            && ent[0].Category == SecretDetector.KindLongString);
+
+        // A narrow-alphabet token (~4.3 bits/char) is flagged at the default 3.0 but skipped at 4.5
+        var narrowAlphabet = "abcdefghij0123456789";
+        var narrow = new string(Enumerable.Range(0, 36).Select(i => narrowAlphabet[i % 20]).ToArray());
+        CheckTrue("entropy narrow alphabet flagged at 3.0", () => SecretDetector.Detect(narrow, opts).Count == 1);
+        CheckTrue("entropy threshold 4.5 skips", () => SecretDetector.Detect(narrow, new DetectOptions { EntropyThreshold = 4.5 }).Count == 0);
+
+        // --- False positives ---
+        CheckTrue("fp git sha ignored", () => SecretDetector.Detect("commit a5f3c8e2b9d147f0e6c8a1b2d3e4f5a6b7c8d9e0", opts).Count == 0);
+        CheckTrue("fp uuid ignored", () => SecretDetector.Detect("bug 550e8400-e29b-41d4-a716-446655440000", opts).Count == 0);
+        CheckTrue("fp prose ignored", () => SecretDetector.Detect("the quick brown fox jumps over the lazy dog again and again", opts).Count == 0);
+        CheckTrue("fp monotone ignored", () => SecretDetector.Detect(new string('a', 40), opts).Count == 0);
+        CheckTrue("fp long word ignored", () => SecretDetector.Detect("supercalifragilisticexpialidocious word", opts).Count == 0);
+
+        // --- Layer toggles ---
+        CheckTrue("byFormats off", () => SecretDetector.Detect("sk-abcde12345fghij67890", new DetectOptions { ByFormats = false }).Count == 0);
+        CheckTrue("byContext off", () => SecretDetector.Detect("LocalKey: abcdefgh1234", new DetectOptions { ByKeyValueContext = false }).Count == 0);
+        CheckTrue("byLongStrings off", () => SecretDetector.Detect("4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4", new DetectOptions { ByLongStrings = false }).Count == 0);
+        CheckTrue("null/empty input", () => SecretDetector.Detect(null, opts).Count == 0 && SecretDetector.Detect("", opts).Count == 0);
+
+        // --- Overlap resolution (format > context > entropy) ---
+        CheckTrue("overlap format wins over entropy", () =>
+            SecretDetector.Detect("sk-abcde12345fghij67890abcdefghijklmnop", opts) is { Count: 1 } f0
+                && f0[0].Detector == SecretDetector.DetectorFormat);
+        CheckTrue("overlap context wins over entropy", () =>
+            SecretDetector.Detect("api_key=\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\"", opts) is { Count: 1 } f1
+                && f1[0].Category == SecretDetector.KindKeyValue);
+
+        // --- End-to-end via the redactor: nested + free text, value never leaks ---
+        var nested = SecretRedactor.RedactJson(Bytes("{\"deployment\":{\"environment\":{\"DATABASE_PASSWORD\":\"sup3rS3cr3tValue123\",\"CUSTOM_AUTH\":\"ghp_abcdefghijklmnopqrstuvwx90\"}}}"));
+        CheckTrue("nested credentials redacted", () => nested.Changed
+            && !Str(nested.Data).Contains("sup3rS3cr3tValue123")
+            && !Str(nested.Data).Contains("ghp_abcdefghijklmnopqrstuvwx90"));
+
+        var freeText = SecretRedactor.RedactJson(Bytes("{\"content\":\"My GitHub token is ghp_abcdefghijklmnopqrstuvwxyz123456, never share it\"}"));
+        CheckTrue("free text github redacted", () => freeText.Changed && !Str(freeText.Data).Contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
+
+        var noticeSource = SecretRedactor.RedactJson(Bytes("{\"content\":\"key sk-abcdefghijklmnop123 x\"}"));
+        var notice = SecretRedactor.FormatPreviews(noticeSource.Stats.Previews);
+        CheckTrue("notice leaks no content", () => notice.Contains("OpenAI key") && !notice.Contains("sk-"));
+    }
+
+    // --------------------------------------------------------------
+    // Incremental SSE parser + streaming processor (Sprint 4)
+    // --------------------------------------------------------------
+    static List<SseEvent> ParseSse(string raw, int chunkSize)
+    {
+        var parser = new SseParser();
+        var all = new List<SseEvent>();
+        var bytes = Encoding.UTF8.GetBytes(raw);
+
+        for (var i = 0; i < bytes.Length; i += chunkSize)
+        {
+            var count = Math.Min(chunkSize, bytes.Length - i);
+            all.AddRange(parser.Feed(bytes.AsSpan(i, count)));
+        }
+
+        var final = parser.EndOfStream();
+        if (final is not null)
+        {
+            all.Add(final);
+        }
+
+        return all;
+    }
+
+    static void TestSseParser()
+    {
+        var sse = "data: hello\n\ndata: world\n\n";
+        var whole = ParseSse(sse, 100);
+        CheckTrue("sse two events", () => whole.Count == 2
+            && whole[0].Data == "hello" && whole[1].Data == "world"
+            && whole[0].StartOffset == 0 && whole[0].EndOffset == 13
+            && whole[1].StartOffset == 13 && whole[1].EndOffset == 26);
+
+        var chunked = ParseSse(sse, 1);
+        CheckTrue("sse chunked 1B identical", () => chunked.Count == whole.Count
+            && chunked.Select(e => e.Data).SequenceEqual(whole.Select(e => e.Data)));
+
+        var crlf = ParseSse("data: a\r\n\r\n", 100);
+        CheckTrue("sse CRLF", () => crlf.Count == 1 && crlf[0].Data == "a");
+
+        var multi = ParseSse("data: a\ndata: b\n\n", 100);
+        CheckTrue("sse multi-line data", () => multi.Count == 1 && multi[0].Data == "a\nb");
+
+        var named = ParseSse("event: ping\ndata: payload\n\n", 100);
+        CheckTrue("sse event name", () => named.Count == 1 && named[0].EventName == "ping" && named[0].Data == "payload");
+
+        var fields = ParseSse("id: 42\nretry: 3000\ndata: z\n\n", 100);
+        CheckTrue("sse id/retry", () => fields.Count == 1 && fields[0].Id == "42" && fields[0].Retry == 3000);
+
+        CheckTrue("sse comments no event", () => ParseSse(": keep-alive\n\n", 100).Count == 0);
+        CheckTrue("sse empty input", () => ParseSse("", 100).Count == 0);
+
+        var done = ParseSse("data: [DONE]\n\n", 100);
+        CheckTrue("sse done", () => done.Count == 1 && done[0].IsDone && done[0].Data == "[DONE]");
+
+        var doneNoBlank = ParseSse("data: [DONE]", 100);
+        CheckTrue("sse done at EOF no blank", () => doneNoBlank.Count == 1 && doneNoBlank[0].IsDone);
+
+        var partial = ParseSse("data: hi", 100);
+        CheckTrue("sse partial at EOF", () => partial.Count == 1 && partial[0].Data == "hi" && !partial[0].IsDone);
+
+        CheckTrue("sse cut at every boundary", () =>
+        {
+            const string tricky = "data: [DONE]\n\n";
+            for (var size = 1; size <= tricky.Length; size++)
+            {
+                var evts = ParseSse(tricky, size);
+                if (evts.Count != 1 || !evts[0].IsDone || evts[0].EndOffset != tricky.Length)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        CheckTrue("sse unicode split", () =>
+        {
+            const string emoji = "data: olá 👋\ndata: fim\n\n";
+            var evts = ParseSse(emoji, 3); // splits mid-multibyte on purpose
+            return evts.Count == 1 && evts[0].Data == "olá 👋\nfim";
+        });
+    }
+
+    static async Task<string> ProcessSseAsync(string input, string notice, int chunk = 1 << 20)
+    {
+        using var source = new MemoryStream(Encoding.UTF8.GetBytes(input));
+        using var result = new MemoryStream();
+        await SseStreamProcessor.ProcessAsync(source, result, notice, CancellationToken.None, chunk);
+        return Encoding.UTF8.GetString(result.ToArray());
+    }
+
+    static void TestSseProcessor()
+    {
+        const string chat = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        var outp = ProcessSseAsync(chat, "⚠️ notice").GetAwaiter().GetResult();
+
+        CheckTrue("proc notice before done", () =>
+        {
+            var idx = outp.IndexOf("⚠️ notice", StringComparison.Ordinal);
+            var done = outp.IndexOf("data: [DONE]", StringComparison.Ordinal);
+            return idx >= 0 && idx < done && outp.EndsWith("data: [DONE]\n\n");
+        });
+
+        CheckTrue("proc notice chunk valid JSON", () =>
+        {
+            var lastData = outp.LastIndexOf("data: {", StringComparison.Ordinal);
+            var chunk = outp[(lastData + 6)..];
+            chunk = chunk[..chunk.IndexOf("\n\n", StringComparison.Ordinal)];
+            return JsonNode.Parse(chunk) is JsonObject o && o["choices"] is JsonArray;
+        });
+
+        var small = ProcessSseAsync(chat, "⚠️ notice", 4).GetAwaiter().GetResult();
+        CheckTrue("proc chunking identical", () => small == outp);
+
+        const string noDone = "data: {}\n\n";
+        var nd = ProcessSseAsync(noDone, "XX").GetAwaiter().GetResult();
+        CheckTrue("proc append when no done", () => nd.StartsWith(noDone) && nd.IndexOf("XX") > nd.IndexOf("data: {}"));
+        CheckTrue("proc append exact format", () => nd == noDone + "\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n\\nXX\"}}]}\n\n");
+
+        const string resp = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"oi\"}\n\ndata: [DONE]\n\n";
+        var ro = ProcessSseAsync(resp, "R").GetAwaiter().GetResult();
+        CheckTrue("proc responses event", () => ro.Contains("event: response.output_text.delta\ndata: ")
+            && ro.IndexOf("R") < ro.IndexOf("data: [DONE]")
+            && ro.EndsWith("data: [DONE]\n\n"));
+
+        const string anth = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\ndata: [DONE]\n\n";
+        var ao = ProcessSseAsync(anth, "A").GetAwaiter().GetResult();
+        CheckTrue("proc anthropic event", () => ao.Contains("event: content_block_delta\ndata: ")
+            && ao.IndexOf("A") < ao.IndexOf("data: [DONE]"));
+
+        const string raw = "data: 1\n\ndata: 2\n\n";
+        var pt = ProcessSseAsync(raw, string.Empty).GetAwaiter().GetResult();
+        CheckTrue("proc passthrough identical", () => pt == raw);
+    }
+
+    // --------------------------------------------------------------
+    // Protocol adapters (Sprint 5): SseProtocol/ replaces the lightweight
+    // in-processor detection with per-protocol adapters + registry.
+    // --------------------------------------------------------------
+    static SseEvent Evt(string data, string? name = null)
+        => new(name, data, null, null, 0, 0);
+
+    static void TestSseProtocolAdapters()
+    {
+        // Registry resolution: first match wins, generic catch-all last.
+        CheckTrue("resolve responses (event name)", () =>
+            SseProtocolRegistry.Resolve(Evt("{}", "response.completed")) is OpenAiResponsesAdapter);
+        CheckTrue("resolve responses (payload)", () =>
+            SseProtocolRegistry.Resolve(Evt("{\"type\":\"response.output_text.delta\",\"delta\":\"oi\"}")) is OpenAiResponsesAdapter);
+        CheckTrue("resolve anthropic", () =>
+            SseProtocolRegistry.Resolve(Evt("{\"type\":\"content_block_delta\",\"index\":0}", "content_block_delta")) is AnthropicAdapter);
+        CheckTrue("resolve chat", () =>
+            SseProtocolRegistry.Resolve(Evt("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}")) is OpenAiChatAdapter);
+        CheckTrue("resolve generic", () =>
+            SseProtocolRegistry.Resolve(Evt("{}")) is GenericSseAdapter
+            && SseProtocolRegistry.Resolve(Evt("[DONE]")) is GenericSseAdapter);
+
+        CheckTrue("adapter names", () =>
+            new OpenAiResponsesAdapter().Name == "responses"
+            && new AnthropicAdapter().Name == "anthropic"
+            && new OpenAiChatAdapter().Name == "chat"
+            && new GenericSseAdapter().Name == "generic");
+
+        // Classification per protocol
+        CheckTrue("classify terminal all protocols", () =>
+            new OpenAiChatAdapter().Classify(Evt("[DONE]")) == SseEventKind.Terminal
+            && new OpenAiResponsesAdapter().Classify(Evt("[DONE]")) == SseEventKind.Terminal
+            && new AnthropicAdapter().Classify(Evt("[DONE]")) == SseEventKind.Terminal
+            && new GenericSseAdapter().Classify(Evt("[DONE]")) == SseEventKind.Terminal);
+
+        CheckTrue("classify chat error", () =>
+            new OpenAiChatAdapter().Classify(Evt("{\"error\":{\"message\":\"x\"}}")) == SseEventKind.Error
+            && new OpenAiChatAdapter().Classify(Evt("{}", "error")) == SseEventKind.Error);
+
+        CheckTrue("classify chat start/content", () =>
+            new OpenAiChatAdapter().Classify(Evt("{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}")) == SseEventKind.Start
+            && new OpenAiChatAdapter().Classify(Evt("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}")) == SseEventKind.Content);
+
+        CheckTrue("classify responses start/content", () =>
+            new OpenAiResponsesAdapter().Classify(Evt("{}", "response.created")) == SseEventKind.Start
+            && new OpenAiResponsesAdapter().Classify(Evt("{\"type\":\"response.output_text.delta\",\"delta\":\"oi\"}")) == SseEventKind.Content);
+
+        CheckTrue("classify anthropic start/content", () =>
+            new AnthropicAdapter().Classify(Evt("{}", "message_start")) == SseEventKind.Start
+            && new AnthropicAdapter().Classify(Evt("{\"type\":\"content_block_delta\"}", "content_block_delta")) == SseEventKind.Content);
+
+        // Notice chunks: byte-exact per protocol (identical to Sprint 4 output)
+        CheckTrue("chat notice chunk exact", () =>
+            Str(new OpenAiChatAdapter().BuildNoticeChunk("N"))
+                == "\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n\\nN\"}}]}\n\n");
+
+        CheckTrue("responses notice chunk exact", () =>
+            Str(new OpenAiResponsesAdapter().BuildNoticeChunk("N"))
+                == "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\\n\\nN\"}\n\n");
+
+        CheckTrue("anthropic notice chunk exact", () =>
+            Str(new AnthropicAdapter().BuildNoticeChunk("N"))
+                == "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n\\nN\"}}\n\n");
+
+        CheckTrue("generic notice = chat notice", () =>
+            Str(new GenericSseAdapter().BuildNoticeChunk("N"))
+                == Str(new OpenAiChatAdapter().BuildNoticeChunk("N")));
+
+        CheckTrue("chat notice chunk valid JSON", () =>
+        {
+            var chunk = Str(new OpenAiChatAdapter().BuildNoticeChunk("N"));
+            var data = chunk[(chunk.IndexOf("data: {", StringComparison.Ordinal) + 6)..];
+            var json = data[..data.IndexOf("\n\n", StringComparison.Ordinal)];
+            return JsonNode.Parse(json) is JsonObject o && o["choices"] is JsonArray;
+        });
+    }
+
+    // --------------------------------------------------------------
+    // Authentication policy (multi-key) and rate limiting (Sprint 3)
+    // --------------------------------------------------------------
+    static void TestAuthenticationPolicy()
+    {
+        var single = new KeyOptions { LocalKey = "abc" };
+        CheckTrue("single valid", () => AuthenticationPolicy.IsValidLocalKey("abc", single));
+        CheckTrue("single invalid", () => !AuthenticationPolicy.IsValidLocalKey("xyz", single));
+        CheckTrue("single null/empty", () => !AuthenticationPolicy.IsValidLocalKey(null, single)
+            && !AuthenticationPolicy.IsValidLocalKey(string.Empty, single));
+        CheckTrue("null keys", () => !AuthenticationPolicy.IsValidLocalKey("abc", null));
+
+        var multi = new KeyOptions
+        {
+            LocalKey = "abc",
+            LocalKeys = new List<string> { "def", "ghi" },
+        };
+        CheckTrue("multi primary", () => AuthenticationPolicy.IsValidLocalKey("abc", multi));
+        CheckTrue("multi secondary", () => AuthenticationPolicy.IsValidLocalKey("def", multi)
+            && AuthenticationPolicy.IsValidLocalKey("ghi", multi));
+        CheckTrue("multi invalid", () => !AuthenticationPolicy.IsValidLocalKey("xyz", multi));
+
+        CheckTrue("key count single", () => AuthenticationPolicy.LocalKeyCount(single) == 1);
+        CheckTrue("key count multi", () => AuthenticationPolicy.LocalKeyCount(multi) == 3);
+        CheckTrue("key count null", () => AuthenticationPolicy.LocalKeyCount(null) == 0);
+        CheckTrue("empty extra list", () => AuthenticationPolicy.LocalKeyCount(new KeyOptions { LocalKey = "a" }) == 1);
+    }
+
+    static void TestRateLimiter()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var rl = new RateLimiter(new RateLimitOptions
+        {
+            MaxRequestsPerWindow = 3,
+            RequestWindowSeconds = 60,
+            MaxFailuresPerWindow = 2,
+            FailureWindowSeconds = 60,
+            LockoutSeconds = 30,
+        }, () => now);
+
+        CheckTrue("allow under limit", () => rl.Check("1.2.3.4") == RateLimiter.Verdict.Allow);
+        CheckTrue("allow at limit", () => rl.Check("1.2.3.4") == RateLimiter.Verdict.Allow
+            && rl.Check("1.2.3.4") == RateLimiter.Verdict.Allow);
+        CheckTrue("deny over limit", () => rl.Check("1.2.3.4") == RateLimiter.Verdict.TooManyRequests);
+        CheckTrue("other key independent", () => rl.Check("5.6.7.8") == RateLimiter.Verdict.Allow);
+        CheckTrue("request count", () => rl.RequestCount("1.2.3.4") == 3);
+
+        now = now.AddMinutes(2);
+        CheckTrue("window slides", () => rl.Check("1.2.3.4") == RateLimiter.Verdict.Allow
+            && rl.RequestCount("1.2.3.4") == 1);
+
+        // Brute-force lockout: 2 failures -> locked; lockout expires after 30s
+        var now2 = DateTimeOffset.UtcNow;
+        var rl2 = new RateLimiter(new RateLimitOptions
+        {
+            MaxFailuresPerWindow = 2,
+            FailureWindowSeconds = 60,
+            LockoutSeconds = 30,
+        }, () => now2);
+
+        rl2.RecordFailure("9.9.9.9");
+        rl2.RecordFailure("9.9.9.9");
+        CheckTrue("locked after 2 failures", () => rl2.Check("9.9.9.9") == RateLimiter.Verdict.LockedOut
+            && rl2.FailureCount("9.9.9.9") == 2);
+
+        now2 = now2.AddSeconds(31);
+        CheckTrue("lockout expires", () => rl2.Check("9.9.9.9") == RateLimiter.Verdict.Allow);
+
+        // Failures expire with their window
+        var now3 = DateTimeOffset.UtcNow;
+        var rl3 = new RateLimiter(new RateLimitOptions
+        {
+            MaxFailuresPerWindow = 2,
+            FailureWindowSeconds = 60,
+            LockoutSeconds = 30,
+        }, () => now3);
+
+        rl3.RecordFailure("z");
+        now3 = now3.AddSeconds(61);
+        rl3.RecordFailure("z");
+        CheckTrue("failures expire", () => rl3.FailureCount("z") == 1
+            && rl3.Check("z") == RateLimiter.Verdict.Allow);
+
+        // Retry-After is always >= 1s
+        CheckTrue("retry-after positive", () => rl.RetryAfterSeconds("5.6.7.8") >= 1
+            && rl2.RetryAfterSeconds("9.9.9.9") >= 1);
+
+        // Empty/unknown key maps to "unknown" without crashing
+        CheckTrue("null key safe", () => { rl.Check(null!); rl.RecordFailure(null!); return true; });
+    }
+
+    // --------------------------------------------------------------
+    // Security edges (Sprint 6): bearer parsing, multi-key auth,
+    // route enumeration and concurrency (offline, no ASP.NET needed).
+    // --------------------------------------------------------------
+    static void TestSecurityEdges()
+    {
+        // Bearer parsing - auth bypass attempts
+        CheckTrue("bearer exact", () => SecurityHelpers.ExtractBearerToken("Bearer abc") == "abc");
+        CheckTrue("bearer lowercase", () => SecurityHelpers.ExtractBearerToken("bearer abc") == "abc");
+        CheckTrue("bearer uppercase", () => SecurityHelpers.ExtractBearerToken("BEARER abc") == "abc");
+        CheckTrue("bearer extra spaces", () => SecurityHelpers.ExtractBearerToken("Bearer   abc") == "abc");
+        CheckTrue("bearer trailing space", () => SecurityHelpers.ExtractBearerToken("Bearer abc ") == "abc");
+        CheckTrue("bearer no key", () => SecurityHelpers.ExtractBearerToken("Bearer") is null);
+        CheckTrue("bearer empty value", () => SecurityHelpers.ExtractBearerToken("Bearer   ") is null);
+        CheckTrue("basic is not bearer", () => SecurityHelpers.ExtractBearerToken("Basic dXNlcjpwYXNz") is null);
+        CheckTrue("no prefix", () => SecurityHelpers.ExtractBearerToken("abc") is null);
+        CheckTrue("null/empty", () => SecurityHelpers.ExtractBearerToken(null) is null
+            && SecurityHelpers.ExtractBearerToken("") is null);
+
+        // Multi-key auth edges
+        var multi = new KeyOptions
+        {
+            LocalKey = "primary",
+            LocalKeys = new List<string> { "second", " third ", "", " " },
+        };
+        CheckTrue("multi second key", () => AuthenticationPolicy.IsValidLocalKey("second", multi));
+        CheckTrue("multi spaces literal", () => AuthenticationPolicy.IsValidLocalKey(" third ", multi)
+            && !AuthenticationPolicy.IsValidLocalKey("third", multi));
+        CheckTrue("multi blank rejected", () => !AuthenticationPolicy.IsValidLocalKey("", multi));
+        CheckTrue("multi case-sensitive", () => !AuthenticationPolicy.IsValidLocalKey("Primary", multi)
+            && !AuthenticationPolicy.IsValidLocalKey("SECOND", multi));
+        CheckTrue("multi count includes blanks", () => AuthenticationPolicy.LocalKeyCount(multi) == 5);
+
+        // Route enumeration: allowed-path guards, case and traversal
+        var airouter = new RouteOptions
+        {
+            Name = "airouter",
+            Prefix = "",
+            Upstream = "https://api.airrouter.ch",
+            KeyRef = "AIROUTER",
+            AllowedPaths = { "/v1/models", "/v1/chat/completions", "/v1/embeddings" },
+        };
+        var openrouter = new RouteOptions
+        {
+            Name = "openrouter",
+            Prefix = "/openrouter",
+            Upstream = "https://openrouter.ai/api",
+            KeyRef = "OPENROUTER",
+            AllowedPaths = { "/v1/*" },
+        };
+        var routes = new[] { airouter, openrouter };
+        var keys = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AIROUTER"] = "sk-airouter-abc",
+            ["OPENROUTER"] = "sk-openrouter-xyz",
+        };
+
+        CheckTrue("enum exact allowed", () => RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/chat/completions"));
+        CheckTrue("enum trailing slash blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/chat/completions/"));
+        CheckTrue("enum case blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/V1/CHAT/COMPLETIONS"));
+        CheckTrue("enum dotdot blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/chat/completions/../models"));
+        CheckTrue("enum double slash blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "//v1/chat/completions"));
+        CheckTrue("enum encoded slash blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/chat%2fcompletions"));
+        CheckTrue("enum unknown path blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/embeddings2"));
+
+        CheckTrue("enum prefix segment boundary", () =>
+            RouteResolver.PathMatchesPrefix("/openrouter/v1/models", "/openrouter")
+            && !RouteResolver.PathMatchesPrefix("/openrouterX/v1/models", "/openrouter")
+            && !RouteResolver.PathMatchesPrefix("//openrouter/v1", "/openrouter"));
+
+        CheckTrue("enum resolve default", () =>
+            RouteResolver.Resolve(routes, keys, "/v1/chat/completions") is { } r1
+            && r1.Route.Name == "airouter"
+            && r1.RewrittenPath == "/v1/chat/completions");
+
+        CheckTrue("enum rewrite strips prefix", () =>
+            RouteResolver.Resolve(routes, keys, "/openrouter/v1/models") is { } r2
+            && r2.Route.Name == "openrouter"
+            && r2.RewrittenPath == "/v1/models"
+            && r2.Key == "sk-openrouter-xyz");
+
+        // Concurrency: the rate limiter stays exact and exception-free under load
+        CheckTrue("concurrency allows exactly the limit", () =>
+        {
+            var rl = new RateLimiter(new RateLimitOptions
+            {
+                MaxRequestsPerWindow = 100,
+                RequestWindowSeconds = 60,
+                MaxFailuresPerWindow = 100,
+                FailureWindowSeconds = 60,
+                LockoutSeconds = 60,
+            }, () => DateTimeOffset.UtcNow);
+
+            var allowed = 0;
+            Parallel.For(0, 1000, _ =>
+            {
+                if (rl.Check("1.1.1.1") == RateLimiter.Verdict.Allow)
+                {
+                    Interlocked.Increment(ref allowed);
+                }
+            });
+
+            return allowed == 100 && rl.RequestCount("1.1.1.1") == 100;
+        });
+
+        CheckTrue("concurrency keys independent", () =>
+        {
+            var rl = new RateLimiter(new RateLimitOptions { MaxRequestsPerWindow = 50, RequestWindowSeconds = 60 });
+            Parallel.For(0, 200, i =>
+            {
+                rl.Check(i % 2 == 0 ? "a.a.a.a" : "b.b.b.b");
+            });
+
+            return rl.RequestCount("a.a.a.a") == 50 && rl.RequestCount("b.b.b.b") == 50;
+        });
+
+        CheckTrue("concurrency failures count exact", () =>
+        {
+            var rl = new RateLimiter(new RateLimitOptions
+            {
+                MaxFailuresPerWindow = 100,
+                FailureWindowSeconds = 60,
+                LockoutSeconds = 60,
+            });
+            Parallel.For(0, 100, _ => rl.RecordFailure("9.9.9.9"));
+
+            return rl.FailureCount("9.9.9.9") == 100 && rl.Check("9.9.9.9") == RateLimiter.Verdict.LockedOut;
+        });
+    }
+
     static void TestRouting()
     {
         var airouter = new RouteOptions

@@ -15,6 +15,31 @@
     <Compile Include="..\AiRouterProxy\NoticeInjector.cs" Link="NoticeInjector.cs" />
     <Compile Include="..\AiRouterProxy\RouteResolver.cs" Link="RouteResolver.cs" />
     <Compile Include="..\AiRouterProxy\ProxyOptions.cs" Link="ProxyOptions.cs" />
+    <Compile Include="..\AiRouterProxy\InspectionPolicy.cs" Link="InspectionPolicy.cs" />
+    <Compile Include="..\AiRouterProxy\SecretDetector.cs" Link="SecretDetector.cs" />
+    <Compile Include="..\AiRouterProxy\SecurityHelpers.cs" Link="SecurityHelpers.cs" />
+    <Compile Include="..\AiRouterProxy\AuthenticationPolicy.cs" Link="AuthenticationPolicy.cs" />
+    <Compile Include="..\AiRouterProxy\RateLimiter.cs" Link="RateLimiter.cs" />
+    <Compile Include="..\AiRouterProxy\SseEvent.cs" Link="SseEvent.cs" />
+    <Compile Include="..\AiRouterProxy\SseParser.cs" Link="SseParser.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\SseEventKind.cs" Link="SseProtocol\SseEventKind.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\ISseProtocolAdapter.cs" Link="SseProtocol\ISseProtocolAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\SseProtocolJson.cs" Link="SseProtocol\SseProtocolJson.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\SseProtocolAdapterBase.cs" Link="SseProtocol\SseProtocolAdapterBase.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\SseProtocolRegistry.cs" Link="SseProtocol\SseProtocolRegistry.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\OpenAiChatAdapter.cs" Link="SseProtocol\OpenAiChatAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\OpenAiResponsesAdapter.cs" Link="SseProtocol\OpenAiResponsesAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\AnthropicAdapter.cs" Link="SseProtocol\AnthropicAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\GenericSseAdapter.cs" Link="SseProtocol\GenericSseAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseStreamProcessor.cs" Link="SseStreamProcessor.cs" />
+  </ItemGroup>
+
+  <!-- The dedicated integration project lives in tests/Integration and must NOT be
+       compiled by this offline harness (it has its own Program.cs). -->
+  <ItemGroup>
+    <Compile Remove="Integration\**" />
+    <EmbeddedResource Remove="Integration\**" />
+    <None Remove="Integration\**" />
   </ItemGroup>
 
 </Project>
