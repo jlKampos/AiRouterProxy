@@ -9,7 +9,8 @@
         "byFieldName": true,
         "byFormats": true,
         "byKeyValueContext": true,
-        "byLongStrings": true
+        "byLongStrings": true,
+        "entropyThreshold": 3.0
       }
     },
     "Inspection": {

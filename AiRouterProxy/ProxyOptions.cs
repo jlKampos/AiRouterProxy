@@ -141,6 +141,13 @@ public sealed class DetectOptions
 
     /// <summary>Long URL-safe tokens (>= 28 chars) with mixed classes.</summary>
     public bool ByLongStrings { get; set; } = true;
+
+    /// <summary>
+    /// Minimum Shannon entropy (bits/char) for the long-string scanner (default 3.0).
+    /// Entropy is never the only signal - a token must also look random (wide alphabet
+    /// or mixed classes) and not be a hex/uuid-like value.
+    /// </summary>
+    public double EntropyThreshold { get; set; } = 3.0;
 }
 
 public sealed class CertOptions

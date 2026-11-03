@@ -29,6 +29,7 @@ class Program
         TestNotices();
         TestExtendedDetection();
         TestPreviews();
+        TestDetector();
         TestRouting();
         TestInspectionPolicy();
         Console.WriteLine();
@@ -50,7 +51,7 @@ class Program
         CheckTrue("multiple inline keys", () => r2.Changed
             && !s2.Contains("sk-ant-") && !s2.Contains("ghp_") && !s2.Contains("AIza")
             && !s2.Contains("npm_") && !s2.Contains("xoxb-") && !s2.Contains("AKIA")
-            && r2.Stats.ByKind.GetValueOrDefault("openai") >= 1
+            && r2.Stats.ByKind.GetValueOrDefault("anthropic") >= 1
             && r2.Stats.ByKind.GetValueOrDefault("github") >= 1
             && r2.Stats.ByKind.GetValueOrDefault("google") >= 1
             && r2.Stats.ByKind.GetValueOrDefault("npm") >= 1
@@ -311,30 +312,25 @@ class Program
     // --------------------------------------------------------------
     static void TestPreviews()
     {
-        // Format detection collects a masked preview, never the full value
+        // Format detection collects a category-only preview, never content
         var r1 = SecretRedactor.RedactJson(Bytes("{\"content\":\"use sk-abcdefghijklmnop123 x\"}"));
         CheckTrue("preview format masked", () => r1.Stats.Previews.Count == 1
-            && r1.Stats.Previews[0].Kind == "openai"
-            && r1.Stats.Previews[0].Preview == "sk-a\u2026"
-            && !r1.Stats.Previews[0].Preview.Contains("abcdefghijklmnop123"));
+            && r1.Stats.Previews[0].Kind == "openai");
 
         // Field-name detection preview
         var r2 = SecretRedactor.RedactJson(Bytes("{\"password\":\"supersecret123\"}"));
         CheckTrue("preview field masked", () => r2.Stats.Previews.Count == 1
-            && r2.Stats.Previews[0].Kind == "password"
-            && r2.Stats.Previews[0].Preview == "supe\u2026");
+            && r2.Stats.Previews[0].Kind == "password");
 
         // key=value context preview
         var r3 = SecretRedactor.RedactJson(Bytes("{\"c\":\"use LOCAL_KEY=abcdefgh1234 and continue\"}"));
         CheckTrue("preview context masked", () => r3.Stats.Previews.Count == 1
-            && r3.Stats.Previews[0].Kind == "key_in_text"
-            && r3.Stats.Previews[0].Preview == "abcd\u2026");
+            && r3.Stats.Previews[0].Kind == "key_in_text");
 
         // Long-string preview (layer still works when enabled)
         var r4 = SecretRedactor.RedactJson(Bytes("{\"c\":\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\"}"));
         CheckTrue("preview longString masked", () => r4.Stats.Previews.Count == 1
-            && r4.Stats.Previews[0].Kind == "suspicious_key"
-            && r4.Stats.Previews[0].Preview == "4v_w\u2026");
+            && r4.Stats.Previews[0].Kind == "suspicious_key");
 
         // Long strings disabled -> no detection, no preview (current default config)
         var r5 = SecretRedactor.RedactJson(Bytes("{\"c\":\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\"}"), detectByLongStrings: false);
@@ -347,9 +343,9 @@ class Program
         var r6 = SecretRedactor.RedactJson(Bytes("{\"c\":\"" + many + "\"}"));
         CheckTrue("previews capped at 6", () => r6.Stats.Total == 9 && r6.Stats.Previews.Count == 6);
 
-        // FormatPreviews renders readable text
+        // FormatPreviews renders readable, category-only text (no value prefix)
         var text = SecretRedactor.FormatPreviews(r1.Stats.Previews);
-        CheckTrue("FormatPreviews text", () => text.Contains("sk-a\u2026") && text.Contains("OpenAI key"));
+        CheckTrue("FormatPreviews text", () => text.Contains("OpenAI key") && text.Contains("detected") && !text.Contains("sk-a"));
     }
 
     // --------------------------------------------------------------
@@ -389,6 +385,113 @@ class Program
         // Disabled = everything passes.
         var off = new InspectionOptions { Enabled = false };
         CheckTrue("disabled -> inspect", () => InspectionPolicy.Decide(off, true, "application/xml") == InspectionPolicy.ActionInspect);
+    }
+
+    // --------------------------------------------------------------
+    // Unified secret detector (Sprint 2)
+    // --------------------------------------------------------------
+    static void TestDetector()
+    {
+        var opts = new DetectOptions();
+
+        // --- Shannon entropy ---
+        CheckTrue("entropy random high", () => SecretDetector.ShannonEntropy("XyZ0pQr9mN2vW7sT4uL8kK1jH6gF5dS3aBc") > 3.0);
+        CheckTrue("entropy monotone low", () => SecretDetector.ShannonEntropy(new string('a', 40)) < 0.5);
+
+        // --- Known formats: category + confidence + position, never the value ---
+        var openai = SecretDetector.Detect("key sk-abcde12345fghij67890 end", opts);
+        CheckTrue("format openai", () => openai.Count == 1 && openai[0].Category == "openai"
+            && openai[0].Detector == SecretDetector.DetectorFormat
+            && openai[0].Confidence == Confidence.High
+            && openai[0].Start == 4 && openai[0].Length == 23);
+
+        var ant = SecretDetector.Detect("use sk-ant-api03-abcdefghijklmnopqrstuvwxyz12", opts);
+        CheckTrue("format anthropic", () => ant.Count == 1 && ant[0].Category == "anthropic" && ant[0].Length >= 28);
+
+        var stripe = SecretDetector.Detect("sk_live_51AbCdEfGhIjKlMnOpQrStUvWxYz1234567890", opts);
+        CheckTrue("format stripe", () => stripe.Count == 1 && stripe[0].Category == "stripe");
+
+        var gh = SecretDetector.Detect("token ghp_12345678901234567890123456789012345678", opts);
+        CheckTrue("format github", () => gh.Count == 1 && gh[0].Category == "github" && gh[0].Confidence == Confidence.High);
+
+        var gp = SecretDetector.Detect("github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz1234", opts);
+        CheckTrue("format github_pat", () => gp.Count == 1 && gp[0].Category == "github");
+
+        var goog = SecretDetector.Detect("AIzaSyA1234567890abcdefghijklmnopqrstuv", opts);
+        CheckTrue("format google", () => goog.Count == 1 && goog[0].Category == "google");
+
+        var slack = SecretDetector.Detect("xoxb-1234567890-123456789012-abcdefghijklmn", opts);
+        CheckTrue("format slack", () => slack.Count == 1 && slack[0].Category == "slack");
+
+        var npm = SecretDetector.Detect("npm_AbC1234567890abcdefghijklmnopqrstuvwx", opts);
+        CheckTrue("format npm", () => npm.Count == 1 && npm[0].Category == "npm");
+
+        var aws = SecretDetector.Detect("aws AKIAIOSFODNN7EXAMPLE end", opts);
+        CheckTrue("format aws", () => aws.Count == 1 && aws[0].Category == "aws" && aws[0].Length == 20);
+
+        var jwt = SecretDetector.Detect("tok eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSM ABC", opts);
+        CheckTrue("format jwt", () => jwt.Count == 1 && jwt[0].Category == "jwt");
+
+        var pem = "-----BEGIN PRIVATE KEY-----\nMIIEVQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----";
+        var pk = SecretDetector.Detect(pem, opts);
+        CheckTrue("format private_key", () => pk.Count == 1 && pk[0].Category == "private_key");
+
+        var bearer = SecretDetector.Detect("Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456", opts);
+        CheckTrue("format bearer masks only the token", () => bearer.Count == 1
+            && bearer[0].Category == "bearer"
+            && bearer[0].Start == "Authorization: Bearer ".Length);
+
+        // --- Context layer ---
+        var ctx = SecretDetector.Detect("config LocalKey: abcdefgh1234 x", opts);
+        CheckTrue("context LocalKey", () => ctx.Count == 1
+            && ctx[0].Detector == SecretDetector.DetectorContext
+            && ctx[0].Category == SecretDetector.KindKeyValue);
+
+        // --- Entropy layer (never alone: threshold + random-look guard) ---
+        var ent = SecretDetector.Detect("tok 4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4 end", opts);
+        CheckTrue("entropy long string", () => ent.Count == 1
+            && ent[0].Detector == SecretDetector.DetectorEntropy
+            && ent[0].Category == SecretDetector.KindLongString);
+
+        // A narrow-alphabet token (~4.3 bits/char) is flagged at the default 3.0 but skipped at 4.5
+        var narrowAlphabet = "abcdefghij0123456789";
+        var narrow = new string(Enumerable.Range(0, 36).Select(i => narrowAlphabet[i % 20]).ToArray());
+        CheckTrue("entropy narrow alphabet flagged at 3.0", () => SecretDetector.Detect(narrow, opts).Count == 1);
+        CheckTrue("entropy threshold 4.5 skips", () => SecretDetector.Detect(narrow, new DetectOptions { EntropyThreshold = 4.5 }).Count == 0);
+
+        // --- False positives ---
+        CheckTrue("fp git sha ignored", () => SecretDetector.Detect("commit a5f3c8e2b9d147f0e6c8a1b2d3e4f5a6b7c8d9e0", opts).Count == 0);
+        CheckTrue("fp uuid ignored", () => SecretDetector.Detect("bug 550e8400-e29b-41d4-a716-446655440000", opts).Count == 0);
+        CheckTrue("fp prose ignored", () => SecretDetector.Detect("the quick brown fox jumps over the lazy dog again and again", opts).Count == 0);
+        CheckTrue("fp monotone ignored", () => SecretDetector.Detect(new string('a', 40), opts).Count == 0);
+        CheckTrue("fp long word ignored", () => SecretDetector.Detect("supercalifragilisticexpialidocious word", opts).Count == 0);
+
+        // --- Layer toggles ---
+        CheckTrue("byFormats off", () => SecretDetector.Detect("sk-abcde12345fghij67890", new DetectOptions { ByFormats = false }).Count == 0);
+        CheckTrue("byContext off", () => SecretDetector.Detect("LocalKey: abcdefgh1234", new DetectOptions { ByKeyValueContext = false }).Count == 0);
+        CheckTrue("byLongStrings off", () => SecretDetector.Detect("4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4", new DetectOptions { ByLongStrings = false }).Count == 0);
+        CheckTrue("null/empty input", () => SecretDetector.Detect(null, opts).Count == 0 && SecretDetector.Detect("", opts).Count == 0);
+
+        // --- Overlap resolution (format > context > entropy) ---
+        CheckTrue("overlap format wins over entropy", () =>
+            SecretDetector.Detect("sk-abcde12345fghij67890abcdefghijklmnop", opts) is { Count: 1 } f0
+                && f0[0].Detector == SecretDetector.DetectorFormat);
+        CheckTrue("overlap context wins over entropy", () =>
+            SecretDetector.Detect("api_key=\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\"", opts) is { Count: 1 } f1
+                && f1[0].Category == SecretDetector.KindKeyValue);
+
+        // --- End-to-end via the redactor: nested + free text, value never leaks ---
+        var nested = SecretRedactor.RedactJson(Bytes("{\"deployment\":{\"environment\":{\"DATABASE_PASSWORD\":\"sup3rS3cr3tValue123\",\"CUSTOM_AUTH\":\"ghp_abcdefghijklmnopqrstuvwx90\"}}}"));
+        CheckTrue("nested credentials redacted", () => nested.Changed
+            && !Str(nested.Data).Contains("sup3rS3cr3tValue123")
+            && !Str(nested.Data).Contains("ghp_abcdefghijklmnopqrstuvwx90"));
+
+        var freeText = SecretRedactor.RedactJson(Bytes("{\"content\":\"My GitHub token is ghp_abcdefghijklmnopqrstuvwxyz123456, never share it\"}"));
+        CheckTrue("free text github redacted", () => freeText.Changed && !Str(freeText.Data).Contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
+
+        var noticeSource = SecretRedactor.RedactJson(Bytes("{\"content\":\"key sk-abcdefghijklmnop123 x\"}"));
+        var notice = SecretRedactor.FormatPreviews(noticeSource.Stats.Previews);
+        CheckTrue("notice leaks no content", () => notice.Contains("OpenAI key") && !notice.Contains("sk-"));
     }
 
     static void TestRouting()

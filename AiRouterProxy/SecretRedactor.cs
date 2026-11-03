@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -10,21 +11,21 @@ namespace AIRouterProxy;
 /// If nothing is found, returns the original bytes intact.
 /// Detection layers (all optional):
 ///  - byFieldName: value of properties with sensitive names (api_key, password, senha, token...);
-///  - byFormats:   known formats (sk-..., ghp_, AIza..., JWT, Bearer, PEM...);
-///  - byKeyValueContext: "key: value" / "KEY=value" in text (config excerpts);
-///  - byLongStrings: long URL-safe tokens (>= 28 chars) with mixed classes (entropy).
+///  - byFormats:   known formats (sk-..., ghp_, AIza, JWT, Bearer, PEM...) via SecretDetector;
+///  - byKeyValueContext: "key: value" / "KEY=value" in text (config excerpts) via SecretDetector;
+///  - byLongStrings: long random-looking tokens (Shannon entropy) via SecretDetector.
+/// All text scanners run through <see cref="SecretDetector"/>, so detection lives in one place.
 /// </summary>
 public static class SecretRedactor
 {
     /// <summary>Default mask - fixed bullets (does not reveal the real length).</summary>
     public const string DefaultMask = "\u2022\u2022\u2022\u2022\u2022\u2022"; // ••••••
 
-    private const string KindKeyValue = "key_in_text";
-    private const string KindLongString = "suspicious_key";
-    private const int LongStringMinLength = 28;
-
-    /// <summary>A masked preview of a single detected value, used in the response notice.</summary>
-    public sealed record RedactionPreview(string Kind, string Preview);
+    /// <summary>
+    /// A category-only label of a single detection, used in the response notice.
+    /// Deliberately carries no content sample, so no partial credential can leak.
+    /// </summary>
+    public sealed record RedactionPreview(string Kind);
 
     public sealed class RedactionStats
     {
@@ -35,7 +36,7 @@ public static class SecretRedactor
         public int Total => FieldRedactions + FormatRedactions + ContextRedactions + LongStringRedactions;
         public Dictionary<string, int> ByKind { get; } = new(StringComparer.Ordinal);
 
-        /// <summary>Masked previews of detected values (never the full value). Capped.</summary>
+        /// <summary>Category-only previews of detected values (never content). Capped.</summary>
         public List<RedactionPreview> Previews { get; } = new();
     }
 
@@ -58,7 +59,8 @@ public static class SecretRedactor
         bool detectByFieldName = true,
         bool detectByFormats = true,
         bool detectByKeyValueContext = true,
-        bool detectByLongStrings = true)
+        bool detectByLongStrings = true,
+        double detectEntropyThreshold = 3.0)
     {
         var result = new Result { Data = body, Changed = false };
 
@@ -89,7 +91,8 @@ public static class SecretRedactor
             }))
             {
                 WriteElement(writer, doc.RootElement, null, maskValue, result.Stats,
-                    detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings);
+                    detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
+                    detectEntropyThreshold);
             }
 
             if (result.Stats.Total > 0)
@@ -130,6 +133,7 @@ public static class SecretRedactor
         "jwt" => "JWT token",
         "bearer" => "bearer token",
         "openai" => "OpenAI key",
+        "anthropic" => "Anthropic key",
         "stripe" => "Stripe key",
         "github" => "GitHub token",
         "google" => "Google key",
@@ -142,21 +146,22 @@ public static class SecretRedactor
     };
 
     private const int PreviewMax = 6;
-    private const int PreviewPrefixLength = 4;
 
-    /// <summary>Masks a detected value into a short preview (first N chars + "…").</summary>
-    private static void AddPreview(RedactionStats stats, string kind, string? value)
+    /// <summary>Registers a category-only preview (never the value). Capped.</summary>
+    private static void AddPreview(RedactionStats stats, string kind)
     {
-        if (stats.Previews.Count >= PreviewMax || string.IsNullOrEmpty(value))
+        if (stats.Previews.Count >= PreviewMax)
         {
             return;
         }
 
-        var prefix = value.Length <= PreviewPrefixLength ? value : value[..PreviewPrefixLength];
-        stats.Previews.Add(new RedactionPreview(kind, prefix + "\u2026"));
+        stats.Previews.Add(new RedactionPreview(kind));
     }
 
-    /// <summary>Formats the previews for the response notice (e.g. `sk-4C…` (OpenAI key)).</summary>
+    /// <summary>
+    /// Formats the previews for the response notice. Category-only - no value prefix is ever shown.
+    /// Example: "OpenAI key detected, GitHub token detected".
+    /// </summary>
     public static string FormatPreviews(IReadOnlyList<RedactionPreview>? previews)
     {
         if (previews is null || previews.Count == 0)
@@ -167,7 +172,7 @@ public static class SecretRedactor
         var parts = new List<string>(previews.Count);
         foreach (var preview in previews)
         {
-            parts.Add($"`{preview.Preview}` ({Humanize(preview.Kind)})");
+            parts.Add($"{Humanize(preview.Kind)} detected");
         }
 
         return string.Join(", ", parts);
@@ -310,93 +315,6 @@ public static class SecretRedactor
     }
 
     // ------------------------------------------------------------------
-    // Layer 2 — KNOWN FORMAT (any text, incl. code blocks)
-    // ------------------------------------------------------------------
-
-    private sealed record FormatPattern(Regex Regex, string Kind, string? PrefixGroup = null);
-
-    private static readonly FormatPattern[] FormatPatterns =
-    {
-        // OpenAI / Anthropic / project keys
-        new(new Regex(@"sk-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{10,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "openai"),
-        new(new Regex(@"sk_[A-Za-z0-9]{20,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "openai"),
-        // Stripe
-        new(new Regex(@"sk_(?:live|test)_[0-9A-Za-z]{10,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "stripe"),
-        // GitHub
-        new(new Regex(@"gh[pousr]_[A-Za-z0-9]{10,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "github"),
-        new(new Regex(@"github_pat_[A-Za-z0-9_]{20,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "github"),
-        // Google
-        new(new Regex(@"AIza[0-9A-Za-z_-]{20,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "google"),
-        // Slack
-        new(new Regex(@"xox[baprs]-[0-9A-Za-z-]{10,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "slack"),
-        // npm
-        new(new Regex(@"npm_[A-Za-z0-9]{20,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "npm"),
-        // AWS access key id
-        new(new Regex(@"AKIA[0-9A-Z]{16}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "aws"),
-        // JWT
-        new(new Regex(@"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "jwt"),
-        // "Bearer <token>" in text - keeps the prefix, replaces the token
-        new(new Regex(@"(Bearer\s+)([A-Za-z0-9._~+/=-]{12,})",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "bearer", "1"),
-        // PEM private key blocks
-        new(new Regex(@"-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----",
-            RegexOptions.Compiled | RegexOptions.CultureInvariant), "private_key"),
-    };
-
-    // ------------------------------------------------------------------
-    // Layer 3 — "key: value" CONTEXT in text
-    // ------------------------------------------------------------------
-
-    /// <summary>
-    /// Catches config excerpts pasted into messages: `"LocalKey": "abc..."`, `LOCAL_KEY=abc...`,
-    /// `password: abc...`. The name and separator stay; only the value is masked.
-    /// </summary>
-    private static readonly Regex KeyValueContextRegex = new(
-        @"(?i)(?<![A-Za-z0-9_])"
-        + @"(?<name>api[_-]?key|api[_-]?secret|loc[a]?l[_-]?key|secret[_-]?key|secret|private[_-]?key|master[_-]?key|encryption[_-]?key|client[_-]?secret|password|passwd|senha|credential|authorization|access[_-]?token|refresh[_-]?token|bearer[_-]?token)"
-        + @"(?<sep>[\""']?\s*[:=]\s*[\""']?)"
-        + @"(?<value>[A-Za-z0-9_\.~+/=-]{8,})",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
-    // ------------------------------------------------------------------
-    // Layer 4 — LONG STRINGS (URL-safe token >= 28 chars with entropy)
-    // ------------------------------------------------------------------
-
-    private static readonly Regex LongStringRegex = new(
-        @"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{28,}(?![A-Za-z0-9_-])",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
-    /// <summary>False-positive guard: requires a mix of classes (lower/upper/digit/symbol).</summary>
-    private static bool LooksRandom(string token)
-    {
-        var lower = false;
-        var upper = false;
-        var digit = false;
-        var symbol = false;
-
-        foreach (var c in token)
-        {
-            if (char.IsLower(c)) lower = true;
-            else if (char.IsUpper(c)) upper = true;
-            else if (char.IsDigit(c)) digit = true;
-            else symbol = true;
-        }
-
-        var classes = (lower ? 1 : 0) + (upper ? 1 : 0) + (digit ? 1 : 0) + (symbol ? 1 : 0);
-        return classes >= 2;
-    }
-
-    // ------------------------------------------------------------------
     // JSON walk
     // ------------------------------------------------------------------
 
@@ -409,7 +327,8 @@ public static class SecretRedactor
         bool detectByFieldName,
         bool detectByFormats,
         bool detectByKeyValueContext,
-        bool detectByLongStrings)
+        bool detectByLongStrings,
+        double detectEntropyThreshold)
     {
         switch (element.ValueKind)
         {
@@ -419,7 +338,8 @@ public static class SecretRedactor
                 {
                     writer.WritePropertyName(property.Name);
                     WriteElement(writer, property.Value, property.Name, mask, stats,
-                        detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings);
+                        detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
+                        detectEntropyThreshold);
                 }
                 writer.WriteEndObject();
                 break;
@@ -429,7 +349,8 @@ public static class SecretRedactor
                 foreach (var item in element.EnumerateArray())
                 {
                     WriteElement(writer, item, null, mask, stats,
-                        detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings);
+                        detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
+                        detectEntropyThreshold);
                 }
                 writer.WriteEndArray();
                 break;
@@ -442,12 +363,12 @@ public static class SecretRedactor
                     var kind = FieldKind(parentName);
                     stats.FieldRedactions++;
                     stats.ByKind[kind] = stats.ByKind.TryGetValue(kind, out var count) ? count + 1 : 1;
-                    AddPreview(stats, kind, text);
+                    AddPreview(stats, kind);
                 }
                 else
                 {
                     writer.WriteStringValue(ApplyScans(text, mask, stats,
-                        detectByFormats, detectByKeyValueContext, detectByLongStrings));
+                        detectByFormats, detectByKeyValueContext, detectByLongStrings, detectEntropyThreshold));
                 }
                 break;
 
@@ -457,114 +378,100 @@ public static class SecretRedactor
         }
     }
 
+    // ------------------------------------------------------------------
+    // Unified text scanning (formats + context + entropy => SecretDetector)
+    // ------------------------------------------------------------------
+
     private static string ApplyScans(
         string? text,
         string mask,
         RedactionStats stats,
         bool detectByFormats,
         bool detectByKeyValueContext,
-        bool detectByLongStrings)
+        bool detectByLongStrings,
+        double detectEntropyThreshold)
     {
         if (string.IsNullOrEmpty(text))
         {
             return text ?? string.Empty;
         }
 
-        var current = text;
-
-        if (detectByFormats)
+        var opts = new DetectOptions
         {
-            current = ApplyFormats(current, mask, stats);
-        }
+            ByFormats = detectByFormats,
+            ByKeyValueContext = detectByKeyValueContext,
+            ByLongStrings = detectByLongStrings,
+            EntropyThreshold = detectEntropyThreshold,
+        };
 
-        if (detectByKeyValueContext)
-        {
-            current = ApplyKeyValueContext(current, mask, stats);
-        }
-
-        if (detectByLongStrings)
-        {
-            current = ApplyLongStrings(current, mask, stats);
-        }
-
-        return current;
+        return ApplyFindings(text, mask, stats, opts);
     }
 
-    private static string ApplyFormats(string current, string mask, RedactionStats stats)
+    /// <summary>
+    /// Masks every finding returned by <see cref="SecretDetector.Detect"/> in a single pass,
+    /// rebuilding the string around the detected spans. Stats are tallied per detector family.
+    /// </summary>
+    private static string ApplyFindings(string current, string mask, RedactionStats stats, DetectOptions opts)
     {
-        foreach (var pattern in FormatPatterns)
+        var findings = SecretDetector.Detect(current, opts);
+        if (findings.Count == 0)
         {
-            var matches = 0;
-            current = pattern.Regex.Replace(current, m =>
-            {
-                matches++;
-                var sample = pattern.PrefixGroup is null ? m.Value : m.Groups[2].Value;
-                AddPreview(stats, pattern.Kind, sample);
-                return pattern.PrefixGroup is null
-                    ? mask
-                    : m.Groups[pattern.PrefixGroup].Value + mask;
-            });
-
-            if (matches > 0)
-            {
-                var kind = pattern.Kind;
-                stats.FormatRedactions += matches;
-                stats.ByKind[kind] = stats.ByKind.TryGetValue(kind, out var count) ? count + matches : matches;
-            }
+            return current;
         }
 
-        return current;
-    }
+        var sb = new StringBuilder(current.Length + 64);
+        var cursor = 0;
+        var formatCount = 0;
+        var contextCount = 0;
+        var entropyCount = 0;
+        var byKindCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
-    private static string ApplyKeyValueContext(string current, string mask, RedactionStats stats)
-    {
-        var matches = 0;
-
-        current = KeyValueContextRegex.Replace(current, m =>
+        foreach (var finding in findings)
         {
-            var value = m.Groups["value"];
-            if (!value.Success || value.Length == 0)
+            sb.Append(current, cursor, finding.Start - cursor);
+            sb.Append(mask);
+
+            if (finding.Detector == SecretDetector.DetectorFormat)
             {
-                return m.Value;
+                formatCount++;
+            }
+            else if (finding.Detector == SecretDetector.DetectorContext)
+            {
+                contextCount++;
+            }
+            else
+            {
+                entropyCount++;
             }
 
-            var start = value.Index - m.Index;
-            matches++;
-            AddPreview(stats, KindKeyValue, value.Value);
-            return m.Value[..start] + mask + m.Value[(start + value.Length)..];
-        });
+            byKindCounts[finding.Category] = byKindCounts.TryGetValue(finding.Category, out var n) ? n + 1 : 1;
+            AddPreview(stats, finding.Category);
 
-        if (matches > 0)
-        {
-            stats.ContextRedactions += matches;
-            stats.ByKind[KindKeyValue] = stats.ByKind.TryGetValue(KindKeyValue, out var count) ? count + matches : matches;
+            cursor = finding.Start + finding.Length;
         }
 
-        return current;
-    }
+        sb.Append(current, cursor, current.Length - cursor);
 
-    private static string ApplyLongStrings(string current, string mask, RedactionStats stats)
-    {
-        var matches = 0;
-
-        current = LongStringRegex.Replace(current, m =>
+        if (formatCount > 0)
         {
-            if (m.Value.Length < LongStringMinLength || !LooksRandom(m.Value))
-            {
-                return m.Value;
-            }
-
-            matches++;
-            AddPreview(stats, KindLongString, m.Value);
-            return mask;
-        });
-
-        if (matches > 0)
-        {
-            stats.LongStringRedactions += matches;
-            stats.ByKind[KindLongString] = stats.ByKind.TryGetValue(KindLongString, out var count) ? count + matches : matches;
+            stats.FormatRedactions += formatCount;
         }
 
-        return current;
+        if (contextCount > 0)
+        {
+            stats.ContextRedactions += contextCount;
+        }
+
+        if (entropyCount > 0)
+        {
+            stats.LongStringRedactions += entropyCount;
+        }
+
+        foreach (var kv in byKindCounts)
+        {
+            stats.ByKind[kv.Key] = stats.ByKind.TryGetValue(kv.Key, out var count) ? count + kv.Value : kv.Value;
+        }
+
+        return sb.ToString();
     }
 }

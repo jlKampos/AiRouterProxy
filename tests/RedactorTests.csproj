@@ -15,7 +15,8 @@
     <Compile Include="..\AiRouterProxy\NoticeInjector.cs" Link="NoticeInjector.cs" />
     <Compile Include="..\AiRouterProxy\RouteResolver.cs" Link="RouteResolver.cs" />
     <Compile Include="..\AiRouterProxy\ProxyOptions.cs" Link="ProxyOptions.cs" />
-    <Compile Include="..\AiRouterProxy\InspectionPolicy.cs" Link="InspectionPolicy.cs" />  
+    <Compile Include="..\AiRouterProxy\InspectionPolicy.cs" Link="InspectionPolicy.cs" />
+    <Compile Include="..\AiRouterProxy\SecretDetector.cs" Link="SecretDetector.cs" />  
   </ItemGroup>
 
 </Project>
