@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using AIRouterProxy;
@@ -265,7 +266,7 @@ app.MapGet("/admin/health", (ActivityStore store) =>
     return Results.Ok(new
     {
         status = "ok",
-        version = typeof(Program).Assembly.GetName().Version?.ToString() ?? "0.0.0",
+        version = typeof(Program).Assembly.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0] ?? "0.0.0",
         timestamp = DateTimeOffset.UtcNow,
         uptimeSec = (long)uptime.TotalSeconds,
         activity = store.Count,

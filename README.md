@@ -2,6 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
+**Current version:** 1.0.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ## Why: a security layer for development environments
 
@@ -50,6 +51,7 @@ And the model only ever sees the masked value - never the real secret:
 - Sensitive-content redaction on outgoing requests (`redaction.json`, hot reload)
 - Admin endpoints protected by a local key (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
+- Versioned via assembly info (SemVer, e.g. 1.0.0); reported by /admin/health
 
 ## Structure
 
