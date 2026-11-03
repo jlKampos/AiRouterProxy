@@ -66,6 +66,10 @@ if (WindowsServiceHelpers.IsWindowsService())
 
 var proxyOptions = LoadProxyOptions(builder.Configuration);
 
+// Shared in-memory rate limiter (per client IP). Snapshot taken at startup: changing
+// RateLimit options requires a service restart (redaction/routes keep hot reload).
+builder.Services.AddSingleton(new RateLimiter(proxyOptions.RateLimit ?? new RateLimitOptions()));
+
 if (string.IsNullOrWhiteSpace(proxyOptions.Keys.UpstreamKey)
     || string.IsNullOrWhiteSpace(proxyOptions.Keys.LocalKey))
 {
@@ -148,6 +152,15 @@ app.MapGet("/admin/endpoints", (IOptionsMonitor<ProxyOptions> opts) =>
                     byLongStrings = o.Redaction.Detect?.ByLongStrings ?? true,
                 },
                 scope = "outgoing messages (JSON requests)",
+            },
+            rateLimit = new
+            {
+                enabled = o.RateLimit is { Enabled: true },
+                maxRequestsPerWindow = o.RateLimit?.MaxRequestsPerWindow ?? 0,
+                requestWindowSeconds = o.RateLimit?.RequestWindowSeconds ?? 0,
+                maxFailuresPerWindow = o.RateLimit?.MaxFailuresPerWindow ?? 0,
+                failureWindowSeconds = o.RateLimit?.FailureWindowSeconds ?? 0,
+                lockoutSeconds = o.RateLimit?.LockoutSeconds ?? 0,
             },
         },
         admin = new[]

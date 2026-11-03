@@ -16,7 +16,10 @@
     <Compile Include="..\AiRouterProxy\RouteResolver.cs" Link="RouteResolver.cs" />
     <Compile Include="..\AiRouterProxy\ProxyOptions.cs" Link="ProxyOptions.cs" />
     <Compile Include="..\AiRouterProxy\InspectionPolicy.cs" Link="InspectionPolicy.cs" />
-    <Compile Include="..\AiRouterProxy\SecretDetector.cs" Link="SecretDetector.cs" />  
+    <Compile Include="..\AiRouterProxy\SecretDetector.cs" Link="SecretDetector.cs" />
+    <Compile Include="..\AiRouterProxy\SecurityHelpers.cs" Link="SecurityHelpers.cs" />
+    <Compile Include="..\AiRouterProxy\AuthenticationPolicy.cs" Link="AuthenticationPolicy.cs" />
+    <Compile Include="..\AiRouterProxy\RateLimiter.cs" Link="RateLimiter.cs" />  
   </ItemGroup>
 
 </Project>

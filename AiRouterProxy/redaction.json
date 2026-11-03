@@ -24,6 +24,14 @@
         "multipart/form-data": "block",
         "application/x-www-form-urlencoded": "block"
       }
+    },
+    "RateLimit": {
+      "enabled": true,
+      "maxRequestsPerWindow": 120,
+      "requestWindowSeconds": 60,
+      "maxFailuresPerWindow": 10,
+      "failureWindowSeconds": 300,
+      "lockoutSeconds": 300
     }
   }
 }

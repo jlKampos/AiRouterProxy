@@ -12,6 +12,7 @@ public sealed class ProxyMiddleware
     private readonly IOptionsMonitor<ProxyOptions> _options;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ActivityStore _activity;
+    private readonly RateLimiter _rateLimiter;
 
     private static readonly string[] HeadersToForward =
         { "content-type", "cache-control", "retry-after", "x-request-id" };
@@ -21,12 +22,14 @@ public sealed class ProxyMiddleware
         ILogger<ProxyMiddleware> logger,
         IOptionsMonitor<ProxyOptions> options,
         IHttpClientFactory httpClientFactory,
-        ActivityStore activity)
+        ActivityStore activity,
+        RateLimiter rateLimiter)
     {
         _logger = logger;
         _options = options;
         _httpClientFactory = httpClientFactory;
         _activity = activity;
+        _rateLimiter = rateLimiter;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -58,17 +61,49 @@ public sealed class ProxyMiddleware
                 requestId, context.Request.Method, context.Request.Path, clientIp);
         }
 
+        // Rate limiting (per client) - cheap, fail-closed, runs before local authentication
+        // so it also protects against unauthenticated floods and brute-force lockouts.
+        if (options.RateLimit is { Enabled: true })
+        {
+            var verdict = _rateLimiter.Check(clientIp);
+            if (verdict != RateLimiter.Verdict.Allow)
+            {
+                finalStatus = StatusCodes.Status429TooManyRequests;
+                context.Response.Headers.RetryAfter =
+                    Math.Max(1, _rateLimiter.RetryAfterSeconds(clientIp)).ToString();
+
+                _logger.LogWarning("Rate limit exceeded | Id={Id} Client={Client} Verdict={Verdict}",
+                    requestId, clientIp, verdict);
+
+                await SendErrorAsync(context, StatusCodes.Status429TooManyRequests,
+                    verdict == RateLimiter.Verdict.LockedOut
+                        ? "Too many failed attempts. Try again later."
+                        : "Too many requests.",
+                    "rate_limit_error");
+                return;
+            }
+        }
+
         // 1. Local authentication - always first, before any routing/method logic.
         //    Unauthenticated clients must never see route/upstream information.
         var clientKey = SecurityHelpers.ExtractBearerToken(context.Request.Headers.Authorization.ToString());
-        if (!SecurityHelpers.SecureEquals(clientKey, options.Keys.LocalKey))
+        if (!AuthenticationPolicy.IsValidLocalKey(clientKey, options.Keys))
         {
+            var keyCount = AuthenticationPolicy.LocalKeyCount(options.Keys);
+
+            if (options.RateLimit is { Enabled: true })
+            {
+                _rateLimiter.RecordFailure(clientIp); // brute-force counter
+            }
+
             var userAgent = Truncate(context.Request.Headers.UserAgent.ToString(), 120);
 
             presentedHash = string.IsNullOrEmpty(clientKey)
                 ? "(empty)"
                 : SecurityHelpers.HashShort(SecurityHelpers.Sha256Hex(clientKey));
-            expectedHash = SecurityHelpers.HashShort(SecurityHelpers.Sha256Hex(options.Keys.LocalKey ?? string.Empty));
+            expectedHash = keyCount == 1
+                ? SecurityHelpers.HashShort(SecurityHelpers.Sha256Hex(options.Keys.LocalKey ?? string.Empty))
+                : null;
             finalStatus = StatusCodes.Status401Unauthorized;
             authRefused = true;
 
@@ -76,11 +111,12 @@ public sealed class ProxyMiddleware
             {
                 _logger.LogWarning(
                     "Authentication refused | Id={Id} Client={Client} Path={Path} " +
-                    "PresentedLen={PresentedLen} PresentedHash={PresentedHash} ExpectedHash={ExpectedHash} UA={UA}",
+                    "PresentedLen={PresentedLen} PresentedHash={PresentedHash} ExpectedHash={ExpectedHash} KeyCount={KeyCount} UA={UA}",
                     requestId, clientIp, context.Request.Path.Value ?? "/",
                     clientKey?.Length ?? 0,
                     presentedHash,
-                    expectedHash,
+                    expectedHash ?? "(multiple keys)",
+                    keyCount,
                     userAgent);
             }
             catch

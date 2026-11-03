@@ -24,6 +24,11 @@ public sealed class ProxyOptions
     public InspectionOptions Inspection { get; set; } = new();
 
     /// <summary>
+    /// Per-client rate limiting and brute-force protection (see <see cref="RateLimitOptions"/>).
+    /// </summary>
+    public RateLimitOptions RateLimit { get; set; } = new();
+
+    /// <summary>
     /// Route table (Item 2). If empty, the proxy works as before:
     /// 1 fixed upstream (<see cref="Upstream"/>) + <see cref="AllowedPaths"/>.
     /// </summary>
@@ -150,6 +155,33 @@ public sealed class DetectOptions
     public double EntropyThreshold { get; set; } = 3.0;
 }
 
+/// <summary>
+/// Rate limiting and brute-force protection, both per client IP.
+/// - Requests beyond <see cref="MaxRequestsPerWindow"/> in <see cref="RequestWindowSeconds"/> -> 429.
+/// - After <see cref="MaxFailuresPerWindow"/> failed local-key attempts in
+///   <see cref="FailureWindowSeconds"/>, the client is locked out for <see cref="LockoutSeconds"/> (429).
+/// </summary>
+public sealed class RateLimitOptions
+{
+    /// <summary>Turns per-client rate limiting on/off (default: on - fail closed).</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Maximum requests per client in the window (default: 120).</summary>
+    public int MaxRequestsPerWindow { get; set; } = 120;
+
+    /// <summary>Sliding window for the request limit, in seconds (default: 60).</summary>
+    public int RequestWindowSeconds { get; set; } = 60;
+
+    /// <summary>Failed authentication attempts tolerated before a lockout (default: 10).</summary>
+    public int MaxFailuresPerWindow { get; set; } = 10;
+
+    /// <summary>Sliding window for the failure count, in seconds (default: 300 = 5 min).</summary>
+    public int FailureWindowSeconds { get; set; } = 300;
+
+    /// <summary>How long a client stays locked out after too many failures, in seconds (default: 300 = 5 min).</summary>
+    public int LockoutSeconds { get; set; } = 300;
+}
+
 public sealed class CertOptions
 {
     public string? PemCert { get; set; } = "proxy-cert.pem";
@@ -161,5 +193,14 @@ public sealed class CertOptions
 public sealed class KeyOptions
 {
     public string? UpstreamKey { get; set; }
+
+    /// <summary>The primary local key (compatibility).</summary>
     public string? LocalKey { get; set; }
+
+    /// <summary>
+    /// Additional accepted local keys (e.g. rotation or multiple clients). A request is
+    /// authenticated if it matches <see cref="LocalKey"/> or any entry here.
+    /// Values live only in appsettings.Server.json / environment (never in non-secret files).
+    /// </summary>
+    public List<string> LocalKeys { get; set; } = new();
 }

@@ -30,6 +30,8 @@ class Program
         TestExtendedDetection();
         TestPreviews();
         TestDetector();
+        TestAuthenticationPolicy();
+        TestRateLimiter();
         TestRouting();
         TestInspectionPolicy();
         Console.WriteLine();
@@ -492,6 +494,97 @@ class Program
         var noticeSource = SecretRedactor.RedactJson(Bytes("{\"content\":\"key sk-abcdefghijklmnop123 x\"}"));
         var notice = SecretRedactor.FormatPreviews(noticeSource.Stats.Previews);
         CheckTrue("notice leaks no content", () => notice.Contains("OpenAI key") && !notice.Contains("sk-"));
+    }
+
+    // --------------------------------------------------------------
+    // Authentication policy (multi-key) and rate limiting (Sprint 3)
+    // --------------------------------------------------------------
+    static void TestAuthenticationPolicy()
+    {
+        var single = new KeyOptions { LocalKey = "abc" };
+        CheckTrue("single valid", () => AuthenticationPolicy.IsValidLocalKey("abc", single));
+        CheckTrue("single invalid", () => !AuthenticationPolicy.IsValidLocalKey("xyz", single));
+        CheckTrue("single null/empty", () => !AuthenticationPolicy.IsValidLocalKey(null, single)
+            && !AuthenticationPolicy.IsValidLocalKey(string.Empty, single));
+        CheckTrue("null keys", () => !AuthenticationPolicy.IsValidLocalKey("abc", null));
+
+        var multi = new KeyOptions
+        {
+            LocalKey = "abc",
+            LocalKeys = new List<string> { "def", "ghi" },
+        };
+        CheckTrue("multi primary", () => AuthenticationPolicy.IsValidLocalKey("abc", multi));
+        CheckTrue("multi secondary", () => AuthenticationPolicy.IsValidLocalKey("def", multi)
+            && AuthenticationPolicy.IsValidLocalKey("ghi", multi));
+        CheckTrue("multi invalid", () => !AuthenticationPolicy.IsValidLocalKey("xyz", multi));
+
+        CheckTrue("key count single", () => AuthenticationPolicy.LocalKeyCount(single) == 1);
+        CheckTrue("key count multi", () => AuthenticationPolicy.LocalKeyCount(multi) == 3);
+        CheckTrue("key count null", () => AuthenticationPolicy.LocalKeyCount(null) == 0);
+        CheckTrue("empty extra list", () => AuthenticationPolicy.LocalKeyCount(new KeyOptions { LocalKey = "a" }) == 1);
+    }
+
+    static void TestRateLimiter()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var rl = new RateLimiter(new RateLimitOptions
+        {
+            MaxRequestsPerWindow = 3,
+            RequestWindowSeconds = 60,
+            MaxFailuresPerWindow = 2,
+            FailureWindowSeconds = 60,
+            LockoutSeconds = 30,
+        }, () => now);
+
+        CheckTrue("allow under limit", () => rl.Check("1.2.3.4") == RateLimiter.Verdict.Allow);
+        CheckTrue("allow at limit", () => rl.Check("1.2.3.4") == RateLimiter.Verdict.Allow
+            && rl.Check("1.2.3.4") == RateLimiter.Verdict.Allow);
+        CheckTrue("deny over limit", () => rl.Check("1.2.3.4") == RateLimiter.Verdict.TooManyRequests);
+        CheckTrue("other key independent", () => rl.Check("5.6.7.8") == RateLimiter.Verdict.Allow);
+        CheckTrue("request count", () => rl.RequestCount("1.2.3.4") == 3);
+
+        now = now.AddMinutes(2);
+        CheckTrue("window slides", () => rl.Check("1.2.3.4") == RateLimiter.Verdict.Allow
+            && rl.RequestCount("1.2.3.4") == 1);
+
+        // Brute-force lockout: 2 failures -> locked; lockout expires after 30s
+        var now2 = DateTimeOffset.UtcNow;
+        var rl2 = new RateLimiter(new RateLimitOptions
+        {
+            MaxFailuresPerWindow = 2,
+            FailureWindowSeconds = 60,
+            LockoutSeconds = 30,
+        }, () => now2);
+
+        rl2.RecordFailure("9.9.9.9");
+        rl2.RecordFailure("9.9.9.9");
+        CheckTrue("locked after 2 failures", () => rl2.Check("9.9.9.9") == RateLimiter.Verdict.LockedOut
+            && rl2.FailureCount("9.9.9.9") == 2);
+
+        now2 = now2.AddSeconds(31);
+        CheckTrue("lockout expires", () => rl2.Check("9.9.9.9") == RateLimiter.Verdict.Allow);
+
+        // Failures expire with their window
+        var now3 = DateTimeOffset.UtcNow;
+        var rl3 = new RateLimiter(new RateLimitOptions
+        {
+            MaxFailuresPerWindow = 2,
+            FailureWindowSeconds = 60,
+            LockoutSeconds = 30,
+        }, () => now3);
+
+        rl3.RecordFailure("z");
+        now3 = now3.AddSeconds(61);
+        rl3.RecordFailure("z");
+        CheckTrue("failures expire", () => rl3.FailureCount("z") == 1
+            && rl3.Check("z") == RateLimiter.Verdict.Allow);
+
+        // Retry-After is always >= 1s
+        CheckTrue("retry-after positive", () => rl.RetryAfterSeconds("5.6.7.8") >= 1
+            && rl2.RetryAfterSeconds("9.9.9.9") >= 1);
+
+        // Empty/unknown key maps to "unknown" without crashing
+        CheckTrue("null key safe", () => { rl.Check(null!); rl.RecordFailure(null!); return true; });
     }
 
     static void TestRouting()
