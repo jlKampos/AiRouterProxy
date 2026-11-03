@@ -30,6 +30,7 @@ class Program
         TestExtendedDetection();
         TestPreviews();
         TestRouting();
+        TestInspectionPolicy();
         Console.WriteLine();
         Console.WriteLine($"RESULT: {_passed} PASS, {_failed} FAIL");
         Environment.ExitCode = _failed == 0 ? 0 : 1;
@@ -354,6 +355,42 @@ class Program
     // --------------------------------------------------------------
     // Multi-upstream router (Item 2)
     // --------------------------------------------------------------
+    // --------------------------------------------------------------
+    // Fail-closed body inspection (Item: InspectionPolicy)
+    // --------------------------------------------------------------
+    static void TestInspectionPolicy()
+    {
+        var def = new InspectionOptions(); // application/json: inspect, default: block
+
+        // Inspect: JSON is allowed.
+        CheckTrue("json -> inspect", () => InspectionPolicy.Decide(def, true, "application/json") == InspectionPolicy.ActionInspect);
+        CheckTrue("json charset -> inspect", () => InspectionPolicy.Decide(def, true, "application/json; charset=utf-8") == InspectionPolicy.ActionInspect);
+        CheckTrue("+json subtype -> inspect", () => InspectionPolicy.Decide(def, true, "application/problem+json") == InspectionPolicy.ActionInspect);
+        CheckTrue("case-insensitive", () => InspectionPolicy.Decide(def, true, "Application/JSON") == InspectionPolicy.ActionInspect);
+
+        // Block: unknown / explicitly blocked types with a body.
+        CheckTrue("xml -> block", () => InspectionPolicy.Decide(def, true, "application/xml") == InspectionPolicy.ActionBlock);
+        CheckTrue("octet-stream -> block", () => InspectionPolicy.Decide(def, true, "application/octet-stream") == InspectionPolicy.ActionBlock);
+        CheckTrue("multipart -> block", () => InspectionPolicy.Decide(def, true, "multipart/form-data; boundary=x") == InspectionPolicy.ActionBlock);
+        CheckTrue("form-urlencoded -> block", () => InspectionPolicy.Decide(def, true, "application/x-www-form-urlencoded") == InspectionPolicy.ActionBlock);
+        CheckTrue("text/plain -> block (default)", () => InspectionPolicy.Decide(def, true, "text/plain") == InspectionPolicy.ActionBlock);
+        CheckTrue("no content-type -> block", () => InspectionPolicy.Decide(def, true, null) == InspectionPolicy.ActionBlock);
+
+        // GET (no body allowed) passes regardless of content-type.
+        CheckTrue("GET never blocked", () => InspectionPolicy.Decide(def, false, "application/xml") == InspectionPolicy.ActionInspect);
+        CheckTrue("no body -> pass", () => InspectionPolicy.Decide(def, true, "application/xml", hasBody: false) == InspectionPolicy.ActionInspect);
+
+        // inspect declared for a non-JSON type fails closed (blocked) in this iteration.
+        var custom = new InspectionOptions();
+        custom.ByContentType["text/plain"] = "inspect";
+        CheckTrue("text/plain inspect -> block (not implemented)", () => InspectionPolicy.Decide(custom, true, "text/plain") == InspectionPolicy.ActionBlock);
+        CheckTrue("custom json override -> inspect", () => InspectionPolicy.Decide(custom, true, "application/json") == InspectionPolicy.ActionInspect);
+
+        // Disabled = everything passes.
+        var off = new InspectionOptions { Enabled = false };
+        CheckTrue("disabled -> inspect", () => InspectionPolicy.Decide(off, true, "application/xml") == InspectionPolicy.ActionInspect);
+    }
+
     static void TestRouting()
     {
         var airouter = new RouteOptions

@@ -18,6 +18,12 @@ public sealed class ProxyOptions
     public RedactionOptions Redaction { get; set; } = new();
 
     /// <summary>
+    /// Fail-closed body inspection policy: decides what to do with each Content-Type
+    /// before anything is forwarded (see <see cref="InspectionOptions"/>).
+    /// </summary>
+    public InspectionOptions Inspection { get; set; } = new();
+
+    /// <summary>
     /// Route table (Item 2). If empty, the proxy works as before:
     /// 1 fixed upstream (<see cref="Upstream"/>) + <see cref="AllowedPaths"/>.
     /// </summary>
@@ -88,6 +94,38 @@ public sealed class RedactionOptions
 
     /// <summary>Detection layers (default: all active).</summary>
     public DetectOptions Detect { get; set; } = new();
+}
+
+/// <summary>
+/// Fail-closed inspection of request bodies. "Security must fail closed": an uninspected
+/// request is never forwarded, regardless of format, parse errors or size.
+/// </summary>
+public sealed class InspectionOptions
+{
+    /// <summary>Master switch for body inspection (default: on).</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Action for Content-Types not present in <see cref="ByContentType"/>.
+    /// Default: "block" (415) - fail closed.
+    /// </summary>
+    public string DefaultAction { get; set; } = "block";
+
+    /// <summary>
+    /// Handling of a JSON body that does not parse: "block" (400, default) or "warn".
+    /// "warn" forwards the body anyway (opt-in escape hatch - do not use without review).
+    /// </summary>
+    public string InvalidJson { get; set; } = "block";
+
+    /// <summary>
+    /// Media type (without parameters) -> action. "inspect" = parse + redact (only supported
+    /// for JSON in this iteration); "block" = reject with 415. Unknown types use
+    /// <see cref="DefaultAction"/>.
+    /// </summary>
+    public Dictionary<string, string> ByContentType { get; set; } = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["application/json"] = "inspect",
+    };
 }
 
 public sealed class DetectOptions

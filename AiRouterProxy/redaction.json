@@ -9,7 +9,19 @@
         "byFieldName": true,
         "byFormats": true,
         "byKeyValueContext": true,
-        "byLongStrings": false
+        "byLongStrings": true
+      }
+    },
+    "Inspection": {
+      "enabled": true,
+      "defaultAction": "block",
+      "invalidJson": "block",
+      "byContentType": {
+        "application/json": "inspect",
+        "application/xml": "block",
+        "application/octet-stream": "block",
+        "multipart/form-data": "block",
+        "application/x-www-form-urlencoded": "block"
       }
     }
   }
