@@ -140,6 +140,7 @@ public static class SecretRedactor
         "slack" => "Slack token",
         "npm" => "npm token",
         "aws" => "AWS key",
+        "url_cred" => "URL credentials",
         "key_in_text" => "key in text",
         "suspicious_key" => "suspicious key",
         _ => kind,
@@ -214,6 +215,16 @@ public static class SecretRedactor
             case "secretkey":
             case "secret_key":
             case "secret-key":
+            case "secretaccesskey":
+            case "secret_access_key":
+            case "secret-access-key":
+            case "aws_secret_key":
+            case "aws_secret_access_key":
+            case "accesskey":
+            case "access_key":
+            case "access-key":
+            case "aws_access_key":
+            case "aws_access_key_id":
             case "privatekey":
             case "private_key":
             case "private-key":
@@ -254,6 +265,11 @@ public static class SecretRedactor
             || lower.Contains("secretkey")
             || lower.Contains("secret_key")
             || lower.Contains("secret-key")
+            || lower.Contains("accesskey")
+            || lower.Contains("access_key")
+            || lower.Contains("access-key")
+            || lower.Contains("aws_access_key")
+            || lower.Contains("aws_secret_access_key")
             || lower.Contains("privatekey")
             || lower.Contains("private_key")
             || lower.Contains("private-key")
@@ -283,6 +299,19 @@ public static class SecretRedactor
     private static string FieldKind(string name)
     {
         var lower = name.ToLowerInvariant();
+
+        // AWS credential names get a dedicated kind (aws), so activity/notices distinguish them.
+        if (lower.Contains("aws_secret_access_key") || lower.Contains("aws_secret_key") || lower.Contains("aws_access_key"))
+        {
+            return "aws";
+        }
+
+        // Generic access/secret key names (also covers secret_access_key / access_key_id).
+        if (lower.Contains("access_key") || lower.Contains("accesskey") || lower.Contains("access-key")
+            || lower.Contains("secret_access_key"))
+        {
+            return "secret";
+        }
 
         if (lower is "x-api-key" or "apikey" or "api_key" or "api-key" or "localkey" or "local_key" or "local-key"
             || lower.Contains("apikey") || lower.Contains("api_key") || lower.Contains("api-key")
