@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -16,6 +17,8 @@ using System.Text.Json;
 //   --brute-force       Run the 10-failure lockout test LAST (waits ~65s for the
 //                       request window to drain, then locks this IP for the lockout
 //                       duration - default 5 minutes). Off by default.
+//   --perf              Run only the performance battery (TTFT / total latency per
+//                       model, small token spend) and exit.
 // ---------------------------------------------------------------------------
 class Program
 {
@@ -40,6 +43,7 @@ class Program
         var baseUrl = GetArg(args, "--base") ?? "https://127.0.0.1:4000";
         var skipPaid = HasFlag(args, "--skip-paid");
         var bruteForce = HasFlag(args, "--brute-force");
+        var perf = HasFlag(args, "--perf");
 
         if (keyFile is null)
         {
@@ -64,7 +68,7 @@ class Program
         Console.WriteLine($"key file: {keyFile}");
         Console.WriteLine($"key sha256: {ShaPrefix(_key)} (first 8 hex chars - never the key itself)");
         Console.WriteLine($"base url : {baseUrl}");
-        Console.WriteLine($"skip paid: {skipPaid}   brute-force: {bruteForce}");
+        Console.WriteLine($"skip paid: {skipPaid}   brute-force: {bruteForce}   perf: {perf}");
         Console.WriteLine();
 
         using var client = NewClient(baseUrl);
@@ -93,6 +97,11 @@ class Program
         }
 
         Info($"proxy up: {TrimInfo(health.body)}");
+
+        if (perf)
+        {
+            return await RunPerfAsync(client);
+        }
 
         // ------------------------------------------------------------------
         // 1. Local authentication (401 vs 200)
@@ -315,6 +324,163 @@ class Program
         Console.WriteLine();
         Console.WriteLine($"RESULT: {_passed} PASS, {_failed} FAIL");
         return _failed == 0 ? 0 : 1;
+    }
+
+    // ------------------------------------------------------------------
+    // Performance battery (--perf): TTFT = ms until the first SSE "data:"
+    // line; total = ms until [DONE]. Runs against the REAL proxy + router.
+    // Small token spend: warmup + N tiny calls (max_tokens=8) per model.
+    // ------------------------------------------------------------------
+    static async Task<int> RunPerfAsync(HttpClient client)
+    {
+        var endpoints = await GetWithKeyAsync(client, "/admin/endpoints");
+        if (endpoints.status != 200)
+        {
+            Console.Error.WriteLine($"Cannot read /admin/endpoints (status {endpoints.status}) to derive the chat path.");
+            return 5;
+        }
+
+        var chatPath = DeriveChatPath(endpoints.body) ?? "/v1/chat/completions";
+        Info($"perf chat path: {chatPath}");
+
+        var models = new[] { "DeepSeek-V4-Flash", "Qwen3.8" };
+        const int iterations = 3;
+
+        // Warmup (date-line reuse, avoids measuring cold path in the averages).
+        var wu = await MeasureSseAsync(client, chatPath, models[0]);
+        if (wu.status == 0) { Warn("warmup failed (network?) - is the proxy up?"); }
+        else if (wu.status >= 400) { Warn($"warmup returned {wu.status}; the router key may reject the model list."); }
+
+        foreach (var model in models)
+        {
+            var ttft = new List<double>();
+            var total = new List<double>();
+            var lines = new List<int>();
+            var ok = true;
+            for (var i = 0; i < iterations; i++)
+            {
+                var r = await MeasureSseAsync(client, chatPath, model);
+                if (r.status is 0 or >= 400)
+                {
+                    Warn($"{model}: call {i + 1} failed (status {r.status}) - skipping the rest");
+                    ok = false;
+                    break;
+                }
+
+                ttft.Add(r.ttftMs);
+                total.Add(r.totalMs);
+                lines.Add(r.dataLines);
+                Console.WriteLine($"  {model} #{i + 1}: ttft={r.ttftMs:F0}ms total={r.totalMs:F0}ms dataLines={r.dataLines}");
+            }
+
+            if (ok && ttft.Count == iterations)
+            {
+                var linesD = lines.Select(l => (double)l).ToList();
+                var outLn = perLine(P(ttft), P(total), P(linesD));
+                Console.WriteLine($"  {model}: " + outLn);
+                Console.WriteLine($"  {model} avg: ttft={Avg(ttft):F0}ms  p50={P(ttft):F0}  p100={MaxV(ttft):F0} | total avg={Avg(total):F0}ms p50={P(total):F0} p100={MaxV(total):F0}");
+            }
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("PERF DONE");
+        return 0;
+
+        static string perLine(double t, double p, double l)
+            => $"p50 ttft={t:F0}ms | p50 total={p:F0}ms | dataLines p50={l:F0}";
+        static double Avg(List<double> vs) => vs.Average();
+        static double P(List<double> vs) => vs.OrderBy(v => v).Skip(vs.Count / 2).First();
+        static double MaxV(List<double> vs) => vs.Max();
+    }
+
+    /// <summary>Extracts the chat path from an /admin/endpoints payload (route prefix + /chat/completions),
+    /// or the first allowed path. Returns null when it cannot be derived.</summary>
+    static string? DeriveChatPath(string endpointsBody)
+    {
+        try
+        {
+            using var edoc = JsonDocument.Parse(endpointsBody);
+            var proxyEl = edoc.RootElement.GetProperty("proxy");
+            if (proxyEl.GetProperty("routingEnabled").GetBoolean())
+            {
+                var routes = proxyEl.GetProperty("routes");
+                if (routes.GetArrayLength() > 0
+                    && routes[0].TryGetProperty("prefix", out var prefixEl)
+                    && prefixEl.GetString() is { Length: > 0 } prefix)
+                {
+                    return prefix + "/chat/completions";
+                }
+            }
+            else if (proxyEl.GetProperty("allowedPaths").GetArrayLength() > 0)
+            {
+                var allowed = proxyEl.GetProperty("allowedPaths")[0].GetString();
+                if (!string.IsNullOrWhiteSpace(allowed))
+                {
+                    return allowed;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        return null;
+    }
+
+    sealed record PerfResult(int status, double ttftMs, double totalMs, int dataLines);
+
+    static async Task<PerfResult> MeasureSseAsync(HttpClient client, string path, string model)
+    {
+        var payload = JsonSerializer.Serialize(new
+        {
+            model,
+            messages = new[] { new { role = "user", content = "hi" } },
+            max_tokens = 8,
+            stream = true,
+        });
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, path)
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/json"),
+        };
+        req.Headers.Authorization = new("Bearer", _key);
+
+        var total = Stopwatch.StartNew();
+        double ttft = -1;
+        var dataLines = 0;
+        try
+        {
+            using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+            var status = (int)resp.StatusCode;
+            if (status >= 400)
+            {
+                return new PerfResult(status, 0, total.Elapsed.TotalMilliseconds, 0);
+            }
+
+            using var stream = await resp.Content.ReadAsStreamAsync();
+            using var reader = new StreamReader(stream);
+            string? line;
+            var guard = 0;
+            while ((line = await reader.ReadLineAsync()) is not null && guard++ < 200_000)
+            {
+                if (line.StartsWith("data:", StringComparison.Ordinal))
+                {
+                    if (ttft < 0) { ttft = total.Elapsed.TotalMilliseconds; }
+                    dataLines++;
+                    if (line.Contains("[DONE]", StringComparison.Ordinal))
+                    {
+                        break;
+                    }
+                }
+            }
+
+            return new PerfResult(status, ttft, total.Elapsed.TotalMilliseconds, dataLines);
+        }
+        catch (HttpRequestException ex)
+        {
+            Info($"perf request failed: {ex.Message}");
+            return new PerfResult(0, 0, total.Elapsed.TotalMilliseconds, 0);
+        }
     }
 
     // ------------------------------------------------------------------
