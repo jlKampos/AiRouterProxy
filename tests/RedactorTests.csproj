@@ -22,6 +22,15 @@
     <Compile Include="..\AiRouterProxy\RateLimiter.cs" Link="RateLimiter.cs" />
     <Compile Include="..\AiRouterProxy\SseEvent.cs" Link="SseEvent.cs" />
     <Compile Include="..\AiRouterProxy\SseParser.cs" Link="SseParser.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\SseEventKind.cs" Link="SseProtocol\SseEventKind.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\ISseProtocolAdapter.cs" Link="SseProtocol\ISseProtocolAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\SseProtocolJson.cs" Link="SseProtocol\SseProtocolJson.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\SseProtocolAdapterBase.cs" Link="SseProtocol\SseProtocolAdapterBase.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\SseProtocolRegistry.cs" Link="SseProtocol\SseProtocolRegistry.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\OpenAiChatAdapter.cs" Link="SseProtocol\OpenAiChatAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\OpenAiResponsesAdapter.cs" Link="SseProtocol\OpenAiResponsesAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\AnthropicAdapter.cs" Link="SseProtocol\AnthropicAdapter.cs" />
+    <Compile Include="..\AiRouterProxy\SseProtocol\GenericSseAdapter.cs" Link="SseProtocol\GenericSseAdapter.cs" />
     <Compile Include="..\AiRouterProxy\SseStreamProcessor.cs" Link="SseStreamProcessor.cs" />  
   </ItemGroup>
 

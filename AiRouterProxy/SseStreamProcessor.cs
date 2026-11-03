@@ -1,6 +1,5 @@
-using System.Text;
-using System.Text.Encodings.Web;
-using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace AIRouterProxy;
 
@@ -14,8 +13,10 @@ namespace AIRouterProxy;
 /// and the raw bytes are replayed verbatim. When the notice is empty the stream is passed
 /// through byte-for-byte.
 ///
-/// Protocol detection (chat / Responses API / Anthropic) is a lightweight mirror of
-/// NoticeInjector; Sprint 5 will replace it with the adapter-based detection.
+/// The protocol family is resolved on the first event through SseProtocolRegistry; each
+/// ISseProtocolAdapter classifies terminal events and builds the notice chunk for its own
+/// protocol. This keeps the streaming behavior protocol-independent: adding a new protocol
+/// is a new adapter, never a change to this processor.
 /// </summary>
 public static class SseStreamProcessor
 {
@@ -43,7 +44,7 @@ public static class SseStreamProcessor
 
             foreach (var e in events)
             {
-                if (e.IsDone)
+                if (state.ResolveAdapter(e).Classify(e) == SseEventKind.Terminal)
                 {
                     await state.TerminateAsync(destination, e, cancellationToken);
                 }
@@ -69,7 +70,7 @@ public static class SseStreamProcessor
         private long _rawBase;   // absolute offset of _raw[0]
         private long _flushed;   // absolute offset already written to the destination
         private SseEvent? _held; // last complete event not yet written (one-event look-behind)
-        private string? _protocol;
+        private ISseProtocolAdapter? _adapter;
         private bool _sawEvent;
         private bool _terminated;
 
@@ -83,9 +84,22 @@ public static class SseStreamProcessor
             _raw.Write(bytes.Span);
         }
 
+        /// <summary>
+        /// Returns the stream's protocol adapter, resolving it once on the first event
+        /// (a stream is homogeneous; the protocol never changes mid-stream).
+        /// </summary>
+        public ISseProtocolAdapter ResolveAdapter(SseEvent e)
+        {
+            if (_adapter is null)
+            {
+                _adapter = SseProtocolRegistry.Resolve(e);
+            }
+
+            return _adapter;
+        }
+
         public async ValueTask HoldAsync(Stream destination, SseEvent e, CancellationToken cancellationToken)
         {
-            TrackProtocol(e);
             _sawEvent = true;
 
             // A *new* non-terminal event completed, so the previously held one is safe to flush
@@ -120,6 +134,11 @@ public static class SseStreamProcessor
             {
                 // Trailing "[DONE]" without a blank-line terminator: notice still goes before it.
                 await FlushUpToAsync(destination, finalEvent.StartOffset, cancellationToken);
+                if (_adapter is null)
+                {
+                    _adapter = SseProtocolRegistry.Resolve(finalEvent);
+                }
+
                 if (!string.IsNullOrEmpty(_notice))
                 {
                     await WriteNoticeAsync(destination, cancellationToken);
@@ -149,28 +168,12 @@ public static class SseStreamProcessor
             // NoticeInjector's behavior on a stream without "[DONE]").
             if (!string.IsNullOrEmpty(_notice) && (_sawEvent || finalEvent is not null))
             {
+                if (_adapter is null && finalEvent is not null)
+                {
+                    _adapter = SseProtocolRegistry.Resolve(finalEvent);
+                }
+
                 await WriteNoticeAsync(destination, cancellationToken);
-            }
-        }
-
-        private void TrackProtocol(SseEvent e)
-        {
-            if (_protocol is not null)
-            {
-                return;
-            }
-
-            if ((e.EventName is not null && e.EventName.StartsWith("response.", StringComparison.Ordinal))
-                || e.Data.Contains("\"type\":\"response.output_text.delta\"", StringComparison.Ordinal))
-            {
-                _protocol = "responses";
-                return;
-            }
-
-            if (e.EventName == "content_block_delta"
-                || e.Data.Contains("\"type\":\"content_block_delta\"", StringComparison.Ordinal))
-            {
-                _protocol = "anthropic";
             }
         }
 
@@ -190,7 +193,7 @@ public static class SseStreamProcessor
 
         private async ValueTask WriteNoticeAsync(Stream destination, CancellationToken cancellationToken)
         {
-            await destination.WriteAsync(BuildNoticeChunk(_protocol, _notice), cancellationToken);
+            await destination.WriteAsync(_adapter!.BuildNoticeChunk(_notice), cancellationToken);
         }
 
         private void Compact()
@@ -215,41 +218,5 @@ public static class SseStreamProcessor
             _raw.Write(tail);
             _rawBase = _flushed;
         }
-    }
-
-    private static byte[] BuildNoticeChunk(string? protocol, string notice)
-    {
-        var options = new JsonSerializerOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
-        string payload;
-        string prefix;
-
-        switch (protocol)
-        {
-            case "responses":
-                payload = JsonSerializer.Serialize(
-                    new { type = "response.output_text.delta", delta = "\n\n" + notice }, options);
-                prefix = "event: response.output_text.delta\ndata: ";
-                break;
-
-            case "anthropic":
-                payload = JsonSerializer.Serialize(new
-                {
-                    type = "content_block_delta",
-                    index = 0,
-                    delta = new { type = "text_delta", text = "\n\n" + notice },
-                }, options);
-                prefix = "event: content_block_delta\ndata: ";
-                break;
-
-            default: // chat completions (OpenAI-compatible)
-                payload = JsonSerializer.Serialize(new
-                {
-                    choices = new[] { new { delta = new { content = "\n\n" + notice } } },
-                }, options);
-                prefix = "\ndata: ";
-                break;
-        }
-
-        return Encoding.UTF8.GetBytes(prefix + payload + "\n\n");
     }
 }

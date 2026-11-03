@@ -34,6 +34,7 @@ class Program
         TestRateLimiter();
         TestSseParser();
         TestSseProcessor();
+        TestSseProtocolAdapters();
         TestRouting();
         TestInspectionPolicy();
         Console.WriteLine();
@@ -632,6 +633,83 @@ class Program
         const string raw = "data: 1\n\ndata: 2\n\n";
         var pt = ProcessSseAsync(raw, string.Empty).GetAwaiter().GetResult();
         CheckTrue("proc passthrough identical", () => pt == raw);
+    }
+
+    // --------------------------------------------------------------
+    // Protocol adapters (Sprint 5): SseProtocol/ replaces the lightweight
+    // in-processor detection with per-protocol adapters + registry.
+    // --------------------------------------------------------------
+    static SseEvent Evt(string data, string? name = null)
+        => new(name, data, null, null, 0, 0);
+
+    static void TestSseProtocolAdapters()
+    {
+        // Registry resolution: first match wins, generic catch-all last.
+        CheckTrue("resolve responses (event name)", () =>
+            SseProtocolRegistry.Resolve(Evt("{}", "response.completed")) is OpenAiResponsesAdapter);
+        CheckTrue("resolve responses (payload)", () =>
+            SseProtocolRegistry.Resolve(Evt("{\"type\":\"response.output_text.delta\",\"delta\":\"oi\"}")) is OpenAiResponsesAdapter);
+        CheckTrue("resolve anthropic", () =>
+            SseProtocolRegistry.Resolve(Evt("{\"type\":\"content_block_delta\",\"index\":0}", "content_block_delta")) is AnthropicAdapter);
+        CheckTrue("resolve chat", () =>
+            SseProtocolRegistry.Resolve(Evt("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}")) is OpenAiChatAdapter);
+        CheckTrue("resolve generic", () =>
+            SseProtocolRegistry.Resolve(Evt("{}")) is GenericSseAdapter
+            && SseProtocolRegistry.Resolve(Evt("[DONE]")) is GenericSseAdapter);
+
+        CheckTrue("adapter names", () =>
+            new OpenAiResponsesAdapter().Name == "responses"
+            && new AnthropicAdapter().Name == "anthropic"
+            && new OpenAiChatAdapter().Name == "chat"
+            && new GenericSseAdapter().Name == "generic");
+
+        // Classification per protocol
+        CheckTrue("classify terminal all protocols", () =>
+            new OpenAiChatAdapter().Classify(Evt("[DONE]")) == SseEventKind.Terminal
+            && new OpenAiResponsesAdapter().Classify(Evt("[DONE]")) == SseEventKind.Terminal
+            && new AnthropicAdapter().Classify(Evt("[DONE]")) == SseEventKind.Terminal
+            && new GenericSseAdapter().Classify(Evt("[DONE]")) == SseEventKind.Terminal);
+
+        CheckTrue("classify chat error", () =>
+            new OpenAiChatAdapter().Classify(Evt("{\"error\":{\"message\":\"x\"}}")) == SseEventKind.Error
+            && new OpenAiChatAdapter().Classify(Evt("{}", "error")) == SseEventKind.Error);
+
+        CheckTrue("classify chat start/content", () =>
+            new OpenAiChatAdapter().Classify(Evt("{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}")) == SseEventKind.Start
+            && new OpenAiChatAdapter().Classify(Evt("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}")) == SseEventKind.Content);
+
+        CheckTrue("classify responses start/content", () =>
+            new OpenAiResponsesAdapter().Classify(Evt("{}", "response.created")) == SseEventKind.Start
+            && new OpenAiResponsesAdapter().Classify(Evt("{\"type\":\"response.output_text.delta\",\"delta\":\"oi\"}")) == SseEventKind.Content);
+
+        CheckTrue("classify anthropic start/content", () =>
+            new AnthropicAdapter().Classify(Evt("{}", "message_start")) == SseEventKind.Start
+            && new AnthropicAdapter().Classify(Evt("{\"type\":\"content_block_delta\"}", "content_block_delta")) == SseEventKind.Content);
+
+        // Notice chunks: byte-exact per protocol (identical to Sprint 4 output)
+        CheckTrue("chat notice chunk exact", () =>
+            Str(new OpenAiChatAdapter().BuildNoticeChunk("N"))
+                == "\ndata: {\"choices\":[{\"delta\":{\"content\":\"\\n\\nN\"}}]}\n\n");
+
+        CheckTrue("responses notice chunk exact", () =>
+            Str(new OpenAiResponsesAdapter().BuildNoticeChunk("N"))
+                == "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\\n\\nN\"}\n\n");
+
+        CheckTrue("anthropic notice chunk exact", () =>
+            Str(new AnthropicAdapter().BuildNoticeChunk("N"))
+                == "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\\n\\nN\"}}\n\n");
+
+        CheckTrue("generic notice = chat notice", () =>
+            Str(new GenericSseAdapter().BuildNoticeChunk("N"))
+                == Str(new OpenAiChatAdapter().BuildNoticeChunk("N")));
+
+        CheckTrue("chat notice chunk valid JSON", () =>
+        {
+            var chunk = Str(new OpenAiChatAdapter().BuildNoticeChunk("N"));
+            var data = chunk[(chunk.IndexOf("data: {", StringComparison.Ordinal) + 6)..];
+            var json = data[..data.IndexOf("\n\n", StringComparison.Ordinal)];
+            return JsonNode.Parse(json) is JsonObject o && o["choices"] is JsonArray;
+        });
     }
 
     // --------------------------------------------------------------
