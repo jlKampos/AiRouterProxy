@@ -46,9 +46,16 @@ And the model only ever sees the masked value - never the real secret:
 
 ## Stack
 
-- .NET 10 / ASP.NET Core (Kestrel + TLS)
+- .NET 10 / ASP.NET Core (Kestrel + TLS); publish **self-contained win-x64** (embeds the runtime - the
+  host has no x64 .NET runtime installed, so a framework-dependent publish fails to start)
 - Path-prefix router (`routes.json`)
 - Sensitive-content redaction on outgoing requests (`redaction.json`, hot reload)
+- **Fail-closed request body inspection** (only inspected JSON is ever forwarded; unknown content types
+  `415`, invalid JSON `400`, oversized `413`)
+- **Per-client rate limiting and brute-force lockout** (429 + `Retry-After`; failure lockout)
+- **Multiple accepted local keys** (`Proxy:Keys:LocalKeys`) for auth rotation
+- **SSE protocol adapters** (`AiRouterProxy/SseProtocol/`) for streamed forwards (OpenAI chat/responses,
+  Anthropic, generic)
 - Admin endpoints protected by a local key (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
 - Versioned via assembly info (SemVer, e.g. 1.0.0); reported by /admin/health
@@ -58,18 +65,30 @@ And the model only ever sees the masked value - never the real secret:
 ```
 AiRouterProxy/
 |-- AiRouterProxy/                 # C# source
-|   |-- ProxyOptions.cs            # Proxy/Routes/Redaction options
-|   |-- RouteResolver.cs           # route resolution (longest prefix)
-|   |-- ProxyMiddleware.cs         # proxy + redaction + notice
-|   |-- SecretRedactor.cs          # secret detection (4 layers)
+|   |-- ProxyOptions.cs            # Proxy/Routes/Redaction/Inspection/RateLimit options
+|   |-- RouteResolver.cs           # route resolution (longest prefix) + allowed-path guards
+|   |-- ProxyMiddleware.cs         # proxy pipeline (rate limit -> auth -> method -> route -> inspect -> redact -> forward)
+|   |-- SecretDetector.cs          # secret detection (4 layers)
+|   |-- SecretRedactor.cs          # secret redaction (preserves JSON structure)
 |   |-- NoticeInjector.cs          # notice at the end of the response (SSE/JSON)
+|   |-- SseStreamProcessor.cs      # streaming forwarder (protocol-agnostic)
+|   |-- SseParser.cs / SseEvent.cs # minimal SSE parse/emit
+|   |-- SseProtocol/               # SSE protocol adapters (OpenAI chat, OpenAI responses, Anthropic, generic) + registry
+|   |-- InspectionPolicy.cs        # fail-closed content-type inspection decisions
+|   |-- SecurityHelpers.cs         # bearer extraction, hashing
+|   |-- AuthenticationPolicy.cs    # local multi-key auth
+|   |-- RateLimiter.cs             # per-IP rate limit + brute-force lockout
+|   |-- AdminAuthMiddleware.cs     # /admin Bearer auth
 |   |-- ActivityStore.cs           # activity log (/admin/activity)
 |   |-- appsettings.json           # non-secret config
 |   |-- appsettings.Server.example.json  # TEMPLATE for the keys (copy to appsettings.Server.json)
 |   |-- redaction.json             # redaction flags (non-secret)
 |   `-- routes.json                # route table (non-secret)
-|-- tests/                         # unit test harness (no framework)
-|-- deploy-update.ps1              # build/publish + deploy to the service
+|-- tests/
+|   |-- Program.cs                 # unit harness (no framework) - 206 PASS
+|   |-- RedactorTests.csproj       # offline unit harness (excludes tests/Integration)
+|   `-- Integration/               # black-box integration harness against a REAL deployed proxy
+|-- deploy-update.ps1              # deploy to the installed service (preserves secrets/certs on the destination)
 `-- genApiKey.ps1                  # generates/rotates the local key
 ```
 
@@ -467,9 +486,43 @@ Use the models as `airouter/Qwen3.8` or `airouter/DeepSeek-V4-Flash`.
 
 ## Tests
 
+### Unit harness (offline, no framework, no packages)
+
+Links the proxy's real sources in isolation and asserts them with the in-repo `Check`/`CheckTrue`
+helpers (no xUnit). Covers redaction (4 layers), fail-closed inspection policy, route
+resolution/allowed-path enumeration (traversal, case, `%2f`), auth edges + multi-key, rate
+limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE protocol adapters.
+
 ```powershell
-dotnet run --project tests/RedactorTests.csproj
+dotnet run --project tests/RedactorTests.csproj -c Release
+# -> RESULT: 206 PASS, 0 FAIL
 ```
+
+### Integration harness (black box, against the REAL deployed proxy + AI Router)
+
+`tests/Integration/` is a standalone console app (no app references, no packages) that talks HTTP
+with the deployed service, validates the certificate is ignored (self-signed local cert) and derives
+the chat path from `/admin/endpoints`. It reads the local key from a file at runtime and never prints
+it (only a sha256 prefix):
+
+```powershell
+dotnet run --project tests/Integration/Integration.csproj -c Release `
+  -- --key-file C:\Users\jlkampos\secrets\airouterproxy-local.key
+# -> RESULT: 23 PASS, 0 FAIL
+```
+
+Key file flag (`--key-file <path>` or `AIROUTERPROXY_LOCAL_KEY_FILE`) points at a file containing
+only the proxy **LocalKey** (one line). Flags: `--base <url>`, `--skip-paid` (skip token-consuming
+calls), `--brute-force` (10-failure lockout test, LAST - locks the IP ~5 min), `--perf` (performance
+battery: TTFT / total SSE latency per model, small token spend).
+
+What it verifies: health/auth (401 vs 200), `/admin` never leaks the key (payload + activity +
+refusals + logs), malformed/oversized requests blocked upstream-free (400/415/405+Allow/404/413),
+real forward + SSE streaming, redaction observability (`redacted>0` in activity), rate limit
+(429 + `Retry-After >= 1`).
+
+> Note: the `Allow` response header is an **entity header** - `HttpClient` exposes it under
+> `resp.Content.Headers`, so the harness reads it from both the response and the content headers.
 
 ## Deploy (installed service)
 
@@ -480,6 +533,9 @@ folder. The recommended layout puts it under `C:\Services` (outside any repo), e
 ### Regular update of an existing service
 
 ```powershell
+# self-contained is REQUIRED: the host has no x64 .NET runtime installed, so a
+# framework-dependent publish fails to start ("No frameworks were found").
+# Publish to a folder OUTSIDE the repo when you must not touch publish-tmp/.
 dotnet publish AiRouterProxy/AIRouterProxy.csproj -c Release -r win-x64 --self-contained true -o publish-tmp
 # elevated (UAC); deploys to the project's deploy/ folder by default (override with -DeployDir)
 powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1
@@ -487,7 +543,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1
 powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir "C:\Services\AiRouterProxy"
 ```
 
-`deploy-update.ps1` preserves config/certs on the destination and restarts the service (when installed as a Windows Service).
+`deploy-update.ps1` preserves config/certs on the destination and restarts the service (when installed as a Windows Service). If the deploy carries inspection/rate-limit changes, refresh the destination `redaction.json` from the repo copy afterwards (the deploy script preserves the destination file by design).
 
 ### Moving the deployed service to a new folder (generic)
 
