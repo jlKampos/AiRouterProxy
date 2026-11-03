@@ -31,7 +31,15 @@
     <Compile Include="..\AiRouterProxy\SseProtocol\OpenAiResponsesAdapter.cs" Link="SseProtocol\OpenAiResponsesAdapter.cs" />
     <Compile Include="..\AiRouterProxy\SseProtocol\AnthropicAdapter.cs" Link="SseProtocol\AnthropicAdapter.cs" />
     <Compile Include="..\AiRouterProxy\SseProtocol\GenericSseAdapter.cs" Link="SseProtocol\GenericSseAdapter.cs" />
-    <Compile Include="..\AiRouterProxy\SseStreamProcessor.cs" Link="SseStreamProcessor.cs" />  
+    <Compile Include="..\AiRouterProxy\SseStreamProcessor.cs" Link="SseStreamProcessor.cs" />
+  </ItemGroup>
+
+  <!-- The dedicated integration project lives in tests/Integration and must NOT be
+       compiled by this offline harness (it has its own Program.cs). -->
+  <ItemGroup>
+    <Compile Remove="Integration\**" />
+    <EmbeddedResource Remove="Integration\**" />
+    <None Remove="Integration\**" />
   </ItemGroup>
 
 </Project>

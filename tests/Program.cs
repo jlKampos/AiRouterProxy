@@ -35,6 +35,7 @@ class Program
         TestSseParser();
         TestSseProcessor();
         TestSseProtocolAdapters();
+        TestSecurityEdges();
         TestRouting();
         TestInspectionPolicy();
         Console.WriteLine();
@@ -801,6 +802,136 @@ class Program
 
         // Empty/unknown key maps to "unknown" without crashing
         CheckTrue("null key safe", () => { rl.Check(null!); rl.RecordFailure(null!); return true; });
+    }
+
+    // --------------------------------------------------------------
+    // Security edges (Sprint 6): bearer parsing, multi-key auth,
+    // route enumeration and concurrency (offline, no ASP.NET needed).
+    // --------------------------------------------------------------
+    static void TestSecurityEdges()
+    {
+        // Bearer parsing - auth bypass attempts
+        CheckTrue("bearer exact", () => SecurityHelpers.ExtractBearerToken("Bearer abc") == "abc");
+        CheckTrue("bearer lowercase", () => SecurityHelpers.ExtractBearerToken("bearer abc") == "abc");
+        CheckTrue("bearer uppercase", () => SecurityHelpers.ExtractBearerToken("BEARER abc") == "abc");
+        CheckTrue("bearer extra spaces", () => SecurityHelpers.ExtractBearerToken("Bearer   abc") == "abc");
+        CheckTrue("bearer trailing space", () => SecurityHelpers.ExtractBearerToken("Bearer abc ") == "abc");
+        CheckTrue("bearer no key", () => SecurityHelpers.ExtractBearerToken("Bearer") is null);
+        CheckTrue("bearer empty value", () => SecurityHelpers.ExtractBearerToken("Bearer   ") is null);
+        CheckTrue("basic is not bearer", () => SecurityHelpers.ExtractBearerToken("Basic dXNlcjpwYXNz") is null);
+        CheckTrue("no prefix", () => SecurityHelpers.ExtractBearerToken("abc") is null);
+        CheckTrue("null/empty", () => SecurityHelpers.ExtractBearerToken(null) is null
+            && SecurityHelpers.ExtractBearerToken("") is null);
+
+        // Multi-key auth edges
+        var multi = new KeyOptions
+        {
+            LocalKey = "primary",
+            LocalKeys = new List<string> { "second", " third ", "", " " },
+        };
+        CheckTrue("multi second key", () => AuthenticationPolicy.IsValidLocalKey("second", multi));
+        CheckTrue("multi spaces literal", () => AuthenticationPolicy.IsValidLocalKey(" third ", multi)
+            && !AuthenticationPolicy.IsValidLocalKey("third", multi));
+        CheckTrue("multi blank rejected", () => !AuthenticationPolicy.IsValidLocalKey("", multi));
+        CheckTrue("multi case-sensitive", () => !AuthenticationPolicy.IsValidLocalKey("Primary", multi)
+            && !AuthenticationPolicy.IsValidLocalKey("SECOND", multi));
+        CheckTrue("multi count includes blanks", () => AuthenticationPolicy.LocalKeyCount(multi) == 5);
+
+        // Route enumeration: allowed-path guards, case and traversal
+        var airouter = new RouteOptions
+        {
+            Name = "airouter",
+            Prefix = "",
+            Upstream = "https://api.airrouter.ch",
+            KeyRef = "AIROUTER",
+            AllowedPaths = { "/v1/models", "/v1/chat/completions", "/v1/embeddings" },
+        };
+        var openrouter = new RouteOptions
+        {
+            Name = "openrouter",
+            Prefix = "/openrouter",
+            Upstream = "https://openrouter.ai/api",
+            KeyRef = "OPENROUTER",
+            AllowedPaths = { "/v1/*" },
+        };
+        var routes = new[] { airouter, openrouter };
+        var keys = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["AIROUTER"] = "sk-airouter-abc",
+            ["OPENROUTER"] = "sk-openrouter-xyz",
+        };
+
+        CheckTrue("enum exact allowed", () => RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/chat/completions"));
+        CheckTrue("enum trailing slash blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/chat/completions/"));
+        CheckTrue("enum case blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/V1/CHAT/COMPLETIONS"));
+        CheckTrue("enum dotdot blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/chat/completions/../models"));
+        CheckTrue("enum double slash blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "//v1/chat/completions"));
+        CheckTrue("enum encoded slash blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/chat%2fcompletions"));
+        CheckTrue("enum unknown path blocked", () => !RouteResolver.IsPathAllowed(airouter.AllowedPaths, "/v1/embeddings2"));
+
+        CheckTrue("enum prefix segment boundary", () =>
+            RouteResolver.PathMatchesPrefix("/openrouter/v1/models", "/openrouter")
+            && !RouteResolver.PathMatchesPrefix("/openrouterX/v1/models", "/openrouter")
+            && !RouteResolver.PathMatchesPrefix("//openrouter/v1", "/openrouter"));
+
+        CheckTrue("enum resolve default", () =>
+            RouteResolver.Resolve(routes, keys, "/v1/chat/completions") is { } r1
+            && r1.Route.Name == "airouter"
+            && r1.RewrittenPath == "/v1/chat/completions");
+
+        CheckTrue("enum rewrite strips prefix", () =>
+            RouteResolver.Resolve(routes, keys, "/openrouter/v1/models") is { } r2
+            && r2.Route.Name == "openrouter"
+            && r2.RewrittenPath == "/v1/models"
+            && r2.Key == "sk-openrouter-xyz");
+
+        // Concurrency: the rate limiter stays exact and exception-free under load
+        CheckTrue("concurrency allows exactly the limit", () =>
+        {
+            var rl = new RateLimiter(new RateLimitOptions
+            {
+                MaxRequestsPerWindow = 100,
+                RequestWindowSeconds = 60,
+                MaxFailuresPerWindow = 100,
+                FailureWindowSeconds = 60,
+                LockoutSeconds = 60,
+            }, () => DateTimeOffset.UtcNow);
+
+            var allowed = 0;
+            Parallel.For(0, 1000, _ =>
+            {
+                if (rl.Check("1.1.1.1") == RateLimiter.Verdict.Allow)
+                {
+                    Interlocked.Increment(ref allowed);
+                }
+            });
+
+            return allowed == 100 && rl.RequestCount("1.1.1.1") == 100;
+        });
+
+        CheckTrue("concurrency keys independent", () =>
+        {
+            var rl = new RateLimiter(new RateLimitOptions { MaxRequestsPerWindow = 50, RequestWindowSeconds = 60 });
+            Parallel.For(0, 200, i =>
+            {
+                rl.Check(i % 2 == 0 ? "a.a.a.a" : "b.b.b.b");
+            });
+
+            return rl.RequestCount("a.a.a.a") == 50 && rl.RequestCount("b.b.b.b") == 50;
+        });
+
+        CheckTrue("concurrency failures count exact", () =>
+        {
+            var rl = new RateLimiter(new RateLimitOptions
+            {
+                MaxFailuresPerWindow = 100,
+                FailureWindowSeconds = 60,
+                LockoutSeconds = 60,
+            });
+            Parallel.For(0, 100, _ => rl.RecordFailure("9.9.9.9"));
+
+            return rl.FailureCount("9.9.9.9") == 100 && rl.Check("9.9.9.9") == RateLimiter.Verdict.LockedOut;
+        });
     }
 
     static void TestRouting()
