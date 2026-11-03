@@ -28,6 +28,7 @@ class Program
         TestSummarize();
         TestNotices();
         TestExtendedDetection();
+        TestRedactionGaps();
         TestPreviews();
         TestDetector();
         TestAuthenticationPolicy();
@@ -313,6 +314,68 @@ class Program
         var c1 = SecretRedactor.RedactJson(Bytes("{\"c\":\"api_key=\\\"4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4\\\"\"}"));
         CheckTrue("context+long not duplicated", () => c1.Changed && c1.Stats.ByKind.GetValueOrDefault("key_in_text") == 1
             && c1.Stats.ByKind.GetValueOrDefault("suspicious_key") == 0);
+    }
+
+    // --------------------------------------------------------------
+    // Round 2 fixes: symbol passwords, AWS keys (context + field + format), URL credentials
+    // --------------------------------------------------------------
+    static void TestRedactionGaps()
+    {
+        // 1. Password with symbols - the ENTIRE value is masked (no suffix leak after '!')
+        var g1 = SecretRedactor.RedactJson(Bytes("{\"c\":\"Server=wz;Database=app;UserId=sa;Password=SenhaForte!2026#@$;TrustServerCertificate=True\"}"));
+        CheckTrue("symbol password fully masked", () => g1.Changed
+            && !Str(g1.Data).Contains("SenhaForte")
+            && !Str(g1.Data).Contains("!2026")
+            && g1.Stats.Total == 1
+            && g1.Stats.ByKind.GetValueOrDefault("key_in_text") == 1);
+
+        // 2. AWS secret access key (base64 with / + and =) caught by context name in free text
+        var g2 = SecretRedactor.RedactJson(Bytes("{\"c\":\"aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY+1\"}"));
+        CheckTrue("aws secret base64 context", () => g2.Changed
+            && !Str(g2.Data).Contains("wJalr")
+            && !Str(g2.Data).Contains("K7MDENG")
+            && g2.Stats.Total == 1
+            && g2.Stats.ByKind.GetValueOrDefault("key_in_text") == 1);
+
+        // 3. AWS credential names in structured JSON are masked as fields (kind "aws")
+        var g3 = SecretRedactor.RedactJson(Bytes("{\"aws\":{\"aws_access_key_id\":\"AKIAIOSFODNN7EXAMPLE\",\"aws_secret_access_key\":\"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\"}}"));
+        CheckTrue("aws fields masked", () => g3.Changed
+            && Str(g3.Data).Contains("\"aws\"")
+            && !Str(g3.Data).Contains("AKIAIOSFODNN7")
+            && !Str(g3.Data).Contains("wJalr")
+            && g3.Stats.FieldRedactions == 2
+            && g3.Stats.ByKind.GetValueOrDefault("aws") == 2);
+
+        // 4. Real AWS key id format still matched (all real prefixes now)
+        var g4 = SecretRedactor.RedactJson(Bytes("{\"c\":\"credentials AKIAIOSFODNN7EXAMPLE here\"}"));
+        CheckTrue("AKIA real format masked", () => g4.Changed
+            && !Str(g4.Data).Contains("AKIAIOSFODNN7")
+            && g4.Stats.ByKind.GetValueOrDefault("aws") == 1);
+
+        // 5. Regression: AKIA with hyphen/lowercase is NOT a real format -> stays unmasked
+        var g5 = SecretRedactor.RedactJson(Bytes("{\"c\":\"access_key_fake: AKIA-test1234567890ABCDEF\"}"));
+        CheckTrue("AKIA hyphen stays unmasked", () => !g5.Changed && Str(g5.Data).Contains("AKIA-test"));
+
+        // 6. URL-embedded credentials: scheme kept, user:pass@ masked
+        var g6 = SecretRedactor.RedactJson(Bytes("{\"c\":\"https://admin:SuperSecret!123@db.winzone.local:5432/postgres\"}"));
+        CheckTrue("url https creds masked", () => g6.Changed
+            && Str(g6.Data).Contains("https://")
+            && !Str(g6.Data).Contains("admin")
+            && !Str(g6.Data).Contains("SuperSecret")
+            && g6.Stats.ByKind.GetValueOrDefault("url_cred") == 1);
+
+        var g6b = SecretRedactor.RedactJson(Bytes("{\"c\":\"ftp://deploy:ChaveForte%2026@host.exemplo/arquivos\"}"));
+        CheckTrue("url ftp creds masked", () => g6b.Changed
+            && Str(g6b.Data).Contains("ftp://")
+            && !Str(g6b.Data).Contains("deploy")
+            && !Str(g6b.Data).Contains("ChaveForte"));
+
+        // 7. client_secret in free text (context name) still masked, no double count
+        var g7 = SecretRedactor.RedactJson(Bytes("{\"c\":\"oauth client_secret=ctest-abcdefghijklmnopqrstuvwxyz123456\"}"));
+        CheckTrue("client_secret in text", () => g7.Changed
+            && !Str(g7.Data).Contains("ctest-")
+            && g7.Stats.ByKind.GetValueOrDefault("key_in_text") == 1
+            && g7.Stats.ByKind.GetValueOrDefault("suspicious_key") == 0);
     }
 
     // --------------------------------------------------------------

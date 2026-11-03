@@ -78,8 +78,8 @@ public static class SecretDetector
         // npm
         new(new Regex(@"npm_[A-Za-z0-9]{20,}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "npm", Confidence.Medium),
-        // AWS access key id
-        new(new Regex(@"AKIA[0-9A-Z]{16}",
+        // AWS access key id - all real prefixes (AKIA/ASIA/AIDA/AROA/AGPA + exactly 16 base32 chars)
+        new(new Regex(@"(?:AKIA|ASIA|AIDA|AROA|AGPA)[0-9A-Z]{16}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "aws", Confidence.High),
         // JWT
         new(new Regex(@"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
@@ -87,6 +87,10 @@ public static class SecretDetector
         // "Bearer <token>" in text - group 1 is the prefix (kept), group 2 is the value (masked)
         new(new Regex(@"(Bearer\s+)([A-Za-z0-9._~+/=-]{12,})",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "bearer", Confidence.High, "1"),
+        // URL-embedded credentials "scheme://user:pass@host" - group 1 is the scheme (kept),
+        // group 2 is the "user:pass@" part (masked). Only http(s)/ftp/ssh use this syntax.
+        new(new Regex(@"(?i)(?<![A-Za-z0-9])((?:https?|ftp|ssh)://)([^/\s:@]+:[^@\s/]+@)",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "url_cred", Confidence.High, "1"),
         // PEM private key blocks
         new(new Regex(@"-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "private_key", Confidence.High),
@@ -98,13 +102,16 @@ public static class SecretDetector
 
     /// <summary>
     /// Catches config excerpts pasted into messages: `"LocalKey": "abc..."`, `LOCAL_KEY=abc...`,
-    /// `password: abc...`. Only the value is masked (the name + separator stay).
+    /// `password: abc...`, AWS `aws_secret_access_key=...` (base64 with / + =). Only the value
+    /// is masked (the name + separator stay). Values may contain common password symbols
+    /// (! @ # $ % ^ &amp; * ( )), but always delimit at ; , space or quotes so connection
+    /// strings do not swallow the next key.
     /// </summary>
     private static readonly Regex KeyValueContextRegex = new(
         @"(?i)(?<![A-Za-z0-9_])"
-        + @"(?<name>api[_-]?key|api[_-]?secret|loc[a]?l[_-]?key|secret[_-]?key|secret|private[_-]?key|master[_-]?key|encryption[_-]?key|client[_-]?secret|password|passwd|senha|credential|authorization|access[_-]?token|refresh[_-]?token|bearer[_-]?token)"
+        + @"(?<name>aws[_-]?secret[_-]?(?:access[_-]?)?key|aws[_-]?access[_-]?key[_-]?(?:id)?|secret[_-]?access[_-]?key|access[_-]?key[_-]?id|access[_-]?key|api[_-]?key|api[_-]?secret|loc[a]?l[_-]?key|secret[_-]?key|secret|private[_-]?key|master[_-]?key|encryption[_-]?key|client[_-]?secret|password|passwd|senha|credential|authorization|access[_-]?token|refresh[_-]?token|bearer[_-]?token)"
         + @"(?<sep>[\""']?\s*[:=]\s*[\""']?)"
-        + @"(?<value>[A-Za-z0-9_\.~+/=-]{8,})",
+        + @"(?<value>[A-Za-z0-9_~+/=!@#$%^&*().\-]{8,})",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     // ------------------------------------------------------------------
