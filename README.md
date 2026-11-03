@@ -2,7 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 1.0.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.0.1 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ## Why: a security layer for development environments
 
@@ -44,6 +44,14 @@ And the model only ever sees the masked value - never the real secret:
 
 ![The request as it reaches the model, sensitive value masked](images/proxy_guardrails_II.png)
 
+### See the proxy in action
+
+A short demo: an appsettings-style config full of fake secrets is pasted into OpenCode, and the
+proxy redacts them before they reach the model - watch the notice, the masking and the
+non-sensitive content passing through untouched:
+
+[![AiRouterProxy redaction demo](https://img.youtube.com/vi/29nyYgkqx7E/hqdefault.jpg)](https://www.youtube.com/watch?v=29nyYgkqx7E)
+
 ## Stack
 
 - .NET 10 / ASP.NET Core (Kestrel + TLS); publish **self-contained win-x64** (embeds the runtime - the
@@ -58,7 +66,7 @@ And the model only ever sees the masked value - never the real secret:
   Anthropic, generic)
 - Admin endpoints protected by a local key (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
-- Versioned via assembly info (SemVer, e.g. 1.0.0); reported by /admin/health
+- Versioned via assembly info (SemVer, e.g. 2.0.1); reported by /admin/health
 
 ## Structure
 
@@ -85,7 +93,7 @@ AiRouterProxy/
 |   |-- redaction.json             # redaction flags (non-secret)
 |   `-- routes.json                # route table (non-secret)
 |-- tests/
-|   |-- Program.cs                 # unit harness (no framework) - 206 PASS
+|   |-- Program.cs                 # unit harness (no framework) - 214 PASS
 |   |-- RedactorTests.csproj       # offline unit harness (excludes tests/Integration)
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- deploy-update.ps1              # deploy to the installed service (preserves secrets/certs on the destination)
@@ -495,7 +503,7 @@ limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE pro
 
 ```powershell
 dotnet run --project tests/RedactorTests.csproj -c Release
-# -> RESULT: 206 PASS, 0 FAIL
+# -> RESULT: 214 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)
