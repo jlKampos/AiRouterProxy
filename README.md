@@ -2,7 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.0.1 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.0.2 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ## Why: a security layer for development environments
 
@@ -66,7 +66,7 @@ non-sensitive content passing through untouched:
   Anthropic, generic)
 - Admin endpoints protected by a local key (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
-- Versioned via assembly info (SemVer, e.g. 2.0.1); reported by /admin/health
+- Versioned via assembly info (SemVer, e.g. 2.0.2); reported by /admin/health
 
 ## Structure
 
@@ -93,7 +93,7 @@ AiRouterProxy/
 |   |-- redaction.json             # redaction flags (non-secret)
 |   `-- routes.json                # route table (non-secret)
 |-- tests/
-|   |-- Program.cs                 # unit harness (no framework) - 214 PASS
+|   |-- Program.cs                 # unit harness (no framework) - 219 PASS
 |   |-- RedactorTests.csproj       # offline unit harness (excludes tests/Integration)
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- deploy-update.ps1              # deploy to the installed service (preserves secrets/certs on the destination)
@@ -113,6 +113,8 @@ AiRouterProxy/
 | `proxy-cert.pem` / `proxy-key.pem` | TLS certificate + private key (SECRET) | **No** (gitignored). Generated on the server |
 | `LOCAL_KEY.txt` | Last local key generated (SECRET) | **No** (gitignored) |
 | `deploy/`, `publish-tmp/` | Local service install and build output | **No** (gitignored) |
+
+> At the installed service, all config files live in a config subfolder next to the exe (the server reads from there when present - see [Deploy (installed service)](#deploy-installed-service)).
 
 ### appsettings.Server.json
 
@@ -503,7 +505,7 @@ limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE pro
 
 ```powershell
 dotnet run --project tests/RedactorTests.csproj -c Release
-# -> RESULT: 214 PASS, 0 FAIL
+# -> RESULT: 219 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)
@@ -536,7 +538,7 @@ real forward + SSE streaming, redaction observability (`redacted>0` in activity)
 
 The service runs as a Windows Service (`AIRouterProxy`) whose executable is deployed to a service
 folder. The recommended layout puts it under `C:\Services` (outside any repo), e.g.
-`C:\Services\AiRouterProxy\`. Config, certs, `routes.json` and `redaction.json` live next to the exe.
+`C:\Services\AiRouterProxy\`. All config files (appsettings.*.json, redaction.json, routes.json and the TLS certs) live in a **`config`** subfolder next to the exe, so the deploy root only has the executable and the configs are easy to find (the server auto-detects `config/`; a flat install without it keeps working).
 
 ### Regular update of an existing service
 
@@ -551,7 +553,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1
 powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir "C:\Services\AiRouterProxy"
 ```
 
-`deploy-update.ps1` preserves config/certs on the destination and restarts the service (when installed as a Windows Service). If the deploy carries inspection/rate-limit changes, refresh the destination `redaction.json` from the repo copy afterwards (the deploy script preserves the destination file by design).
+`deploy-update.ps1` preserves config/certs (keeping them in the destination `config/` folder and migrating an older flat install automatically) and restarts the service (when installed as a Windows Service). If the deploy carries inspection/rate-limit changes, refresh the destination `redaction.json` from the repo copy afterwards (the deploy script preserves the destination file by design).
 
 ### Moving the deployed service to a new folder (generic)
 
@@ -575,11 +577,11 @@ $To   = "C:\Services\AiRouterProxy"      # new install folder
    ```
    The publish does not include secrets. Copy them manually once into the new folder:
    ```powershell
-   Copy-Item "$From\appsettings.Server.json" $To\
-   Copy-Item "$From\proxy-cert.pem"          $To\
-   Copy-Item "$From\proxy-key.pem"           $To\
+   Copy-Item "$From\config\appsettings.Server.json" "$To\config\"
+   Copy-Item "$From\config\proxy-cert.pem"          "$To\config\"
+   Copy-Item "$From\config\proxy-key.pem"           "$To\config\"
    ```
-   (`deploy-update.ps1` preserves these files on future updates, so you only do this once.)
+   (`deploy-update.ps1` preserves these files on future updates, so you only do this once. If the old install was flat - configs next to the exe - `deploy-update.ps1` migrates them into `config/` automatically on the next update.)
 3. **Point the Windows Service at the new path** (elevated):
    ```powershell
    sc.exe config AIRouterProxy binPath= "$To\AIRouterProxy.exe"

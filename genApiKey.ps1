@@ -8,7 +8,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $deploy     = $DeployDir
-$configFile = Join-Path $deploy 'appsettings.Server.json'
+$configFile# configs live in deploy\config (new layout); fall back to the legacy flat deploy root
+$configFile = Join-Path (Join-Path $deploy 'config') 'appsettings.Server.json'
+if (-not (Test-Path $configFile)) { $configFile = Join-Path $deploy 'appsettings.Server.json' }
 $keyFile    = Join-Path $deploy 'LOCAL_KEY.txt'
 
 if (-not (Test-Path $configFile)) {
