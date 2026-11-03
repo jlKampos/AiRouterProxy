@@ -88,3 +88,5 @@ publish-tmp/
 # Logs
 *.log
 deploy-update.log
+
+.vs

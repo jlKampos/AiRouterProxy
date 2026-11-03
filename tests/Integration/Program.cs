@@ -159,6 +159,7 @@ class Program
         Check("text/plain -> 415", () => textPlain.status == 415);
 
         var delete = await DeleteAsync(client, chatPath);
+        Info($"DELETE -> status={delete.status} allow={delete.allowHeader ?? "<none>"}");
         Check("DELETE -> 405 with Allow header", () =>
             delete.status == 405
             && delete.allowHeader is not null
@@ -181,11 +182,12 @@ class Program
         {
             CheckTrue("real forward reaches the upstream", () =>
             {
-                foreach (var model in new[] { "gpt-4o-mini", "gpt-4o", "openai/gpt-4o-mini", "claude-3-5-haiku-latest" })
+                // Model names are limited by the router key; use models the key can access.
+                foreach (var model in new[] { "DeepSeek-V4-Flash", "Qwen3.8", "whisper-large-v3-turbo", "Qwen3-Embedding" })
                 {
                     var r = SendChatJsonAsync(client, chatPath, model, stream: false, fakeSecret: false);
                     if (r.status == 200) { firstWorkingModel = model; return true; }
-                    if (IsProxyError(r.status)) return false;
+                    if (IsProxyError(r.status, r.body)) return false;
                     lastUpstreamStatus = r.status; // 4xx/5xx from the router still means "reached the upstream"
                 }
 
@@ -349,7 +351,10 @@ class Program
             var body = await resp.Content.ReadAsStringAsync();
             var retry = resp.Headers.TryGetValues("retry-after", out var rv)
                         && int.TryParse(rv.FirstOrDefault(), out var rs) ? rs : 0;
-            var allow = resp.Headers.TryGetValues("allow", out var av) ? string.Join(", ", av) : null;
+            // "Allow" is an entity header: HttpClient exposes it under Content.Headers,
+            // not the top-level response headers. Read both to be transport-agnostic.
+            var allow = (resp.Headers.TryGetValues("allow", out var av) ? string.Join(", ", av) : null)
+                ?? (resp.Content.Headers.TryGetValues("allow", out var cav) ? string.Join(", ", cav) : null);
             return ((int)resp.StatusCode, body, retry, allow);
         }
         catch (HttpRequestException ex)
@@ -473,8 +478,12 @@ class Program
     // Small helpers
     // ------------------------------------------------------------------
 
-    static bool IsProxyError(int status)
-        => status is 401 or 403 or 502 or 503 or 429 or 0;
+    static bool IsProxyError(int status, string body)
+        => status is 502 or 503 or 429 or 0
+           // A 401 from the PROXY carries the authentication_error error type;
+           // a 401 from the UPSTREAM (e.g. "key not allowed to access model")
+           // means the proxy itself worked and the request reached the router.
+           || (status == 401 && body.Contains("\"authentication_error\"", StringComparison.Ordinal));
 
     static string ShaPrefix(string value)
         => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)))[..8];
