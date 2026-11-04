@@ -153,6 +153,7 @@ app.MapGet("/admin/endpoints", (IOptionsMonitor<ProxyOptions> opts) =>
                     byFormats = o.Redaction.Detect?.ByFormats ?? true,
                     byKeyValueContext = o.Redaction.Detect?.ByKeyValueContext ?? true,
                     byLongStrings = o.Redaction.Detect?.ByLongStrings ?? true,
+                    exemptBase64 = o.Redaction.Detect?.ExemptBase64 ?? true,
                 },
                 scope = "outgoing messages (JSON requests)",
             },

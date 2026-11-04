@@ -297,6 +297,104 @@ public static class SecretDetector
         return distinct.Count >= 12 && classes >= 3;
     }
 
+    /// <summary>
+    /// Base64 payload detection (image/binary data). Those payloads are never scanned as text:
+    /// scanning them neither finds keys (they are bytes, not pasted text) nor fixes anything -
+    /// it only corrupts the base64 with the mask (litellm "only ASCII" errors). Detection is
+    /// deliberately narrow: structural characters (/ + =) are required so real random-looking
+    /// text, hashes, slugs and filenames are still caught by the entropy layer.
+    /// </summary>
+
+    /// <summary>Below this length a "base64-looking" run is not treated as payload yet.</summary>
+    private const int Base64PayloadMinLength = 100;
+
+    private static bool IsBase64Char(char c) =>
+        (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c is '+' or '/' or '=' or '-' or '_';
+
+    /// <summary>
+    /// True when a whole string value is a binary payload and must bypass text scanning:
+    /// a data URL ("data:...;base64,&lt;payload&gt;", e.g. OpenAI image_url.url) or a long
+    /// standalone base64 blob (e.g. Anthropic source.data).
+    /// </summary>
+    public static bool IsBase64Payload(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return false;
+        }
+
+        var trimmed = text.Trim();
+        if (trimmed.StartsWith("data:", StringComparison.OrdinalIgnoreCase)
+            && trimmed.Contains(";base64,", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (trimmed.Length < Base64PayloadMinLength)
+        {
+            return false;
+        }
+
+        var structural = false;
+        foreach (var c in trimmed)
+        {
+            if (c is '/' or '+' or '=')
+            {
+                structural = true;
+            }
+            else if (char.IsWhiteSpace(c))
+            {
+                // Base64 with line breaks is still base64.
+                continue;
+            }
+            else if (!IsBase64Char(c))
+            {
+                return false;
+            }
+        }
+
+        return structural;
+    }
+
+    /// <summary>
+    /// True when an entropy/context finding lies inside a base64 payload region of a longer
+    /// text (a data URL or base64 blob pasted inline among prose). "format" findings are never
+    /// exempted, even here, so pasted keys next to an image are still masked.
+    /// </summary>
+    public static bool IsInsideBase64Payload(string text, SecretFinding finding)
+    {
+        var start = finding.Start;
+        var end = finding.Start + finding.Length;
+
+        while (start > 0 && IsBase64Char(text[start - 1]))
+        {
+            start--;
+        }
+
+        while (end < text.Length && IsBase64Char(text[end]))
+        {
+            end++;
+        }
+
+        if (end - start < Base64PayloadMinLength)
+        {
+            return false;
+        }
+
+        for (var i = start; i < end; i++)
+        {
+            if (text[i] is '/' or '+' or '=')
+            {
+                return true;
+            }
+        }
+
+        // A payload glued to its marker ("...base64,&lt;blob&gt;") counts as base64 even when
+        // the blob itself has no structural symbol (tiny images).
+        return text.AsSpan(0, start).EndsWith("base64,", StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>Sorts by start, then detector priority, then longest match; drops overlaps.</summary>
     private static IReadOnlyList<SecretFinding> Merge(List<SecretFinding> findings)
     {

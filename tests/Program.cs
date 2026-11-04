@@ -31,6 +31,7 @@ class Program
         TestRedactionGaps();
         TestConfigPaths();
         TestRedactionAllow();
+        TestBase64ImageExemption();
         TestPreviews();
         TestDetector();
         TestAuthenticationPolicy();
@@ -449,6 +450,69 @@ class Program
         var r7 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"C:\\Users\\demo\\plans\\ACME-1234-v2-WidgetApp-Module-Plan.md\"}"),
             allow: new[] { "^ACME-[0-9]{3,5}-" });
         CheckTrue("allow works in full path", () => !r7.Changed && Str(r7.Data).Contains("C:\\Users\\demo\\plans\\ACME-1234-v2-WidgetApp-Module-Plan.md"));
+    }
+
+    // --------------------------------------------------------------
+    static void TestBase64ImageExemption()
+    {
+        // Deterministic high-entropy base64 blob: 28+ alnum runs between structural chars
+        // (/ + =) - the exact shape the entropy scanner used to corrupt (litellm ASCII error).
+        var rnd = new Random(7);
+        static string Run(Random r, int n)
+        {
+            const string a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            var sb = new StringBuilder(n);
+            for (var i = 0; i < n; i++) sb.Append(a[r.Next(a.Length)]);
+            return sb.ToString();
+        }
+
+        var b64 = string.Join("", Run(rnd, 32), "/", Run(rnd, 31), "+", Run(rnd, 30), "=", Run(rnd, 29), "/", Run(rnd, 28));
+
+        // 1) OpenAI image_url.url data URL: intact end-to-end (pure ASCII, nothing masked).
+        var body1 = Bytes("{\"model\":\"x\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64," + b64 + "\"}}]}]}");
+        var r1 = SecretRedactor.RedactJson(body1);
+        CheckTrue("openai image_url data URL untouched", () => !r1.Changed && Str(r1.Data).Contains(b64.Substring(0, 40)));
+
+        // 2) Anthropic source.data standalone base64 blob: intact.
+        var body2 = Bytes("{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"" + b64 + "\"}}");
+        var r2 = SecretRedactor.RedactJson(body2);
+        CheckTrue("anthropic source.data blob untouched", () => !r2.Changed && Str(r2.Data).Contains(b64.Substring(0, 40)));
+
+        // 3) Data URL inline amid prose: the blob region stays, output still pure ASCII.
+        var body3 = Bytes("{\"prompt\":\"look: data:image/png;base64," + b64 + " end\"}");
+        var r3 = SecretRedactor.RedactJson(body3);
+        CheckTrue("inline data URL in prose intact", () => !r3.Changed && Str(r3.Data).Contains(b64.Substring(0, 40)));
+
+        // 4) A real format key in the same string as a blob is STILL masked (security guard).
+        var body4 = Bytes("{\"prompt\":\"key sk-abc123456789012345678, img data:image/png;base64," + b64 + "\"}");
+        var r4 = SecretRedactor.RedactJson(body4);
+        CheckTrue("format key still masked next to blob", () => r4.Changed && !Str(r4.Data).Contains("sk-abc123456789012345678"));
+
+        // 5) Sensitive field name always masks the whole value, even a data URL.
+        var body5 = Bytes("{\"api_key\":\"data:image/jpeg;base64," + b64 + "\"}");
+        var r5 = SecretRedactor.RedactJson(body5);
+        CheckTrue("api_key field still masks image payload", () => r5.Changed && !Str(r5.Data).Contains(b64.Substring(0, 20)));
+
+        // 6) Toggle off (exemptBase64=false) restores the legacy corruption (regression guard).
+        var r6 = SecretRedactor.RedactJson(body1, exemptBase64: false);
+        CheckTrue("exemptBase64=false: image payload masked again (legacy)", () => r6.Changed);
+
+        // 7) Kebab-case filename: NOT base64 (no /+=), too short - still masked.
+        var r7 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"file ACME-1234-v2-WidgetApp-Module-Plan.md x\"}"));
+        CheckTrue("kebab filename still masked (not base64)", () => r7.Changed && !Str(r7.Data).Contains("ACME-1234-v2-WidgetApp-Module-Plan"));
+
+        // 8) Short token (< 100): never exempted - still scanned and masked.
+        var r8 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"token AaBbCcDdEeFfGgHhIiJjKkLlMmNnOoPpQq1234 x\"}"));
+        CheckTrue("short random token still masked", () => r8.Changed);
+
+        // 9) Long pure-alnum run WITHOUT /+= is not base64 by our rule - still masked.
+        var longAlnum = Run(rnd, 120);
+        var r9 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"tok " + longAlnum + " x\"}"));
+        CheckTrue("long alnum run without /+= still masked", () => r9.Changed && !Str(r9.Data).Contains(longAlnum));
+
+        // 10) Allow-list keeps working together with the base64 exemption.
+        var r10 = SecretRedactor.RedactJson(body3, allow: new[] { "^look:" });
+        CheckTrue("allow + base64 exemption coexist", () => !r10.Changed && Str(r10.Data).Contains(b64.Substring(0, 40)));
     }
 
     static void TestPreviews()

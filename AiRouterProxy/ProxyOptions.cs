@@ -163,6 +163,15 @@ public sealed class DetectOptions
     /// or mixed classes) and not be a hex/uuid-like value.
     /// </summary>
     public double EntropyThreshold { get; set; } = 3.0;
+
+    /// <summary>
+    /// Skips redaction for image/binary payloads: data URLs ("data:...;base64,...")
+    /// and long standalone base64 blobs. Those are binary bytes, not text where keys
+    /// get pasted - scanning them corrupts the base64 (litellm "only ASCII" errors).
+    /// Known formats (sk-, ghp_, ...) and sensitive field values are STILL always
+    /// masked, even next to an image. Default: true.
+    /// </summary>
+    public bool ExemptBase64 { get; set; } = true;
 }
 
 /// <summary>

@@ -2,7 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.0.3 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.0.4 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ## Why: a security layer for development environments
 
@@ -33,6 +33,12 @@ corporate policies that require EU-resident / zero-data-retention gateways.
 
 The mask is a fixed 6-character string (it never reveals the real length), and the JSON structure
 is never changed.
+
+**Image/binary payloads are never scanned as text**: `data:...;base64,...` data URLs (OpenAI
+`image_url.url`, Anthropic `source.data`) and long base64 blobs pass through untouched —
+they are binary bytes, not text where a key gets pasted, and scanning them would corrupt the
+base64. Configurable via `detect.exemptBase64` (default: on). Real keys and known formats are
+always masked, even in text next to an image.
 
 ### In action
 
@@ -66,7 +72,7 @@ non-sensitive content passing through untouched:
   Anthropic, generic)
 - Admin endpoints protected by a local key (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
-- Versioned via assembly info (SemVer, e.g. 2.0.3); reported by /admin/health
+- Versioned via assembly info (SemVer, e.g. 2.0.4); reported by /admin/health
 
 ## Structure
 
