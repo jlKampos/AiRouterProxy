@@ -99,6 +99,16 @@ public sealed class RedactionOptions
 
     /// <summary>Detection layers (default: all active).</summary>
     public DetectOptions Detect { get; set; } = new();
+
+    /// <summary>
+    /// Optional allow-list of regex patterns. A detection whose token matches one of these
+    /// patterns is left untouched (not masked, not counted) - use it to keep legitimate
+    /// file names / internal IDs readable. Exemptions NEVER apply to the high-confidence
+    /// format scanner (sk-, ghp_, AIza, JWT, Bearer, PEM...) nor to values of sensitive
+    /// JSON fields (api_key, password, token...): those are always redacted.
+    /// Empty = current behavior (no exemptions).
+    /// </summary>
+    public List<string> Allow { get; set; } = new();
 }
 
 /// <summary>

@@ -30,6 +30,7 @@ class Program
         TestExtendedDetection();
         TestRedactionGaps();
         TestConfigPaths();
+        TestRedactionAllow();
         TestPreviews();
         TestDetector();
         TestAuthenticationPolicy();
@@ -412,6 +413,44 @@ class Program
     }
 
     // --------------------------------------------------------------
+    // --------------------------------------------------------------
+    static void TestRedactionAllow()
+    {
+        // 1) No allow-list: the 28-char kebab-case filename is still masked (regression guard).
+        var r1 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"file ACME-1234-v2-WidgetApp-Module-Plan.md x\"}"));
+        CheckTrue("allow off: filename masked", () => r1.Changed && !Str(r1.Data).Contains("ACME-1234-v2-WidgetApp-Module-Plan"));
+
+        // 2) Allow-list matches the filename -> left untouched, not counted.
+        var r2 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"file ACME-1234-v2-WidgetApp-Module-Plan.md x\"}"),
+            allow: new[] { "^ACME-[0-9]{3,5}-" });
+        CheckTrue("allow matches filename", () => !r2.Changed && Str(r2.Data).Contains("ACME-1234-v2-WidgetApp-Module-Plan.md"));
+
+        // 3) Real format keys are NEVER exempted, even under a matching allow pattern.
+        var r3 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"key sk-abc123456789012345678 x\"}"),
+            allow: new[] { "^sk-" });
+        CheckTrue("allow never exempts sk-", () => r3.Changed && !Str(r3.Data).Contains("sk-abc123456789012345678"));
+
+        // 4) A non-allowed random-looking token is still masked when the allow-list exists.
+        var r4 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"token AaBbCcDdEeFfGgHhIiJjKkLlMm123 x\"}"),
+            allow: new[] { "^OTHER-" });
+        CheckTrue("allow list keeps other tokens masked", () => r4.Changed);
+
+        // 5) Invalid regex in the allow-list is ignored without crashing.
+        var r5 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"file ACME-1234-v2-WidgetApp-Module-Plan.md x\"}"),
+            allow: new[] { "(" });
+        CheckTrue("allow invalid regex ignored", () => r5.Changed && !Str(r5.Data).Contains("ACME-1234-v2-WidgetApp-Module-Plan"));
+
+        // 6) byFieldName still masks the whole value even if it matches the allow-list.
+        var r6 = SecretRedactor.RedactJson(Bytes("{\"api_key\":\"ACME-1234-v2-WidgetApp-Module-Plan.md\"}"),
+            allow: new[] { "^ACME-[0-9]{3,5}-" });
+        CheckTrue("allow never exempts sensitive field values", () => r6.Changed && !Str(r6.Data).Contains("ACME-1234"));
+
+        // 7) Works in a full Windows path too (JSON-escaped backslashes).
+        var r7 = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"C:\\Users\\demo\\plans\\ACME-1234-v2-WidgetApp-Module-Plan.md\"}"),
+            allow: new[] { "^ACME-[0-9]{3,5}-" });
+        CheckTrue("allow works in full path", () => !r7.Changed && Str(r7.Data).Contains("C:\\Users\\demo\\plans\\ACME-1234-v2-WidgetApp-Module-Plan.md"));
+    }
+
     static void TestPreviews()
     {
         // Format detection collects a category-only preview, never content

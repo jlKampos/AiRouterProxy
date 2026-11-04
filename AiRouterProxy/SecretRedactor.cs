@@ -60,9 +60,12 @@ public static class SecretRedactor
         bool detectByFormats = true,
         bool detectByKeyValueContext = true,
         bool detectByLongStrings = true,
-        double detectEntropyThreshold = 3.0)
+        double detectEntropyThreshold = 3.0,
+        IReadOnlyList<string>? allow = null)
     {
         var result = new Result { Data = body, Changed = false };
+
+        var allowRegexes = CompileAllow(allow);
 
         if (!enabled || body is null || body.Length == 0)
         {
@@ -92,7 +95,7 @@ public static class SecretRedactor
             {
                 WriteElement(writer, doc.RootElement, null, maskValue, result.Stats,
                     detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                    detectEntropyThreshold);
+                    detectEntropyThreshold, allowRegexes);
             }
 
             if (result.Stats.Total > 0)
@@ -357,7 +360,8 @@ public static class SecretRedactor
         bool detectByFormats,
         bool detectByKeyValueContext,
         bool detectByLongStrings,
-        double detectEntropyThreshold)
+        double detectEntropyThreshold,
+        IReadOnlyList<Regex>? allowRegexes)
     {
         switch (element.ValueKind)
         {
@@ -368,7 +372,7 @@ public static class SecretRedactor
                     writer.WritePropertyName(property.Name);
                     WriteElement(writer, property.Value, property.Name, mask, stats,
                         detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                        detectEntropyThreshold);
+                        detectEntropyThreshold, allowRegexes);
                 }
                 writer.WriteEndObject();
                 break;
@@ -379,7 +383,7 @@ public static class SecretRedactor
                 {
                     WriteElement(writer, item, null, mask, stats,
                         detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                        detectEntropyThreshold);
+                        detectEntropyThreshold, allowRegexes);
                 }
                 writer.WriteEndArray();
                 break;
@@ -397,7 +401,7 @@ public static class SecretRedactor
                 else
                 {
                     writer.WriteStringValue(ApplyScans(text, mask, stats,
-                        detectByFormats, detectByKeyValueContext, detectByLongStrings, detectEntropyThreshold));
+                        detectByFormats, detectByKeyValueContext, detectByLongStrings, detectEntropyThreshold, allowRegexes));
                 }
                 break;
 
@@ -418,7 +422,8 @@ public static class SecretRedactor
         bool detectByFormats,
         bool detectByKeyValueContext,
         bool detectByLongStrings,
-        double detectEntropyThreshold)
+        double detectEntropyThreshold,
+        IReadOnlyList<Regex>? allowRegexes)
     {
         if (string.IsNullOrEmpty(text))
         {
@@ -433,14 +438,15 @@ public static class SecretRedactor
             EntropyThreshold = detectEntropyThreshold,
         };
 
-        return ApplyFindings(text, mask, stats, opts);
+        return ApplyFindings(text, mask, stats, opts, allowRegexes);
     }
 
     /// <summary>
     /// Masks every finding returned by <see cref="SecretDetector.Detect"/> in a single pass,
     /// rebuilding the string around the detected spans. Stats are tallied per detector family.
     /// </summary>
-    private static string ApplyFindings(string current, string mask, RedactionStats stats, DetectOptions opts)
+    private static string ApplyFindings(string current, string mask, RedactionStats stats, DetectOptions opts,
+        IReadOnlyList<Regex>? allowRegexes)
     {
         var findings = SecretDetector.Detect(current, opts);
         if (findings.Count == 0)
@@ -457,6 +463,12 @@ public static class SecretRedactor
 
         foreach (var finding in findings)
         {
+            if (IsExemptedByAllow(finding, current, allowRegexes))
+            {
+                cursor = finding.Start + finding.Length;
+                continue;
+            }
+
             sb.Append(current, cursor, finding.Start - cursor);
             sb.Append(mask);
 
@@ -502,5 +514,64 @@ public static class SecretRedactor
         }
 
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// True when a detection is exempted by the configured allow-list (Redaction.allow).
+    /// Only the medium-confidence scanners (context / entropy) may be exempted; the
+    /// high-confidence format scanner is never exempted (sk-, ghp_, AIza, JWT, Bearer, PEM...)
+    /// and sensitive JSON field values are masked before text scanning.
+    /// </summary>
+    private static bool IsExemptedByAllow(SecretFinding finding, string current, IReadOnlyList<Regex>? allowRegexes)
+    {
+        if (allowRegexes is null || allowRegexes.Count == 0)
+        {
+            return false;
+        }
+
+        if (finding.Detector == SecretDetector.DetectorFormat)
+        {
+            return false;
+        }
+
+        var token = current.Substring(finding.Start, finding.Length);
+        foreach (var rx in allowRegexes)
+        {
+            if (rx.IsMatch(token))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Compiles the allow-list patterns once per redaction pass. Invalid patterns are ignored.</summary>
+    private static IReadOnlyList<Regex>? CompileAllow(IReadOnlyList<string>? allow)
+    {
+        if (allow is null || allow.Count == 0)
+        {
+            return null;
+        }
+
+        var list = new List<Regex>(allow.Count);
+        foreach (var pattern in allow)
+        {
+            if (string.IsNullOrWhiteSpace(pattern))
+            {
+                continue;
+            }
+
+            try
+            {
+                list.Add(new Regex(pattern, RegexOptions.Compiled | RegexOptions.CultureInvariant));
+            }
+            catch (ArgumentException)
+            {
+                // Invalid pattern - ignored; the rest of the allow-list still applies.
+            }
+        }
+
+        return list.Count == 0 ? null : list;
     }
 }

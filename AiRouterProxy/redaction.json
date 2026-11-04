@@ -11,7 +11,10 @@
         "byKeyValueContext": true,
         "byLongStrings": true,
         "entropyThreshold": 3.0
-      }
+      },
+      "allow": [
+        "^ACME-[0-9]{3,5}-"
+      ]
     },
     "Inspection": {
       "enabled": true,

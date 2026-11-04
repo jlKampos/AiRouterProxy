@@ -2,7 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.0.2 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.0.3 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ## Why: a security layer for development environments
 
@@ -66,7 +66,7 @@ non-sensitive content passing through untouched:
   Anthropic, generic)
 - Admin endpoints protected by a local key (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
-- Versioned via assembly info (SemVer, e.g. 2.0.2); reported by /admin/health
+- Versioned via assembly info (SemVer, e.g. 2.0.3); reported by /admin/health
 
 ## Structure
 
@@ -93,7 +93,7 @@ AiRouterProxy/
 |   |-- redaction.json             # redaction flags (non-secret)
 |   `-- routes.json                # route table (non-secret)
 |-- tests/
-|   |-- Program.cs                 # unit harness (no framework) - 219 PASS
+|   |-- Program.cs                 # unit harness (no framework) - 226 PASS
 |   |-- RedactorTests.csproj       # offline unit harness (excludes tests/Integration)
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- deploy-update.ps1              # deploy to the installed service (preserves secrets/certs on the destination)
@@ -109,7 +109,7 @@ AiRouterProxy/
 | `appsettings.Server.json` | Keys and certificates config (SECRET) | **No** (gitignored). Copy it from `appsettings.Server.example.json` |
 | `appsettings.json` | Non-secret proxy defaults (host, port) | Yes |
 | `routes.json` | Route table (upstreams, prefixes, key refs by name - no key values) | Yes |
-| `redaction.json` | Redaction flags and mask | Yes |
+| `redaction.json` | Redaction flags, mask and allow-list | Yes |
 | `proxy-cert.pem` / `proxy-key.pem` | TLS certificate + private key (SECRET) | **No** (gitignored). Generated on the server |
 | `LOCAL_KEY.txt` | Last local key generated (SECRET) | **No** (gitignored) |
 | `deploy/`, `publish-tmp/` | Local service install and build output | **No** (gitignored) |
@@ -201,11 +201,21 @@ Redacts sensitive content (API keys, passwords, tokens) in outgoing request bodi
         "byFormats": true,          // sk-, ghp_, AIza, JWT, Bearer, PEM...
         "byKeyValueContext": true,  // "key": "value" / KEY=value in text
         "byLongStrings": true       // long URL-safe tokens (>= 28 chars) with mixed case
-      }
+      },
+      "allow": [                    // optional: skip redaction when a detected token matches
+        "^ACME-[0-9]{3,5}-"          //   one of these regexes (e.g. project file names / IDs)
+      ]
     }
   }
 }
 ```
+
+**`allow` (optional):** a list of regex patterns. When a detected token matches one of them it
+is **not masked** (nor counted / notified) - use it to keep legitimate file names and internal
+IDs (e.g. ``ACME-1234-v2-WidgetApp-Module-Plan.md``) readable even though the long-string scanner
+would flag them. Exemptions **never** apply to the high-confidence format scanner (`sk-`, `ghp_`,
+`AIza`, JWT, `Bearer`, PEM...) nor to values of sensitive JSON fields (`api_key`, `password`,
+`token`...): those are always redacted. Invalid regexes are ignored.
 
 ### Hot reload
 
@@ -505,7 +515,7 @@ limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE pro
 
 ```powershell
 dotnet run --project tests/RedactorTests.csproj -c Release
-# -> RESULT: 219 PASS, 0 FAIL
+# -> RESULT: 226 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)
