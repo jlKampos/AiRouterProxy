@@ -314,7 +314,8 @@ public sealed class ProxyMiddleware
                 detectByFormats: options.Redaction.Detect?.ByFormats ?? true,
                 detectByKeyValueContext: options.Redaction.Detect?.ByKeyValueContext ?? true,
                 detectByLongStrings: options.Redaction.Detect?.ByLongStrings ?? true,
-                detectEntropyThreshold: options.Redaction.Detect?.EntropyThreshold ?? 3.0);
+                detectEntropyThreshold: options.Redaction.Detect?.EntropyThreshold ?? 3.0,
+                allow: options.Redaction.Allow);
             if (redacted.Changed)
             {
                 forwardedBody = redacted.Data;
