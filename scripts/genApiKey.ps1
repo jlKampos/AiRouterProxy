@@ -1,8 +1,8 @@
 # genApiKey.ps1 - generates a new local key AND writes it to the AIRouterProxy config
-# Usage: powershell -ExecutionPolicy Bypass -File .\genApiKey.ps1
-#        powershell -ExecutionPolicy Bypass -File .\genApiKey.ps1 -DeployDir "C:\Path\To\deploy"
+# Usage: powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1
+#        powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1 -DeployDir "C:\Path\To\deploy"
 param(
-    [string]$DeployDir = (Join-Path $PSScriptRoot 'deploy')
+    [string]$DeployDir = (Join-Path (Split-Path $PSScriptRoot -Parent) 'deploy')
 )
 
 $ErrorActionPreference = 'Stop'

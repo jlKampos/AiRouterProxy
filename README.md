@@ -92,7 +92,7 @@ non-sensitive content passing through untouched:
   `415`, invalid JSON `400`, oversized `413`)
 - **Per-client rate limiting and brute-force lockout** (429 + `Retry-After`; failure lockout)
 - **Multiple accepted local keys** (`Proxy:Keys:LocalKeys`) for auth rotation
-- **SSE protocol adapters** (`AiRouterProxy/SseProtocol/`) for streamed forwards (OpenAI chat/responses,
+- **SSE protocol adapters** (`src/AiRouterProxy/Sse/SseProtocol/`) for streamed forwards (OpenAI chat/responses,
   Anthropic, generic)
 - Admin endpoints protected by a local key (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
@@ -102,32 +102,48 @@ non-sensitive content passing through untouched:
 
 ```
 AiRouterProxy/
-|-- AiRouterProxy/                 # C# source
-|   |-- ProxyOptions.cs            # Proxy/Routes/Redaction/Inspection/RateLimit options
-|   |-- RouteResolver.cs           # route resolution (longest prefix) + allowed-path guards
-|   |-- ProxyMiddleware.cs         # proxy pipeline (rate limit -> auth -> method -> route -> inspect -> redact -> forward)
-|   |-- SecretDetector.cs          # secret detection (4 layers)
-|   |-- SecretRedactor.cs          # secret redaction (preserves JSON structure)
-|   |-- NoticeInjector.cs          # notice at the end of the response (SSE/JSON)
-|   |-- SseStreamProcessor.cs      # streaming forwarder (protocol-agnostic)
-|   |-- SseParser.cs / SseEvent.cs # minimal SSE parse/emit
-|   |-- SseProtocol/               # SSE protocol adapters (OpenAI chat, OpenAI responses, Anthropic, generic) + registry
-|   |-- InspectionPolicy.cs        # fail-closed content-type inspection decisions
-|   |-- SecurityHelpers.cs         # bearer extraction, hashing
-|   |-- AuthenticationPolicy.cs    # local multi-key auth
-|   |-- RateLimiter.cs             # per-IP rate limit + brute-force lockout
-|   |-- AdminAuthMiddleware.cs     # /admin Bearer auth
-|   |-- ActivityStore.cs           # activity log (/admin/activity)
-|   |-- appsettings.json           # non-secret config
-|   |-- appsettings.Server.example.json  # TEMPLATE for the keys (copy to appsettings.Server.json)
-|   |-- redaction.json             # redaction flags (non-secret)
-|   `-- routes.json                # route table (non-secret)
+|-- src/
+|   `-- AiRouterProxy/             # C# source, grouped by responsibility
+|       |-- Program.cs             # bootstrap + pipeline wiring
+|       |-- Pipeline/              # request pipeline (rate limit -> auth -> method -> route -> inspect -> redact -> forward)
+|       |   |-- ProxyMiddleware.cs
+|       |   `-- AdminAuthMiddleware.cs     # /admin Bearer auth
+|       |-- Detection/             # secret detection + redaction
+|       |   |-- SecretDetector.cs          # secret detection (4 layers)
+|       |   |-- SecretRedactor.cs          # secret redaction (preserves JSON structure)
+|       |   `-- SecurityHelpers.cs         # bearer extraction, hashing
+|       |-- Policies/              # cross-cutting enforcement policies
+|       |   |-- AuthenticationPolicy.cs    # local multi-key auth
+|       |   |-- RateLimiter.cs             # per-IP rate limit + brute-force lockout
+|       |   `-- InspectionPolicy.cs        # fail-closed content-type inspection decisions
+|       |-- Routing/               # route table + options + config paths
+|       |   |-- RouteResolver.cs           # route resolution (longest prefix) + allowed-path guards
+|       |   |-- ProxyOptions.cs            # Proxy/Routes/Redaction/Inspection/RateLimit options
+|       |   `-- ConfigPaths.cs             # config/ resolution (dev vs deployed layout)
+|       |-- Sse/                   # streaming forwarder (protocol-agnostic)
+|       |   |-- SseStreamProcessor.cs
+|       |   |-- SseParser.cs / SseEvent.cs # minimal SSE parse/emit
+|       |   `-- SseProtocol/                # SSE protocol adapters (OpenAI chat, OpenAI responses, Anthropic, generic) + registry
+|       |-- Observability/         # activity log + response notices
+|       |   |-- ActivityStore.cs           # activity log (/admin/activity)
+|       |   `-- NoticeInjector.cs          # notice at the end of the response (SSE/JSON)
+|       |-- Config/                # non-secret config (copied to config\ on deploy)
+|       |   |-- appsettings.json
+|       |   |-- appsettings.Development.json
+|       |   |-- appsettings.Server.example.json  # TEMPLATE for the keys (copy to appsettings.Server.json)
+|       |   |-- redaction.json
+|       |   `-- routes.json
+|       `-- Properties/launchSettings.json
 |-- tests/
-|   |-- Program.cs                 # unit harness (no framework) - 236 PASS
-|   |-- RedactorTests.csproj       # offline unit harness (excludes tests/Integration)
+|   |-- Unit/                      # offline unit harness (compiles the app sources directly)
+|   |   |-- Program.cs             #   no framework - 236 PASS
+|   |   `-- RedactorTests.csproj
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
-|-- deploy-update.ps1              # deploy to the installed service (preserves secrets/certs on the destination)
-`-- genApiKey.ps1                  # generates/rotates the local key
+|-- scripts/
+|   |-- deploy-update.ps1          # deploy to the installed service (preserves secrets/certs on the destination)
+|   `-- genApiKey.ps1              # generates/rotates the local key
+|-- images/                        # README screenshots
+|-- README.md, LICENSE, .gitignore, AIRouterProxy.slnx
 ```
 
 ## Configuration
@@ -222,7 +238,7 @@ The only place where keys live. Created on the target machine (never committed):
 ```
 
 - `Proxy:Keys:UpstreamKey` - key for the **default route** (`prefix: ""`).
-- `Proxy:Keys:LocalKey` - key the proxy accepts from local clients (protects both the proxy and `/admin`). Generate one with `genApiKey.ps1`.
+- `Proxy:Keys:LocalKey` - key the proxy accepts from local clients (protects both the proxy and `/admin`). Generate one with `scripts\genApiKey.ps1`.
 - `Proxy:RouteKeys` - dictionary of `keyRef` -> key. Each named route points to one entry.
 - Environment variables `AIROUTER_API_KEY` and `LOCAL_PROXY_KEY` are also honored if the config values are empty.
 
@@ -375,7 +391,7 @@ Per-client (by IP) request limiting and brute-force lockout.
 
 ### How to edit
 
-- **Development:** edit the files in `AiRouterProxy/` at the repo root (`appsettings.json`,
+- **Development:** edit the files in `src/AiRouterProxy/` in the repo (`appsettings.json`,
   `redaction.json`, `routes.json`, ...) and run / publish the app.
 - **Installed service:** every config file lives in the **`config\` subfolder** next to the exe
   (e.g. `C:\Services\AiRouterProxy\config\`). Edit the files there directly - the service reads
@@ -414,9 +430,9 @@ edits apply **without a restart**. `Host`/`Port` and the TLS certificates are re
 
 ```powershell
 # generates a new key in sk- format (OpenAI style) and writes it to deploy/appsettings.Server.json
-powershell -ExecutionPolicy Bypass -File .\genApiKey.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1
 # existing install elsewhere:
-powershell -ExecutionPolicy Bypass -File .\genApiKey.ps1 -DeployDir "C:\Path\To\deploy"
+powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1 -DeployDir "C:\Path\To\deploy"
 ```
 
 The script prints the key hash and stores the key in `LOCAL_KEY.txt` for the client to copy.
@@ -687,7 +703,7 @@ Use the models as `airouter/Qwen3.8` or `airouter/DeepSeek-V4-Flash`.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `401` | Wrong LocalKey | Run `genApiKey.ps1` and copy `LOCAL_KEY.txt` |
+| `401` | Wrong LocalKey | Run `scripts\genApiKey.ps1` and copy `LOCAL_KEY.txt` |
 | `404 No proxy route matches` | Prefix not present in routes.json | Check `routes.json` reloaded (hot reload) |
 | `502 Route 'X' has no API key configured` | Upstream key missing | Fill `Proxy:RouteKeys:X` or `UpstreamKey` in appsettings.Server.json |
 | TLS/certificate error on the client | CA not trusted | `mkcert -install` (or install the CA root store as above) |
@@ -702,7 +718,7 @@ resolution/allowed-path enumeration (traversal, case, `%2f`), auth edges + multi
 limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE protocol adapters.
 
 ```powershell
-dotnet run --project tests/RedactorTests.csproj -c Release
+dotnet run --project tests/Unit/RedactorTests.csproj -c Release
 # -> RESULT: 236 PASS, 0 FAIL
 ```
 
@@ -744,11 +760,11 @@ folder. The recommended layout puts it under `C:\Services` (outside any repo), e
 # self-contained is REQUIRED: the host has no x64 .NET runtime installed, so a
 # framework-dependent publish fails to start ("No frameworks were found").
 # Publish to a folder OUTSIDE the repo when you must not touch publish-tmp/.
-dotnet publish AiRouterProxy/AIRouterProxy.csproj -c Release -r win-x64 --self-contained true -o publish-tmp
+dotnet publish src/AiRouterProxy/AIRouterProxy.csproj -c Release -r win-x64 --self-contained true -o publish-tmp
 # elevated (UAC); deploys to the project's deploy/ folder by default (override with -DeployDir)
-powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1
 # installed service under C:\Services:
-powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir "C:\Services\AiRouterProxy"
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir "C:\Services\AiRouterProxy"
 ```
 
 `deploy-update.ps1` preserves config/certs (keeping them in the destination `config/` folder and migrating an older flat install automatically) and restarts the service (when installed as a Windows Service). If the deploy carries inspection/rate-limit changes, refresh the destination `redaction.json` from the repo copy afterwards (the deploy script preserves the destination file by design).
@@ -770,8 +786,8 @@ $To   = "C:\Services\AiRouterProxy"      # new install folder
    ```
 2. **Build and deploy into the new folder** (from the repo root):
    ```powershell
-   dotnet publish AiRouterProxy/AIRouterProxy.csproj -c Release -r win-x64 --self-contained true -o publish-tmp
-   powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir $To
+   dotnet publish src/AiRouterProxy/AIRouterProxy.csproj -c Release -r win-x64 --self-contained true -o publish-tmp
+   powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir $To
    ```
    The publish does not include secrets. Copy them manually once into the new folder:
    ```powershell

@@ -31,15 +31,18 @@ builder.Services.AddWindowsService(options => options.ServiceName = "AIRouterPro
 builder.Services.AddSingleton<ActivityStore>();
 
 // Swagger / explorable API
+// Version comes from the assembly (same value /admin/health reports), so it never drifts from the csproj.
+var serviceVersion = typeof(Program).Assembly.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0] ?? "0.0.0";
+
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
 {
     options.SwaggerDoc("v1", new OpenApiInfo
     {
         Title = "AIRouterProxy",
-        Version = "v1",
-        Description = "Local proxy for the AI Router (api.airrouter.ch). " +
-                      "/admin endpoints require the local key (Bearer).",
+        Version = serviceVersion,
+        Description = "Local HTTPS proxy for AI model providers - enforces that secrets never leave " +
+                      "the machine, with multi-upstream routing. /admin endpoints require the local key (Bearer).",
     });
 
     options.AddSecurityDefinition("LocalKey", new OpenApiSecurityScheme

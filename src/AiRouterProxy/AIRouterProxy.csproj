@@ -7,7 +7,7 @@
     <RootNamespace>AIRouterProxy</RootNamespace>
     <AssemblyName>AIRouterProxy</AssemblyName>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
-    <Version>2.0.4</Version>
+    <Version>2.0.5</Version>
   </PropertyGroup>
 
   <ItemGroup>
@@ -23,29 +23,30 @@
          Unversioned TLS certs: they live in the server deploy, not in the repo. -->
     <None Include="proxy-cert.pem" Condition="Exists('proxy-cert.pem')" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" TargetPath="config\proxy-cert.pem" />
     <None Include="proxy-key.pem" Condition="Exists('proxy-key.pem')" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" TargetPath="config\proxy-key.pem" />
-    <!-- Non-secret config (redaction/routes) - no keys, preserved by deploy-update.ps1 -->
-    <Content Update="redaction.json" Condition="Exists('redaction.json')">
+    <!-- Non-secret config (redaction/routes) - no keys, preserved by deploy-update.ps1.
+         Source files live in Config/ in the repo; they all land in config/ at deploy. -->
+    <Content Update="Config\redaction.json" Condition="Exists('Config\redaction.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <TargetPath>config\redaction.json</TargetPath>
     </Content>
-    <Content Update="routes.json" Condition="Exists('routes.json')">
+    <Content Update="Config\routes.json" Condition="Exists('Config\routes.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <TargetPath>config\routes.json</TargetPath>
     </Content>
     <!-- Default app config + dev overrides + server template all land in config/. -->
-    <Content Update="appsettings.json" Condition="Exists('appsettings.json')">
+    <Content Update="Config\appsettings.json" Condition="Exists('Config\appsettings.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <TargetPath>config\appsettings.json</TargetPath>
     </Content>
-    <Content Update="appsettings.Development.json" Condition="Exists('appsettings.Development.json')">
+    <Content Update="Config\appsettings.Development.json" Condition="Exists('Config\appsettings.Development.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <TargetPath>config\appsettings.Development.json</TargetPath>
     </Content>
-    <Content Update="appsettings.Server.example.json" Condition="Exists('appsettings.Server.example.json')">
+    <Content Update="Config\appsettings.Server.example.json" Condition="Exists('Config\appsettings.Server.example.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <TargetPath>config\appsettings.Server.example.json</TargetPath>

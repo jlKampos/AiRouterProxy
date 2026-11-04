@@ -1,5 +1,5 @@
 <Solution>
-  <Project Path="AiRouterProxy/AIRouterProxy.csproj" />
+  <Project Path="src/AiRouterProxy/AIRouterProxy.csproj" />
   <Project Path="tests/Integration/Integration.csproj" />
-  <Project Path="tests/RedactorTests.csproj" />
+  <Project Path="tests/Unit/RedactorTests.csproj" />
 </Solution>
