@@ -2,11 +2,12 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.0.4 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.0.5 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ## Table of contents
 
 - [Why: a security layer](#why-a-security-layer-for-development-environments)
+  - [How it started](#how-it-started)
 - [Stack](#stack)
 - [Structure](#structure)
 - [Configuration](#configuration)
@@ -33,6 +34,16 @@ route table lets you forward to several OpenAI-compatible providers, each with i
 AiRouterProxy exists to **enforce that secrets never leave the machine** to AI model providers -
 in both **personal and corporate development environments**. It is a local HTTPS guardrail that
 sits between your AI coding agent and the model provider.
+
+### How it started
+
+AiRouterProxy started life as a **personal** security layer: a local HTTPS guardrail I ran
+between my own coding agents and the AI model providers, to make sure secrets never left the
+machine. As it proved itself in real use - redaction, fail-closed inspection, per-client rate
+limiting, SSE streaming - it became clear the utility was bigger than one machine, so the
+project went **public**. The repo layout (`src/`, `tests/`, `scripts/`), the full configuration
+reference and this story are all part of making it easy for anyone else to adopt and trust the
+same guardrail.
 
 ### Defense in depth
 
