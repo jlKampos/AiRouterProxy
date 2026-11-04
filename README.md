@@ -4,6 +4,30 @@ Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
 **Current version:** 2.0.4 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
+## Table of contents
+
+- [Why: a security layer](#why-a-security-layer-for-development-environments)
+- [Stack](#stack)
+- [Structure](#structure)
+- [Configuration](#configuration)
+  - [Files: secret vs non-secret](#files-secret-vs-non-secret)
+  - [Quick reference](#quick-reference)
+  - [appsettings.json](#appsettingsjson)
+  - [appsettings.Development.json](#appsettingsdevelopmentjson)
+  - [appsettings.Server.json](#appsettingsserverjson)
+  - [routes.json](#routesjson)
+  - [redaction.json](#redactionjson)
+  - [Inspection (fail-closed body handling)](#inspection-fail-closed-body-handling)
+  - [Rate limiting](#rate-limiting)
+  - [How to edit](#how-to-edit)
+  - [Verify your changes](#verify-your-changes)
+  - [Hot reload](#hot-reload)
+- [Local key](#local-key)
+- [Certificates](#certificates)
+- [Using from OpenCode (opencode.json)](#using-from-opencode-opencodejson)
+- [Tests](#tests)
+- [Deploy (installed service)](#deploy-installed-service)
+
 ## Why: a security layer for development environments
 
 AiRouterProxy exists to **enforce that secrets never leave the machine** to AI model providers -
@@ -99,7 +123,7 @@ AiRouterProxy/
 |   |-- redaction.json             # redaction flags (non-secret)
 |   `-- routes.json                # route table (non-secret)
 |-- tests/
-|   |-- Program.cs                 # unit harness (no framework) - 226 PASS
+|   |-- Program.cs                 # unit harness (no framework) - 236 PASS
 |   |-- RedactorTests.csproj       # offline unit harness (excludes tests/Integration)
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- deploy-update.ps1              # deploy to the installed service (preserves secrets/certs on the destination)
@@ -113,14 +137,66 @@ AiRouterProxy/
 | File | Content | In the repo? |
 |---|---|---|
 | `appsettings.Server.json` | Keys and certificates config (SECRET) | **No** (gitignored). Copy it from `appsettings.Server.example.json` |
-| `appsettings.json` | Non-secret proxy defaults (host, port) | Yes |
+| `appsettings.json` | Non-secret proxy defaults (host, port, body size, timeout) | Yes |
+| `appsettings.Development.json` | Development overrides (active when `ASPNETCORE_ENVIRONMENT=Development`) | Yes |
 | `routes.json` | Route table (upstreams, prefixes, key refs by name - no key values) | Yes |
-| `redaction.json` | Redaction flags, mask and allow-list | Yes |
+| `redaction.json` | Redaction flags, mask, allow-list + inspection & rate-limit policy (non-secret) | Yes |
 | `proxy-cert.pem` / `proxy-key.pem` | TLS certificate + private key (SECRET) | **No** (gitignored). Generated on the server |
 | `LOCAL_KEY.txt` | Last local key generated (SECRET) | **No** (gitignored) |
 | `deploy/`, `publish-tmp/` | Local service install and build output | **No** (gitignored) |
 
 > At the installed service, all config files live in a config subfolder next to the exe (the server reads from there when present - see [Deploy (installed service)](#deploy-installed-service)).
+
+### Quick reference
+
+| I want to... | File | Section / key | Applies live? |
+|---|---|---|---|
+| Change the proxy host / port | `appsettings.json` | `Proxy:Host` / `Proxy:Port` | restart |
+| Change the default upstream | `appsettings.json` | `Proxy:Upstream` | restart |
+| Change request timeout / max body | `appsettings.json` | `Proxy:RequestTimeoutMs` / `Proxy:MaxBodySize` | restart |
+| Add / change a route | `routes.json` | `Proxy:Routes[]` | ✓ hot reload |
+| Add a named upstream key | `appsettings.Server.json` | `Proxy:RouteKeys:<KEYREF>` | ✓ hot reload |
+| Rotate / add the local key | `appsettings.Server.json` | `Proxy:Keys:LocalKey` / `LocalKeys` | ✓ hot reload |
+| Leave a file name / internal ID unmasked | `redaction.json` | `Proxy:Redaction.Allow` | ✓ hot reload |
+| Tune a detection layer | `redaction.json` | `Proxy:Redaction.Detect.*` | ✓ hot reload |
+| Stop redacting image/base64 payloads | `redaction.json` | `Proxy:Redaction.Detect.ExemptBase64` | ✓ hot reload |
+| Tighten body inspection (fail closed) | `redaction.json` | `Proxy:Inspection.*` | ✓ hot reload |
+| Tighten rate limiting / lockout | `redaction.json` | `Proxy:RateLimit.*` | ✓ hot reload |
+
+> This is the *dev point of view*. On the installed service the same files are read from the
+> `config\` subfolder next to the exe.
+
+### appsettings.json
+
+Non-secret **defaults** (host, port, limits). Lives in the repo and is copied to `config\` on deploy:
+
+```jsonc
+{
+  "Proxy": {
+    "Host": "0.0.0.0",                       // interface to listen on (0.0.0.0 = all interfaces)
+    "Port": 4000,                            // HTTPS port (Kestrel) - changing it requires a restart
+    "Upstream": "https://api.airrouter.ch",  // upstream used when no route matches ("" prefix)
+    "RequestTimeoutMs": 300000,              // per-request upstream timeout (5 min) - timeouts surface as 502
+    "MaxBodySize": 20971520,                 // max request body in bytes (20 MB) - larger -> 413
+    "Verbose": true                          // detailed logging (request ids, redaction warnings)
+  }
+}
+```
+
+| Key | Default | What it does |
+|---|---|---|
+| `Host` | `0.0.0.0` | Listen interface. `127.0.0.1` = this machine only. Restart to apply. |
+| `Port` | `4000` | HTTPS port. Restart to apply. |
+| `Upstream` | `https://api.airrouter.ch` | Fallback upstream when no route matches. |
+| `RequestTimeoutMs` | `300000` | Upstream timeout (ms); a timed-out forward returns 502. |
+| `MaxBodySize` | `20971520` | Requests larger than this are rejected with 413 before forwarding. |
+| `Verbose` | `true` | Extra detail in the logs (request ids, redaction notices). |
+
+### appsettings.Development.json
+
+Optional overrides applied only when the app runs with `ASPNETCORE_ENVIRONMENT=Development`
+(the installed Windows Service does not set it, so this file is ignored there). Use it in dev
+to e.g. raise `Verbose` or lower `RequestTimeoutMs` without touching the shipped defaults.
 
 ### appsettings.Server.json
 
@@ -192,29 +268,48 @@ Rules:
 
 ### redaction.json
 
-Redacts sensitive content (API keys, passwords, tokens) in outgoing request bodies:
+Non-secret policy file. Besides the **redaction** rules it also holds the **inspection**
+(fail-closed body handling) and **rate limiting** sections - all under the same `Proxy` block.
+
+#### Redaction — what gets masked
 
 ```jsonc
 {
   "Proxy": {
     "Redaction": {
-      "enabled": true,
-      "mask": "******",
+      "enabled": true,              // master switch for redaction
+      "mask": "••••••",             // fixed hidden text (never reveals the real length)
       "notifyInResponse": true,     // appends a visible notice to the model response (SSE/JSON)
-      "warnTemplate": "",           // optional template; {Count} and {Kinds} placeholders
+      "warnTemplate": "",           // optional notice template - placeholders: {Count}, {Kinds}, {Previews}
       "detect": {
-        "byFieldName": true,        // api_key, password, token, senha...
-        "byFormats": true,          // sk-, ghp_, AIza, JWT, Bearer, PEM...
-        "byKeyValueContext": true,  // "key": "value" / KEY=value in text
-        "byLongStrings": true       // long URL-safe tokens (>= 28 chars) with mixed case
+        "byFieldName": true,        // value of properties named api_key, password, token, senha...
+        "byFormats": true,          // known formats: sk-, ghp_, AIza, JWT, Bearer, PEM...
+        "byKeyValueContext": true,  // "key": "value" / KEY=value config excerpts pasted in prompts
+        "byLongStrings": true,      // long random-looking tokens (Shannon entropy, >= 28 chars)
+        "exemptBase64": true,       // image/binary payloads pass untouched (data URLs, base64 blobs)
+        "entropyThreshold": 3.0     // minimum bits/char for the long-string scanner
       },
-      "allow": [                    // optional: skip redaction when a detected token matches
-        "^ACME-[0-9]{3,5}-"          //   one of these regexes (e.g. project file names / IDs)
+      "allow": [                    // optional: a detected token matching one of these regexes is
+        "^ACME-[0-9]{3,5}-"          //   left unmasked (e.g. project file names / internal IDs)
       ]
     }
   }
 }
 ```
+
+**detect flags:**
+- `byFieldName` - masks the value of any property whose name matches a sensitive name
+  (`api_key`, `password`, `token`, `senha`, ...). A `*_tokens` family is excluded automatically
+  so usage counters like `max_tokens` are never touched.
+- `byFormats` - high-confidence formats: OpenAI/Anthropic `sk-...`, `ghp_`, `AIza`, Slack `xox*`,
+  AWS `AKIA/ASIA/...`, JWT, `Bearer <value>`, PEM private key blocks.
+- `byKeyValueContext` - `"key": "value"` / `KEY=value` config excerpts (only the value is masked).
+- `byLongStrings` - long URL-safe tokens (≥ 28 chars) that look random (entropy + mixed classes).
+  This is the layer that flags file names/IDs - see `allow`.
+- `exemptBase64` - image/binary payloads (OpenAI `image_url.url` data URLs, Anthropic
+  `source.data`, `b64_json`) are **not scanned as text**: scanning them would corrupt the base64
+  with the mask. Known formats and sensitive field values are **still always** masked.
+- `entropyThreshold` - minimum Shannon entropy (bits/char) for `byLongStrings`.
 
 **`allow` (optional):** a list of regex patterns. When a detected token matches one of them it
 is **not masked** (nor counted / notified) - use it to keep legitimate file names and internal
@@ -223,10 +318,97 @@ would flag them. Exemptions **never** apply to the high-confidence format scanne
 `AIza`, JWT, `Bearer`, PEM...) nor to values of sensitive JSON fields (`api_key`, `password`,
 `token`...): those are always redacted. Invalid regexes are ignored.
 
+### Inspection (fail-closed body handling)
+
+Decides what happens to each request body **before** anything is forwarded. Security fails
+closed: an uninspected request is never forwarded.
+
+```jsonc
+{
+  "Proxy": {
+    "Inspection": {
+      "enabled": true,
+      "defaultAction": "block",     // action for content types not listed in byContentType
+      "invalidJson": "block",       // what to do with a JSON body that does not parse
+      "byContentType": {
+        "application/json": "inspect",
+        "application/xml": "block",
+        "application/octet-stream": "block",
+        "multipart/form-data": "block",
+        "application/x-www-form-urlencoded": "block"
+      }
+    }
+  }
+}
+```
+
+- `"inspect"` = parse + redact (only JSON is supported in this iteration).
+- `"block"` = reject with **415** (`invalidJson: "block"` rejects with **400**).
+- `"warn"` = forward a body that failed inspection anyway (**escape hatch - do not use without
+  review**).
+- `defaultAction` applies to any content type that is not present in `byContentType`, including
+  requests with no content type at all (blocked by default).
+- Oversized bodies are rejected with **413** before any of this (see `Proxy:MaxBodySize`).
+
+### Rate limiting
+
+Per-client (by IP) request limiting and brute-force lockout.
+
+```jsonc
+{
+  "Proxy": {
+    "RateLimit": {
+      "enabled": true,
+      "maxRequestsPerWindow": 120,  // allowed requests...
+      "requestWindowSeconds": 60,   //   ...per this window (per client IP)
+      "maxFailuresPerWindow": 10,   // failed local-key attempts tolerated...
+      "failureWindowSeconds": 300,  //   ...in this window (5 min)
+      "lockoutSeconds": 300         // how long a client stays locked out (5 min)
+    }
+  }
+}
+```
+
+- Requests beyond `maxRequestsPerWindow` in the window → **429** with `Retry-After`.
+- After `maxFailuresPerWindow` failed auth attempts → the client is locked out for
+  `lockoutSeconds` (also 429 + `Retry-After`).
+
+### How to edit
+
+- **Development:** edit the files in `AiRouterProxy/` at the repo root (`appsettings.json`,
+  `redaction.json`, `routes.json`, ...) and run / publish the app.
+- **Installed service:** every config file lives in the **`config\` subfolder** next to the exe
+  (e.g. `C:\Services\AiRouterProxy\config\`). Edit the files there directly - the service reads
+  from `config\` when it exists and falls back to the exe folder otherwise.
+- **Keep valid JSON:** the examples here use `jsonc` (with comments) only for readability. The
+  real files must be **strict JSON** - no comments, no trailing commas.
+- **Back up before editing:** keep a copy of the current file (the deploy scripts already
+  preserve `config\appsettings.*.json`, `redaction.json`, `routes.json` and the certs on update).
+
+### Verify your changes
+
+`/admin` endpoints are protected by the local key (`Proxy:Keys:LocalKey`):
+
+```powershell
+curl.exe --ssl-no-revoke https://localhost:4000/admin/health -H "Authorization: Bearer <LocalKey>"
+# {"status":"ok","version":"2.0.4",...}
+
+curl.exe --ssl-no-revoke https://localhost:4000/admin/endpoints -H "Authorization: Bearer <LocalKey>"
+# routes + allowed paths + current redaction flags (including exemptBase64)
+
+curl.exe --ssl-no-revoke https://localhost:4000/admin/activity?hours=6 -H "Authorization: Bearer <LocalKey>"
+# recent requests; entries with "redacted" > 0 had content masked
+```
+
+When a request is censored the response carries `X-AIRouter-Redacted: <count>` and, if
+`notifyInResponse` is set, a visible notice - use both to confirm a redaction rule behaves as
+expected.
+
 ### Hot reload
 
 `appsettings.Server.json`, `routes.json` and `redaction.json` are watched with `reloadOnChange` -
-edits apply **without a restart**.
+edits apply **without a restart**. `Host`/`Port` and the TLS certificates are read at startup
+(the Kestrel listener binds once), so changing those still requires a restart.
 
 ## Local key
 
@@ -521,7 +703,7 @@ limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE pro
 
 ```powershell
 dotnet run --project tests/RedactorTests.csproj -c Release
-# -> RESULT: 226 PASS, 0 FAIL
+# -> RESULT: 236 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)
@@ -534,7 +716,7 @@ it (only a sha256 prefix):
 ```powershell
 dotnet run --project tests/Integration/Integration.csproj -c Release `
   -- --key-file C:\Users\jlkampos\secrets\airouterproxy-local.key
-# -> RESULT: 23 PASS, 0 FAIL
+# -> RESULT: 24 PASS, 0 FAIL
 ```
 
 Key file flag (`--key-file <path>` or `AIROUTERPROXY_LOCAL_KEY_FILE`) points at a file containing
