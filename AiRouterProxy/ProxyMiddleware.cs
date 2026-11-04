@@ -315,6 +315,7 @@ public sealed class ProxyMiddleware
                 detectByKeyValueContext: options.Redaction.Detect?.ByKeyValueContext ?? true,
                 detectByLongStrings: options.Redaction.Detect?.ByLongStrings ?? true,
                 detectEntropyThreshold: options.Redaction.Detect?.EntropyThreshold ?? 3.0,
+                exemptBase64: options.Redaction.Detect?.ExemptBase64 ?? true,
                 allow: options.Redaction.Allow);
             if (redacted.Changed)
             {

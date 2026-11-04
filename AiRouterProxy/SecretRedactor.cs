@@ -61,6 +61,7 @@ public static class SecretRedactor
         bool detectByKeyValueContext = true,
         bool detectByLongStrings = true,
         double detectEntropyThreshold = 3.0,
+        bool exemptBase64 = true,
         IReadOnlyList<string>? allow = null)
     {
         var result = new Result { Data = body, Changed = false };
@@ -95,7 +96,7 @@ public static class SecretRedactor
             {
                 WriteElement(writer, doc.RootElement, null, maskValue, result.Stats,
                     detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                    detectEntropyThreshold, allowRegexes);
+                    detectEntropyThreshold, exemptBase64, allowRegexes);
             }
 
             if (result.Stats.Total > 0)
@@ -361,6 +362,7 @@ public static class SecretRedactor
         bool detectByKeyValueContext,
         bool detectByLongStrings,
         double detectEntropyThreshold,
+        bool exemptBase64,
         IReadOnlyList<Regex>? allowRegexes)
     {
         switch (element.ValueKind)
@@ -372,7 +374,7 @@ public static class SecretRedactor
                     writer.WritePropertyName(property.Name);
                     WriteElement(writer, property.Value, property.Name, mask, stats,
                         detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                        detectEntropyThreshold, allowRegexes);
+                        detectEntropyThreshold, exemptBase64, allowRegexes);
                 }
                 writer.WriteEndObject();
                 break;
@@ -383,7 +385,7 @@ public static class SecretRedactor
                 {
                     WriteElement(writer, item, null, mask, stats,
                         detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                        detectEntropyThreshold, allowRegexes);
+                        detectEntropyThreshold, exemptBase64, allowRegexes);
                 }
                 writer.WriteEndArray();
                 break;
@@ -401,7 +403,8 @@ public static class SecretRedactor
                 else
                 {
                     writer.WriteStringValue(ApplyScans(text, mask, stats,
-                        detectByFormats, detectByKeyValueContext, detectByLongStrings, detectEntropyThreshold, allowRegexes));
+                        detectByFormats, detectByKeyValueContext, detectByLongStrings, detectEntropyThreshold,
+                        exemptBase64, allowRegexes));
                 }
                 break;
 
@@ -423,11 +426,18 @@ public static class SecretRedactor
         bool detectByKeyValueContext,
         bool detectByLongStrings,
         double detectEntropyThreshold,
+        bool exemptBase64,
         IReadOnlyList<Regex>? allowRegexes)
     {
         if (string.IsNullOrEmpty(text))
         {
             return text ?? string.Empty;
+        }
+
+        // Rule A: whole value is an image/binary payload - never scanned as text.
+        if (exemptBase64 && SecretDetector.IsBase64Payload(text))
+        {
+            return text;
         }
 
         var opts = new DetectOptions
@@ -436,6 +446,7 @@ public static class SecretRedactor
             ByKeyValueContext = detectByKeyValueContext,
             ByLongStrings = detectByLongStrings,
             EntropyThreshold = detectEntropyThreshold,
+            ExemptBase64 = exemptBase64,
         };
 
         return ApplyFindings(text, mask, stats, opts, allowRegexes);
@@ -463,7 +474,14 @@ public static class SecretRedactor
 
         foreach (var finding in findings)
         {
-            if (IsExemptedByAllow(finding, current, allowRegexes))
+            // Rule B: entropy/context findings inside a base64 payload region (image data
+            // URL or blob pasted inline) are binary bytes, not text - left untouched.
+            // "format" findings are never exempted here (pasted keys still masked).
+            var inBase64 = opts.ExemptBase64
+                && finding.Detector != SecretDetector.DetectorFormat
+                && SecretDetector.IsInsideBase64Payload(current, finding);
+
+            if (inBase64 || IsExemptedByAllow(finding, current, allowRegexes))
             {
                 cursor = finding.Start + finding.Length;
                 continue;

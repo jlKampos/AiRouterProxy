@@ -235,6 +235,27 @@ class Program
             Warn("skipping redaction-observability call (--skip-paid)");
         }
 
+        // ------------------------------------------------------------------
+        // 4.6. Image/data-URL payloads are forwarded untouched: the proxy must NOT
+        //      redact them (redaction would corrupt the base64 -> "only ASCII" failures).
+        //      Regression test: old builds set X-AIRouter-Redacted > 0 here, fixed ones 0.
+        // ------------------------------------------------------------------
+        if (!skipPaid)
+        {
+            var (imgStatus, imgBody, imgRedacted) = SendChatImageAsync(client, chatPath,
+                firstWorkingModel.Length > 0 ? firstWorkingModel : "gpt-4o-mini");
+            CheckTrue("image data URL not redacted by the proxy (base64 intact)", () =>
+                imgRedacted == 0 && imgStatus is not (415 or 413));
+            if (imgRedacted > 0 || (imgStatus is >= 400 and <= 599))
+            {
+                Info($"image probe: status={imgStatus} redacted={imgRedacted} body={TrimInfo(imgBody)}");
+            }
+        }
+        else
+        {
+            Warn("skipping image data-URL probe (--skip-paid)");
+        }
+
         var activity = await GetWithKeyAsync(client, "/admin/activity?hours=6&limit=100");
         Check("activity -> 200", () => activity.status == 200);
         CheckTrue("activity reports a redacted request", () =>
@@ -593,6 +614,51 @@ class Program
         using var resp = client.Send(req);
         var body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
         return ((int)resp.StatusCode, body);
+    }
+
+    static (int status, string body, int redacted) SendChatImageAsync(
+        HttpClient client, string path, string model)
+    {
+        // 1x1 red PNG as a data URL: tiny (any budget), exercises the base64/data-URL path.
+        const string dataUrl =
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        var payload = JsonSerializer.Serialize(new
+        {
+            model,
+            messages = new[]
+            {
+                new
+                {
+                    role = "user",
+                    content = new object[]
+                    {
+                        new { type = "image_url", image_url = new { url = dataUrl } },
+                        new { type = "text", text = "describe this image in one word" },
+                    },
+                },
+            },
+            max_tokens = 8,
+            stream = false,
+        });
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, path)
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/json"),
+        };
+        req.Headers.Authorization = new("Bearer", _key);
+
+        using var resp = client.Send(req);
+        var body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        var redacted = 0;
+        if (resp.Headers.TryGetValues("X-AIRouter-Redacted", out var vals))
+        {
+            foreach (var v in vals)
+            {
+                if (int.TryParse(v, out redacted)) break;
+            }
+        }
+
+        return ((int)resp.StatusCode, body, redacted);
     }
 
     static (int dataLines, bool done) SendChatSseAsync(HttpClient client, string path, string model)

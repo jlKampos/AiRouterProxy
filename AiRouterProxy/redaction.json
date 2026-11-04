@@ -10,6 +10,7 @@
         "byFormats": true,
         "byKeyValueContext": true,
         "byLongStrings": true,
+        "exemptBase64": true,
         "entropyThreshold": 3.0
       },
       "allow": [
