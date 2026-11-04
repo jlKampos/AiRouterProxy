@@ -1,16 +1,18 @@
 # deploy-update.ps1 - stops, copies from publish-tmp to deploy (preserving config/cert in the
 # deploy's config/ subfolder) and starts the service.
-# Usage (deploy in the project's 'deploy' folder): powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1
-# Usage (existing install elsewhere):             powershell -ExecutionPolicy Bypass -File .\deploy-update.ps1 -DeployDir "C:\Path\To\deploy"
+# Usage (deploy in the project's 'deploy' folder): powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1
+# Usage (existing install elsewhere):             powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir "C:\Path\To\deploy"
 param(
-    [string]$DeployDir = (Join-Path $PSScriptRoot 'deploy')
+    [string]$DeployDir = (Join-Path (Split-Path $PSScriptRoot -Parent) 'deploy')
 )
+# This script ships in scripts/, so the repo root is one level up from $PSScriptRoot.
+$repoRoot = Split-Path $PSScriptRoot -Parent
 $ErrorActionPreference = 'Continue'
-$log = Join-Path $PSScriptRoot 'deploy-update.log'
+$log = Join-Path $repoRoot 'deploy-update.log'
 function W($m){ $m | Add-Content $log }
 Set-Content $log '=== deploy-update start ==='
-# publish-tmp lives in the project (source); deploy is relative to the project by default (override with -DeployDir)
-$src = Join-Path $PSScriptRoot 'publish-tmp'
+# publish-tmp lives in the repo root (publish output); deploy is relative to the repo root by default (override with -DeployDir)
+$src = Join-Path $repoRoot 'publish-tmp'
 $dst = $DeployDir
 $cfg = Join-Path $dst 'config'
 $svc = Get-Service AIRouterProxy -EA SilentlyContinue

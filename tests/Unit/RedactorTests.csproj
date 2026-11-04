@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>RedactorTests</RootNamespace>
+    <AssemblyName>RedactorTests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Tests the proxy's real sources (in isolation, without compiling the whole app). -->
+    <Compile Include="..\..\src\AiRouterProxy\Detection\SecretRedactor.cs" Link="SecretRedactor.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\NoticeInjector.cs" Link="NoticeInjector.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Routing\RouteResolver.cs" Link="RouteResolver.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Routing\ProxyOptions.cs" Link="ProxyOptions.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Policies\InspectionPolicy.cs" Link="InspectionPolicy.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Detection\SecretDetector.cs" Link="SecretDetector.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Routing\ConfigPaths.cs" Link="ConfigPaths.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Detection\SecurityHelpers.cs" Link="SecurityHelpers.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Policies\AuthenticationPolicy.cs" Link="AuthenticationPolicy.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Policies\RateLimiter.cs" Link="RateLimiter.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseEvent.cs" Link="SseEvent.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseParser.cs" Link="SseParser.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\SseEventKind.cs" Link="SseProtocol\SseEventKind.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\ISseProtocolAdapter.cs" Link="SseProtocol\ISseProtocolAdapter.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\SseProtocolJson.cs" Link="SseProtocol\SseProtocolJson.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\SseProtocolAdapterBase.cs" Link="SseProtocol\SseProtocolAdapterBase.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\SseProtocolRegistry.cs" Link="SseProtocol\SseProtocolRegistry.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\OpenAiChatAdapter.cs" Link="SseProtocol\OpenAiChatAdapter.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\OpenAiResponsesAdapter.cs" Link="SseProtocol\OpenAiResponsesAdapter.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\AnthropicAdapter.cs" Link="SseProtocol\AnthropicAdapter.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\GenericSseAdapter.cs" Link="SseProtocol\GenericSseAdapter.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseStreamProcessor.cs" Link="SseStreamProcessor.cs" />
+  </ItemGroup>
+
+</Project>
