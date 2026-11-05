@@ -256,6 +256,7 @@ The only place where keys live. Created on the target machine (never committed):
 - `Proxy:Keys:UpstreamKey` - key for the **default route** (`prefix: ""`).
 - `Proxy:Keys:LocalKey` - key the proxy accepts from local clients (protects both the proxy and `/admin`). Generate one with `scripts\genApiKey.ps1`.
 - `Proxy:Keys:LocalKeys` - optional list of **additional** local keys (e.g. one per engineer). A request is accepted if it matches the primary `LocalKey` **or** any entry here. Add/remove one entry to rotate or revoke a single key without touching the others - hot-reloaded, no restart, no re-deploy. Values live only in `appsettings.Server.json` / environment (never in non-secret files).
+- Local keys must be **real generated values** - `sk-` + unpadded base64url (46 chars each), as produced by `scripts\genApiKey.ps1`. Never leave the `"sk-..."` placeholders or empty entries in the deployed `appsettings.Server.json` - an empty/placeholder key never authenticates.
 - `Proxy:RouteKeys` - dictionary of `keyRef` -> key. Each named route points to one entry.
 - Environment variables `AIROUTER_API_KEY` and `LOCAL_PROXY_KEY` are also honored if the config values are empty.
 
