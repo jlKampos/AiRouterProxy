@@ -61,26 +61,73 @@ public static class SecretDetector
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "openai", Confidence.High),
         new(new Regex(@"sk_[A-Za-z0-9]{20,}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "openai", Confidence.High),
-        // Stripe
-        new(new Regex(@"sk_(?:live|test)_[0-9A-Za-z]{10,}",
+        // Stripe (secret & restricted keys; live/test/prod)
+        new(new Regex(@"(?:sk|rk)_(?:live|test|prod)_[0-9A-Za-z]{10,}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "stripe", Confidence.High),
-        // GitHub
-        new(new Regex(@"gh[pousr]_[A-Za-z0-9]{10,}",
+        // GitHub (classic PATs are exactly 36 chars after the prefix)
+        new(new Regex(@"gh[pousr]_[A-Za-z0-9]{36}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "github", Confidence.High),
         new(new Regex(@"github_pat_[A-Za-z0-9_]{20,}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "github", Confidence.High),
-        // Google
+        // Google API keys + OAuth 2.0 access tokens (ya29.)
         new(new Regex(@"AIza[0-9A-Za-z_-]{20,}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "google", Confidence.High),
+        new(new Regex(@"\bya29\.[0-9A-Za-z_-]{20,}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "google_oauth", Confidence.High),
         // Slack
         new(new Regex(@"xox[baprs]-[0-9A-Za-z-]{10,}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "slack", Confidence.High),
-        // npm
-        new(new Regex(@"npm_[A-Za-z0-9]{20,}",
+        // npm (real tokens: 36 lowercase alphanumeric chars)
+        new(new Regex(@"\bnpm_[a-z0-9]{20,}\b",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "npm", Confidence.Medium),
-        // AWS access key id - all real prefixes (AKIA/ASIA/AIDA/AROA/AGPA + exactly 16 base32 chars)
-        new(new Regex(@"(?:AKIA|ASIA|AIDA|AROA|AGPA)[0-9A-Z]{16}",
+        // AWS access key id - real prefixes, base32 alphabet (no 0/1/8/9), exactly 16 body chars
+        new(new Regex(@"\b(?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16}\b",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "aws", Confidence.High),
+        // GitLab personal access token (glpat- + 20 chars)
+        new(new Regex(@"\bglpat-[\w-]{20}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "gitlab", Confidence.High),
+        // DigitalOcean personal access token (dop_v1_ + 64 hex)
+        new(new Regex(@"\bdop_v1_[a-f0-9]{64}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "digitalocean", Confidence.High),
+        // Hugging Face access token (hf_ + 34 chars)
+        new(new Regex(@"\bhf_[A-Za-z0-9]{34}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "huggingface", Confidence.High),
+        // Replicate API token (r8_ + 37 chars)
+        new(new Regex(@"\br8_[A-Za-z0-9]{37}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "replicate", Confidence.High),
+        // PyPI upload token (fixed base64 prefix + long body)
+        new(new Regex(@"\bpypi-AgEIcHlwaS5vcmc[\w-]{50,}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "pypi", Confidence.High),
+        // Docker Hub personal access token (dckr_pat_ + 27 chars)
+        new(new Regex(@"\bdckr_pat_[A-Za-z0-9_-]{27}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "dockerhub", Confidence.High),
+        // Twilio API key SID (SK + 32 hex)
+        new(new Regex(@"\bSK[0-9a-fA-F]{32}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "twilio", Confidence.High),
+        // SendGrid API key (SG. + ~66 chars body)
+        new(new Regex(@"\bSG\.[A-Za-z0-9_\-\.=]{66}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "sendgrid", Confidence.High),
+        // Mailgun API key (key- + 32 hex)
+        new(new Regex(@"\bkey-[a-f0-9]{32}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "mailgun", Confidence.Medium),
+        // Shopify admin/custom/private/shared tokens (32 hex)
+        new(new Regex(@"\bshp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "shopify", Confidence.High),
+        // Discord bot token (heuristic: base64 bot id + 2 segments)
+        new(new Regex(@"\b[MN][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27,}\b",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "discord", Confidence.Medium),
+        // Discord webhook URL (id + token path)
+        new(new Regex(@"https://(?:www\.|ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/[0-9]{17,20}/[A-Za-z0-9_-]{60,}",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "discord", Confidence.Medium),
+        // Azure Storage account key (88 base64 chars incl. trailing ==)
+        new(new Regex(@"AccountKey=[A-Za-z0-9+/]{86}==",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "azure", Confidence.High),
+        // Azure Storage connection string
+        new(new Regex(@"DefaultEndpointsProtocol=https?;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]{40,}",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "azure", Confidence.High),
+        // Database URL credentials (user:pass@) - group 1 = scheme kept, group 2 = masked
+        new(new Regex(@"(?i)\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://)([^/\s:@]+:[^@\s/]+@)",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant), "db_conn", Confidence.High, "1"),
         // JWT
         new(new Regex(@"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
             RegexOptions.Compiled | RegexOptions.CultureInvariant), "jwt", Confidence.High),
