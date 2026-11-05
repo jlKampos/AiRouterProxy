@@ -2,7 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.0.5 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.1.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ## Table of contents
 
@@ -62,7 +62,8 @@ corporate policies that require EU-resident / zero-data-retention gateways.
 ### What it masks
 
 - by **field name** (`api_key`, `password`, `token`, ...),
-- by **known format** (`sk-...`, `ghp_`, `AIza`, `JWT`, `Bearer`, PEM private keys, ...),
+- by **known format** (`sk-...`, `ghp_`, `AIza`, `ya29.`, `AKIA/ASIA`, `glpat-`, `dop_v1_`,
+  `hf_`, `pypi-`, Discord, Azure, Stripe, Twilio, SendGrid, JWT, `Bearer`, PEM private keys, ...),
 - by **`key=value` / `"key": "value"` context**,
 - and optionally by **long high-entropy tokens** (configurable).
 
@@ -329,7 +330,10 @@ Non-secret policy file. Besides the **redaction** rules it also holds the **insp
   (`api_key`, `password`, `token`, `senha`, ...). A `*_tokens` family is excluded automatically
   so usage counters like `max_tokens` are never touched.
 - `byFormats` - high-confidence formats: OpenAI/Anthropic `sk-...`, `ghp_`, `AIza`, Slack `xox*`,
-  AWS `AKIA/ASIA/...`, JWT, `Bearer <value>`, PEM private key blocks.
+  AWS `AKIA/ASIA/ABIA/ACCA/A3T` (base32), GitLab `glpat-`, DigitalOcean `dop_v1_`, Hugging Face
+  `hf_`, Replicate `r8_`, PyPI, Docker Hub `dckr_pat_`, Discord, Azure Storage, Twilio, SendGrid,
+  Mailgun, Shopify, Stripe (`live`/`test`/`prod`), JWT, `Bearer <value>`, `scheme://user:pass@`
+  URLs and PEM private key blocks.
 - `byKeyValueContext` - `"key": "value"` / `KEY=value` config excerpts (only the value is masked).
 - `byLongStrings` - long URL-safe tokens (≥ 28 chars) that look random (entropy + mixed classes).
   This is the layer that flags file names/IDs - see `allow`.

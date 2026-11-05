@@ -22,6 +22,7 @@ class Program
     static void Main()
     {
         TestFormats();
+        TestVendorFormats();
         TestFieldNames();
         TestNoChange();
         TestRobustness();
@@ -55,7 +56,7 @@ class Program
         CheckTrue("sk- in content", () => r1.Changed && !Str(r1.Data).Contains("sk-abc123") && r1.Stats.Total == 1 && r1.Stats.ByKind.GetValueOrDefault("openai") == 1);
 
         // set of inline key patterns
-        var body2 = Bytes("{\"content\":\"hi sk-ant-abcdefghijklmnop ghp_abcdefghijklmnop AIza1234567890abcdefghijklmn npm_abcdefghijklmnopqrst xoxb-1234567890-abcdef AKIAABCDEFGHIJKLMNOP abc\"}");
+        var body2 = Bytes("{\"content\":\"hi sk-ant-abcdefghijklmnop ghp_abcdefghijklmnopqrstuvwxyz0123456789 AIza1234567890abcdefghijklmn npm_abcdefghijklmnopqrst xoxb-1234567890-abcdef AKIAABCDEFGHIJKLMNOP abc\"}");
         var r2 = SecretRedactor.RedactJson(body2);
         var s2 = Str(r2.Data);
         CheckTrue("multiple inline keys", () => r2.Changed
@@ -84,7 +85,7 @@ class Program
         CheckTrue("PEM private key", () => r5.Changed && !Str(r5.Data).Contains("MIIEVQIB") && r5.Stats.ByKind.GetValueOrDefault("private_key") == 1);
 
         // Long GitHub key is consumed whole (no partial trace)
-        var r6 = SecretRedactor.RedactJson(Bytes("{\"c\":\"ghp_1234567890123456789012345678901234x\"}"));
+        var r6 = SecretRedactor.RedactJson(Bytes("{\"c\":\"ghp_123456789012345678901234567890123456\"}"));
         var s6 = Str(r6.Data);
         CheckTrue("github fully masked", () => r6.Changed
             && s6.Contains("\"c\":\"" + SecretRedactor.DefaultMask + "\"}")
@@ -94,6 +95,104 @@ class Program
         // Too-short sk- does not trigger (false positive prevention)
         var r7 = SecretRedactor.RedactJson(Bytes("{\"c\":\"just sk-abc is not a key\"}"));
         CheckTrue("short sk- ignored", () => !r7.Changed);
+    }
+
+    // --------------------------------------------------------------
+    // Vendor format patterns (2.1.0) - real formats, source: gitleaks master / vendor docs
+    // --------------------------------------------------------------
+    static void TestVendorFormats()
+    {
+        var opts = new DetectOptions();
+        var noEntropy = new DetectOptions { ByLongStrings = false };
+
+        // Deterministic builders with real alphabets/lengths.
+        string Hex(int n) => new(Enumerable.Range(0, n).Select(i => "0123456789abcdef"[i % 16]).ToArray());
+        string Base32(int n) => new(Enumerable.Range(0, n).Select(i => "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"[i % 32]).ToArray());
+        string Alnum(int n) => new(Enumerable.Range(0, n).Select(i =>
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"[i % 62]).ToArray());
+
+        // DigitalOcean Personal Access Token
+        CheckTrue("do dop_v1_", () => SecretDetector.Detect("tok dop_v1_" + Hex(64) + " end", opts) is { Count: 1 } d
+            && d[0].Category == "digitalocean");
+        // Google OAuth 2.0 access token
+        CheckTrue("google oauth ya29", () => SecretDetector.Detect("tok ya29." + Alnum(24) + " end", opts) is { Count: 1 } g
+            && g[0].Category == "google_oauth");
+        // Hugging Face access token
+        CheckTrue("hf token", () => SecretDetector.Detect("tok hf_" + Alnum(34) + " end", opts) is { Count: 1 } h
+            && h[0].Category == "huggingface");
+        // Replicate API token
+        CheckTrue("replicate r8_", () => SecretDetector.Detect("tok r8_" + Alnum(37) + " end", opts) is { Count: 1 } r
+            && r[0].Category == "replicate");
+        // GitLab personal access token
+        CheckTrue("gitlab glpat-", () => SecretDetector.Detect("tok glpat-" + Alnum(20) + " end", opts) is { Count: 1 } gl
+            && gl[0].Category == "gitlab");
+        // PyPI upload token (public prefix + >= 50 chars body)
+        CheckTrue("pypi token", () => SecretDetector.Detect("tok pypi-AgEIcHlwaS5vcmc" + Alnum(60) + " end", opts) is { Count: 1 } py
+            && py[0].Category == "pypi");
+        // Docker Hub PAT
+        CheckTrue("docker dckr_pat_", () => SecretDetector.Detect("tok dckr_pat_" + Alnum(27) + " end", opts) is { Count: 1 } dc
+            && dc[0].Category == "dockerhub");
+        // Twilio API key SID
+        CheckTrue("twilio SK", () => SecretDetector.Detect("tok SK" + Hex(32) + " end", opts) is { Count: 1 } tw
+            && tw[0].Category == "twilio");
+        // SendGrid API key
+        CheckTrue("sendgrid SG.", () => SecretDetector.Detect("tok SG." + Alnum(66) + " end", opts) is { Count: 1 } sg
+            && sg[0].Category == "sendgrid");
+        // Mailgun API key
+        CheckTrue("mailgun key-", () => SecretDetector.Detect("tok key-" + Hex(32) + " end", opts) is { Count: 1 } mg
+            && mg[0].Category == "mailgun");
+        // Shopify (admin/custom/private/shared)
+        CheckTrue("shopify shpat_", () => SecretDetector.Detect("tok shpat_" + Hex(32) + " end", opts) is { Count: 1 } sh
+            && sh[0].Category == "shopify");
+        CheckTrue("shopify shpss_", () => SecretDetector.Detect("tok shpss_" + Hex(32) + " end", opts) is { Count: 1 } sh2
+            && sh2[0].Category == "shopify");
+        // Discord bot token (heuristic)
+        CheckTrue("discord bot", () => SecretDetector.Detect("tok M" + Alnum(23) + "." + Alnum(6) + "." + Alnum(27) + " end", opts) is { Count: 1 } db
+            && db[0].Category == "discord");
+        // Discord webhook URL
+        CheckTrue("discord webhook", () => SecretDetector.Detect("use https://discord.com/api/webhooks/123456789012345678/" + Alnum(68), opts) is { Count: 1 } dw
+            && dw[0].Category == "discord");
+        // Azure Storage account key
+        CheckTrue("azure account key", () => SecretDetector.Detect("AccountKey=" + Alnum(86) + "==", opts) is { Count: 1 } az
+            && az[0].Category == "azure");
+        // Azure Storage connection string
+        CheckTrue("azure connstr", () => SecretDetector.Detect("DefaultEndpointsProtocol=https;AccountName=s;AccountKey=" + Alnum(88), opts) is { Count: 1 } az2
+            && az2[0].Category == "azure");
+        // Database URL credentials (only user:pass masked, scheme kept)
+        var db = SecretDetector.Detect("postgres://dbuser:DbPass123@db.example.com:5432/app", opts);
+        CheckTrue("db connstr", () => db.Count == 1 && db[0].Category == "db_conn");
+        // AWS base32 (new), incl. the A3T variant
+        CheckTrue("aws base32", () => SecretDetector.Detect("aws AKIA" + Base32(16) + " end", opts) is { Count: 1 } aw
+            && aw[0].Category == "aws" && aw[0].Length == 20);
+        CheckTrue("aws A3T", () => SecretDetector.Detect("tok A3TQ" + Base32(16) + " end", opts) is { Count: 1 } a3
+            && a3[0].Category == "aws");
+        // Stripe prod + restricted keys (new)
+        CheckTrue("stripe prod", () => SecretDetector.Detect("sk_prod_" + Alnum(30), opts) is { Count: 1 } sp
+            && sp[0].Category == "stripe");
+        CheckTrue("stripe rk", () => SecretDetector.Detect("rk_live_" + Alnum(30), opts) is { Count: 1 } sr
+            && sr[0].Category == "stripe");
+
+        // --- Negatives (no entropy layer: pure format behaviour) ---
+        CheckTrue("neg glpat short", () => SecretDetector.Detect("glpat-short", noEntropy).Count == 0);
+        CheckTrue("neg hf short", () => SecretDetector.Detect("hf_abc", noEntropy).Count == 0);
+        CheckTrue("neg pypi short body", () => SecretDetector.Detect("pypi-AgEIcHlwaS5vcmc" + Alnum(20), noEntropy).Count == 0);
+        CheckTrue("neg shpat short", () => SecretDetector.Detect("shpat_" + Hex(8), noEntropy).Count == 0);
+        CheckTrue("neg dop_v1 bad alphabet", () => SecretDetector.Detect("dop_v1_" + Alnum(64), noEntropy).Count == 0);
+        CheckTrue("neg sendgrid short", () => SecretDetector.Detect("SG." + Alnum(10), noEntropy).Count == 0);
+        CheckTrue("neg aws wrong alphabet", () => SecretDetector.Detect("AKIA" + "0123456789abcdefghij", noEntropy).Count == 0);
+
+        // --- End-to-end via the redactor: value masked, kind reported ---
+        var vendor = SecretRedactor.RedactJson(Bytes("{\"content\":\"deploy dop_v1_" + Hex(64) + " is set and glpat-" + Alnum(20) + " plus dckr_pat_" + Alnum(27) + "\"}"));
+        CheckTrue("vendor redaction e2e", () => vendor.Changed
+            && !Str(vendor.Data).Contains("dop_v1_") && !Str(vendor.Data).Contains("glpat-") && !Str(vendor.Data).Contains("dckr_pat_")
+            && vendor.Stats.ByKind.GetValueOrDefault("digitalocean") == 1
+            && vendor.Stats.ByKind.GetValueOrDefault("gitlab") == 1
+            && vendor.Stats.ByKind.GetValueOrDefault("dockerhub") == 1);
+
+        var azureMasked = SecretRedactor.RedactJson(Bytes("{\"c\":\"AccountKey=" + Alnum(86) + "==\"}"));
+        CheckTrue("azure e2e fully masked", () => azureMasked.Changed
+            && Str(azureMasked.Data).Contains("\"c\":\"" + SecretRedactor.DefaultMask + "\"}")
+            && azureMasked.Stats.ByKind.GetValueOrDefault("azure") == 1);
     }
 
     // --------------------------------------------------------------
@@ -628,7 +727,7 @@ class Program
         var slack = SecretDetector.Detect("xoxb-1234567890-123456789012-abcdefghijklmn", opts);
         CheckTrue("format slack", () => slack.Count == 1 && slack[0].Category == "slack");
 
-        var npm = SecretDetector.Detect("npm_AbC1234567890abcdefghijklmnopqrstuvwx", opts);
+        var npm = SecretDetector.Detect("npm_ab1c2d3e4f5g6h7i8j9k0l1m2n3o4p5q6r", opts);
         CheckTrue("format npm", () => npm.Count == 1 && npm[0].Category == "npm");
 
         var aws = SecretDetector.Detect("aws AKIAIOSFODNN7EXAMPLE end", opts);
@@ -686,13 +785,13 @@ class Program
                 && f1[0].Category == SecretDetector.KindKeyValue);
 
         // --- End-to-end via the redactor: nested + free text, value never leaks ---
-        var nested = SecretRedactor.RedactJson(Bytes("{\"deployment\":{\"environment\":{\"DATABASE_PASSWORD\":\"sup3rS3cr3tValue123\",\"CUSTOM_AUTH\":\"ghp_abcdefghijklmnopqrstuvwx90\"}}}"));
+        var nested = SecretRedactor.RedactJson(Bytes("{\"deployment\":{\"environment\":{\"DATABASE_PASSWORD\":\"sup3rS3cr3tValue123\",\"CUSTOM_AUTH\":\"ghp_abcdefghijklmnopqrstuvwxyz0123456789\"}}}"));
         CheckTrue("nested credentials redacted", () => nested.Changed
             && !Str(nested.Data).Contains("sup3rS3cr3tValue123")
-            && !Str(nested.Data).Contains("ghp_abcdefghijklmnopqrstuvwx90"));
+            && !Str(nested.Data).Contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
 
-        var freeText = SecretRedactor.RedactJson(Bytes("{\"content\":\"My GitHub token is ghp_abcdefghijklmnopqrstuvwxyz123456, never share it\"}"));
-        CheckTrue("free text github redacted", () => freeText.Changed && !Str(freeText.Data).Contains("ghp_abcdefghijklmnopqrstuvwxyz123456"));
+        var freeText = SecretRedactor.RedactJson(Bytes("{\"content\":\"My GitHub token is ghp_abcdefghijklmnopqrstuvwxyz0123456789, never share it\"}"));
+        CheckTrue("free text github redacted", () => freeText.Changed && !Str(freeText.Data).Contains("ghp_abcdefghijklmnopqrstuvwxyz0123456789"));
 
         var noticeSource = SecretRedactor.RedactJson(Bytes("{\"content\":\"key sk-abcdefghijklmnop123 x\"}"));
         var notice = SecretRedactor.FormatPreviews(noticeSource.Stats.Previews);
