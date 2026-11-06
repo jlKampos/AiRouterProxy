@@ -1140,7 +1140,7 @@ class Program
         {
             Name = "airouter",
             Prefix = "",
-            Upstream = "https://api.airrouter.ch",
+            Upstream = "https://api.airouter.ch",
             KeyRef = "AIROUTER",
             AllowedPaths = { "/v1/models", "/v1/chat/completions", "/v1/embeddings" },
         };
@@ -1238,7 +1238,7 @@ class Program
         {
             Name = "airouter",
             Prefix = "",
-            Upstream = "https://api.airrouter.ch",
+            Upstream = "https://api.airouter.ch",
             KeyRef = "AIROUTER",
             AllowedPaths = { "/v1/models", "/v1/chat/completions", "/v1/embeddings" },
             RequestTimeoutMs = 300000,

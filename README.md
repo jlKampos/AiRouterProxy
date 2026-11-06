@@ -203,7 +203,7 @@ Non-secret **defaults** (host, port, limits). Lives in the repo and is copied to
   "Proxy": {
     "Host": "0.0.0.0",                       // interface to listen on (0.0.0.0 = all interfaces)
     "Port": 4000,                            // HTTPS port (Kestrel) - changing it requires a restart
-    "Upstream": "https://api.airrouter.ch",  // upstream used when no route matches ("" prefix)
+    "Upstream": "https://api.airouter.ch",  // upstream used when no route matches ("" prefix)
     "RequestTimeoutMs": 300000,              // per-request upstream timeout (5 min) - timeouts surface as 502
     "MaxBodySize": 20971520,                 // max request body in bytes (20 MB) - larger -> 413
     "Verbose": true                          // detailed logging (request ids, redaction warnings)
@@ -215,7 +215,7 @@ Non-secret **defaults** (host, port, limits). Lives in the repo and is copied to
 |---|---|---|
 | `Host` | `0.0.0.0` | Listen interface. `127.0.0.1` = this machine only. Restart to apply. |
 | `Port` | `4000` | HTTPS port. Restart to apply. |
-| `Upstream` | `https://api.airrouter.ch` | Fallback upstream when no route matches. |
+| `Upstream` | `https://api.airouter.ch` | Fallback upstream when no route matches. |
 | `RequestTimeoutMs` | `300000` | Upstream timeout (ms); a timed-out forward returns 502. |
 | `MaxBodySize` | `20971520` | Requests larger than this are rejected with 413 before forwarding. |
 | `Verbose` | `true` | Extra detail in the logs (request ids, redaction notices). |
@@ -272,7 +272,7 @@ and the route key is selected by `keyRef`:
       {
         "name": "airouter",
         "prefix": "",                                 // "" = default route (accepts any path)
-        "upstream": "https://api.airrouter.ch",
+        "upstream": "https://api.airouter.ch",
         "keyRef": "",                                 // empty -> uses Proxy:Keys:UpstreamKey
         "allowedPaths": ["/v1/*"],
         "requestTimeoutMs": 300000
@@ -291,7 +291,7 @@ and the route key is selected by `keyRef`:
 ```
 
 Mapping example:
-- `https://localhost:4000/v1/chat/completions` -> `https://api.airrouter.ch/v1/chat/completions` (default route)
+- `https://localhost:4000/v1/chat/completions` -> `https://api.airouter.ch/v1/chat/completions` (default route)
 - `https://localhost:4000/openrouter/v1/chat/completions` -> `https://openrouter.ai/api/v1/chat/completions` (prefix removed before forwarding)
 
 Rules:

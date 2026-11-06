@@ -4,7 +4,7 @@
       {
         "name": "airouter",
         "prefix": "",
-        "upstream": "https://api.airrouter.ch",
+        "upstream": "https://api.airouter.ch",
         "keyRef": "",
         "allowedPaths": [
           "/v1/models",
