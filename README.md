@@ -106,7 +106,7 @@ non-sensitive content passing through untouched:
 - **Multiple accepted local keys** (`Proxy:Keys:LocalKeys`) for auth rotation
 - **SSE protocol adapters** (`src/AiRouterProxy/Sse/SseProtocol/`) for streamed forwards (OpenAI chat/responses,
   Anthropic, generic)
-- Admin endpoints protected by a local key (`/admin/*`)
+- Admin endpoints protected by the primary local key only (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
 - Versioned via assembly info (SemVer, e.g. 2.0.4); reported by /admin/health
 
@@ -148,12 +148,12 @@ AiRouterProxy/
 |       `-- Properties/launchSettings.json
 |-- tests/
 |   |-- Unit/                      # offline unit harness (compiles the app sources directly)
-|   |   |-- Program.cs             #   no framework - 236 PASS
+|   |   |-- Program.cs             #   no framework - 272 PASS
 |   |   `-- RedactorTests.csproj
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- scripts/
 |   |-- deploy-update.ps1          # deploy to the installed service (preserves secrets/certs on the destination)
-|   `-- genApiKey.ps1              # generates/rotates the local key
+|   `-- genApiKey.ps1              # generates/prints/rotates local keys (-Print / -Write)
 |-- images/                        # README screenshots
 |-- README.md, LICENSE, .gitignore, AIRouterProxy.slnx
 ```
@@ -254,8 +254,8 @@ The only place where keys live. Created on the target machine (never committed):
 ```
 
 - `Proxy:Keys:UpstreamKey` - key for the **default route** (`prefix: ""`).
-- `Proxy:Keys:LocalKey` - key the proxy accepts from local clients (protects both the proxy and `/admin`). Generate one with `scripts\genApiKey.ps1`.
-- `Proxy:Keys:LocalKeys` - optional list of **additional** local keys (e.g. one per engineer). A request is accepted if it matches the primary `LocalKey` **or** any entry here. Add/remove one entry to rotate or revoke a single key without touching the others - hot-reloaded, no restart, no re-deploy. Values live only in `appsettings.Server.json` / environment (never in non-secret files).
+- `Proxy:Keys:LocalKey` - the **primary local key**: full access. It authenticates the proxied API (`/v1/*`) and is the **only** key accepted on `/admin/*`. Generate one with `scripts\genApiKey.ps1`.
+- `Proxy:Keys:LocalKeys` - optional list of **additional** local keys, one per engineer/agent. They authenticate the proxied API (`/v1/*`) but are **never accepted on `/admin/*`** (`401`): API access without admin. A request is accepted if it matches the primary `LocalKey` **or** any entry here. Add/remove one entry to rotate or revoke a single key without touching the others - hot-reloaded, no restart, no re-deploy. Values live only in `appsettings.Server.json` / environment (never in non-secret files).
 - Local keys must be **real generated values** - `sk-` + unpadded base64url (46 chars each), as produced by `scripts\genApiKey.ps1`. Never leave the `"sk-..."` placeholders or empty entries in the deployed `appsettings.Server.json` - an empty/placeholder key never authenticates.
 - `Proxy:RouteKeys` - dictionary of `keyRef` -> key. Each named route points to one entry.
 - Environment variables `AIROUTER_API_KEY` and `LOCAL_PROXY_KEY` are also honored if the config values are empty.
@@ -437,6 +437,24 @@ curl.exe --ssl-no-revoke https://localhost:4000/admin/activity?hours=6 -H "Autho
 # recent requests; entries with "redacted" > 0 had content masked
 ```
 
+### Who can access `/admin` (swagger)
+
+Only local keys authenticate clients; `/admin` is stricter and accepts **only the primary
+local key** (`Proxy:Keys:LocalKey`) - never the extra ones:
+
+| Key | Where it lives | `/v1/*` (API) | `/admin/*` (swagger ops) |
+|---|---|---|---|
+| `LocalKey` (primary) | `Proxy:Keys:LocalKey` | ✅ | ✅ the only one with admin |
+| Extra local keys (per engineer/agent) | `Proxy:Keys:LocalKeys` | ✅ | ❌ `401` |
+| Route / upstream keys | `Proxy:RouteKeys` (`keyRef`) | ❌ never accepted from clients | ❌ |
+
+- Engineer/agent keys in `LocalKeys` use the proxied API (`/v1/*`) but get `401` on all
+  `/admin/*` - by design, there are no per-key admin grants.
+- `Proxy:RouteKeys` are upstream credentials the proxy uses server-side; they are never
+  accepted as a client `Bearer` and grant nothing client-facing.
+- The `/swagger` UI page itself is served without auth (read-only documentation); calling any
+  documented operation requires the primary local key.
+
 When a request is censored the response carries `X-AIRouter-Redacted: <count>` and, if
 `notifyInResponse` is set, a visible notice - use both to confirm a redaction rule behaves as
 expected.
@@ -447,16 +465,30 @@ expected.
 edits apply **without a restart**. `Host`/`Port` and the TLS certificates are read at startup
 (the Kestrel listener binds once), so changing those still requires a restart.
 
-## Local key
+## Local key / `genApiKey.ps1`
+
+`scripts\genApiKey.ps1` generates keys in OpenAI format (`sk-` + unpadded base64url, 46 chars, from a CSPRNG).
+
+| Mode | Effect |
+|---|---|
+| *(no flags)* | Prints usage help and exits. |
+| `-Print` | Generates a key and **prints it to the console** (nothing else). Use it to create a per-engineer key: add the printed value to `Proxy:Keys:LocalKeys` on the server. That key gets `/v1/*` but **not** `/admin/*`. |
+| `-Write` | Generates a key and **writes it as the primary `LocalKey`** into the deployed `appsettings.Server.json` (backup `.bak`, `LOCAL_KEY.txt`, immediate `/v1` test). |
+| `-DeployDir <path>` | Target install (used with `-Write`). Default: `<repo>\deploy`. |
 
 ```powershell
-# generates a new key in sk- format (OpenAI style) and writes it to deploy/appsettings.Server.json
-powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1
-# existing install elsewhere:
-powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1 -DeployDir "C:\Path\To\deploy"
+# per-engineer key: prints the key to the console - add it to Proxy:Keys:LocalKeys on the server
+powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1 -Print
+
+# rotate the primary local key (writes appsettings.Server.json + LOCAL_KEY.txt)
+powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1 -Write
+
+# rotate on an existing install elsewhere
+powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1 -Write -DeployDir "C:\Path\To\deploy"
 ```
 
-The script prints the key hash and stores the key in `LOCAL_KEY.txt` for the client to copy.
+With `-Write`, the script prints the key hash (never the key itself) and stores the key in
+`LOCAL_KEY.txt` for the client to copy.
 
 ## Certificates
 

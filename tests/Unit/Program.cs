@@ -1033,6 +1033,16 @@ class Program
             && AuthenticationPolicy.IsValidLocalKey("ghi", multi));
         CheckTrue("multi invalid", () => !AuthenticationPolicy.IsValidLocalKey("xyz", multi));
 
+        // Admin access: the PRIMARY local key only (extra LocalKeys / route keys never reach /admin).
+        CheckTrue("admin primary", () => AuthenticationPolicy.IsValidAdminKey("abc", single));
+        CheckTrue("admin primary multi", () => AuthenticationPolicy.IsValidAdminKey("abc", multi));
+        CheckTrue("admin extra rejected", () => !AuthenticationPolicy.IsValidAdminKey("def", multi)
+            && !AuthenticationPolicy.IsValidAdminKey("ghi", multi));
+        CheckTrue("admin invalid rejected", () => !AuthenticationPolicy.IsValidAdminKey("xyz", multi));
+        CheckTrue("admin null/empty", () => !AuthenticationPolicy.IsValidAdminKey(null, multi)
+            && !AuthenticationPolicy.IsValidAdminKey(string.Empty, multi));
+        CheckTrue("admin null keys", () => !AuthenticationPolicy.IsValidAdminKey("abc", null));
+
         CheckTrue("key count single", () => AuthenticationPolicy.LocalKeyCount(single) == 1);
         CheckTrue("key count multi", () => AuthenticationPolicy.LocalKeyCount(multi) == 3);
         CheckTrue("key count null", () => AuthenticationPolicy.LocalKeyCount(null) == 0);
