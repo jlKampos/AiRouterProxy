@@ -223,6 +223,21 @@ public static class SecretRedactor
             case "pw":
             case "access_token":
             case "refresh_token":
+            case "auth_token":
+            case "authtoken":
+            case "auth-token":
+            case "session_token":
+            case "sessiontoken":
+            case "session-token":
+            case "id_token":
+            case "idtoken":
+            case "id-token":
+            case "jwtkey":
+            case "jwt_key":
+            case "jwt-key":
+            case "signingkey":
+            case "signing_key":
+            case "signing-key":
             case "authorization":
             case "auth":
             case "auth_header":
@@ -273,6 +288,8 @@ public static class SecretRedactor
             || lower.Contains("refresh_token")
             || lower.Contains("client_secret")
             || lower.Contains("bearer_token")
+            || lower.Contains("jwt")
+            || lower.Contains("signing")
             || lower.Contains("auth_token")
             || lower.Contains("session_token")
             || lower.Contains("id_token")
@@ -353,6 +370,10 @@ public static class SecretRedactor
             return "authorization";
         }
 
+        if (lower.Contains("jwt") || lower.Contains("signing"))
+        {
+            return "secret";
+        }
         if (lower.Contains("token") || lower.EndsWith("token", StringComparison.Ordinal))
         {
             return "token";

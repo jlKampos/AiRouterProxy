@@ -24,6 +24,7 @@ class Program
         TestFormats();
         TestVendorFormats();
         TestFieldNames();
+        TestConventionNames();
         TestNoChange();
         TestRobustness();
         TestSummarize();
@@ -239,6 +240,25 @@ class Program
     }
 
     // --------------------------------------------------------------
+    static void TestConventionNames()
+    {
+        // Context/text layer is convention-agnostic: snake, camel, Pascal, kebab, plain.
+        CheckTrue("auth_token in text", () => SecretRedactor.RedactJson(Bytes("{\"c\":\"auth_token=Value12345 x\"}")).Changed);
+        CheckTrue("AuthToken (camel) in text", () => SecretRedactor.RedactJson(Bytes("{\"c\":\"AuthToken=Value12345 x\"}")).Changed);
+        CheckTrue("session-token in text", () => SecretRedactor.RedactJson(Bytes("{\"c\":\"session-token=Value12345 x\"}")).Changed);
+        CheckTrue("id_token in text", () => SecretRedactor.RedactJson(Bytes("{\"c\":\"id_token=Value12345 x\"}")).Changed);
+        CheckTrue("JwtKey (camel) in text", () => SecretRedactor.RedactJson(Bytes("{\"c\":\"JwtKey=Value12345 x\"}")).Changed);
+        CheckTrue("SigningKey (camel) in text", () => SecretRedactor.RedactJson(Bytes("{\"c\":\"SigningKey=Value12345 x\"}")).Changed);
+        CheckTrue("signing_key in text", () => SecretRedactor.RedactJson(Bytes("{\"c\":\"signing_key=Value12345 x\"}")).Changed);
+        CheckTrue("bare Token= in text", () => SecretRedactor.RedactJson(Bytes("{\"c\":\"Token=Value12345 x\"}")).Changed);
+        CheckTrue("no separator stays", () => !SecretRedactor.RedactJson(Bytes("{\"c\":\"the token Value12345 is natural text\"}")).Changed);
+        CheckTrue("csrf_token short stays", () => !SecretRedactor.RedactJson(Bytes("{\"c\":\"csrf_token=abc x\"}")).Changed);
+        CheckTrue("max_tokens stays", () => !SecretRedactor.RedactJson(Bytes("{\"c\":\"max_tokens=8\"}")).Changed);
+        CheckTrue("field JwtKey", () => SecretRedactor.RedactJson(Bytes("{\"JwtKey\":\"abc12345\"}")).Changed);
+        CheckTrue("field SigningKey", () => SecretRedactor.RedactJson(Bytes("{\"SigningKey\":\"abc12345\"}")).Changed);
+        CheckTrue("field AuthToken", () => SecretRedactor.RedactJson(Bytes("{\"AuthToken\":\"abc12345\"}")).Changed);
+        CheckTrue("field signing_key", () => SecretRedactor.RedactJson(Bytes("{\"signing_key\":\"abc12345\"}")).Changed);
+    }
     static void TestNoChange()
     {
         // No sensitive content -> original bytes intact (zero-cost guarantee)
