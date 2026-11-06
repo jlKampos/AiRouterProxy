@@ -156,7 +156,7 @@ public static class SecretDetector
     /// </summary>
     private static readonly Regex KeyValueContextRegex = new(
         @"(?i)(?<![A-Za-z0-9_])"
-        + @"(?<name>aws[_-]?secret[_-]?(?:access[_-]?)?key|aws[_-]?access[_-]?key[_-]?(?:id)?|secret[_-]?access[_-]?key|access[_-]?key[_-]?id|access[_-]?key|api[_-]?key|api[_-]?secret|loc[a]?l[_-]?key|secret[_-]?key|secret|private[_-]?key|master[_-]?key|encryption[_-]?key|client[_-]?secret|password|passwd|senha|credential|authorization|access[_-]?token|refresh[_-]?token|bearer[_-]?token)"
+        + @"(?<name>aws[_-]?secret[_-]?(?:access[_-]?)?key|aws[_-]?access[_-]?key[_-]?(?:id)?|secret[_-]?access[_-]?key|access[_-]?key[_-]?id|access[_-]?key|api[_-]?key|api[_-]?secret|loc[a]?l[_-]?key|secret[_-]?key|secret|private[_-]?key|master[_-]?key|encryption[_-]?key|client[_-]?secret|password|passwd|senha|credential|authorization|access[_-]?token|refresh[_-]?token|bearer[_-]?token|auth[_-]?token|session[_-]?token|id[_-]?token|jwt[_-]?key|signing[_-]?key|token)"
         + @"(?<sep>[\""']?\s*[:=]\s*[\""']?)"
         + @"(?<value>[A-Za-z0-9_~+/=!@#$%^&*().\-]{8,})",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);

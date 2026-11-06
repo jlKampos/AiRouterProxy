@@ -2,7 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.1.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.3.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ## Table of contents
 
@@ -61,7 +61,8 @@ corporate policies that require EU-resident / zero-data-retention gateways.
 
 ### What it masks
 
-- by **field name** (`api_key`, `password`, `token`, ...),
+- by **field name** (`api_key`, `password`, `token`, ...), including the token/signing-key
+  families (`auth/session/id` token, `jwt`/`signing` key) in any casing/separator convention,
 - by **known format** (`sk-...`, `ghp_`, `AIza`, `ya29.`, `AKIA/ASIA`, `glpat-`, `dop_v1_`,
   `hf_`, `pypi-`, Discord, Azure, Stripe, Twilio, SendGrid, JWT, `Bearer`, PEM private keys, ...),
 - by **`key=value` / `"key": "value"` context**,
@@ -148,7 +149,7 @@ AiRouterProxy/
 |       `-- Properties/launchSettings.json
 |-- tests/
 |   |-- Unit/                      # offline unit harness (compiles the app sources directly)
-|   |   |-- Program.cs             #   no framework - 272 PASS
+|   |   |-- Program.cs             #   no framework - 287 PASS
 |   |   `-- RedactorTests.csproj
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- scripts/
@@ -305,6 +306,12 @@ Rules:
 Non-secret policy file. Besides the **redaction** rules it also holds the **inspection**
 (fail-closed body handling) and **rate limiting** sections - all under the same `Proxy` block.
 
+**Precedence:** config files are loaded in order — `appsettings.json`, `appsettings.{Env}.json`,
+`appsettings.Server.json`, then `redaction.json` and `routes.json`. Later files override earlier
+ones **per key** (not per block): if the same key exists in both `appsettings.json` and
+`redaction.json`, `redaction.json` wins; keys present only in `appsettings.json` keep their value.
+Both are watched (hot reload), so edits apply without a restart.
+
 #### Redaction — what gets masked
 
 ```jsonc
@@ -333,14 +340,19 @@ Non-secret policy file. Besides the **redaction** rules it also holds the **insp
 
 **detect flags:**
 - `byFieldName` - masks the value of any property whose name matches a sensitive name
-  (`api_key`, `password`, `token`, `senha`, ...). A `*_tokens` family is excluded automatically
-  so usage counters like `max_tokens` are never touched.
+  (`api_key`, `password`, `token`, `senha`, ...). Name matching is **convention-agnostic**:
+  `ApiKey`/`API_KEY`/`api-key`/`apikey` are all caught, as are the auth/session/id-token and
+  JWT/signing-key families (`AuthToken`, `JwtKey`, `signing_key`, `SigningKeyPem`, ...). A
+  `*_tokens` family is excluded automatically so usage counters like `max_tokens` are never touched.
 - `byFormats` - high-confidence formats: OpenAI/Anthropic `sk-...`, `ghp_`, `AIza`, Slack `xox*`,
   AWS `AKIA/ASIA/ABIA/ACCA/A3T` (base32), GitLab `glpat-`, DigitalOcean `dop_v1_`, Hugging Face
   `hf_`, Replicate `r8_`, PyPI, Docker Hub `dckr_pat_`, Discord, Azure Storage, Twilio, SendGrid,
   Mailgun, Shopify, Stripe (`live`/`test`/`prod`), JWT, `Bearer <value>`, `scheme://user:pass@`
   URLs and PEM private key blocks.
 - `byKeyValueContext` - `"key": "value"` / `KEY=value` config excerpts (only the value is masked).
+  Detection is **convention-agnostic** (`AuthToken`, `session-token`, `id_token`, `JwtKey`,
+  `signing_key`, bare `token` ...) so pasted configs are covered whatever naming style the
+  app uses.
 - `byLongStrings` - long URL-safe tokens (≥ 28 chars) that look random (entropy + mixed classes).
   This is the layer that flags file names/IDs - see `allow`.
 - `exemptBase64` - image/binary payloads (OpenAI `image_url.url` data URLs, Anthropic
@@ -772,7 +784,7 @@ limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE pro
 
 ```powershell
 dotnet run --project tests/Unit/RedactorTests.csproj -c Release
-# -> RESULT: 236 PASS, 0 FAIL
+# -> RESULT: 287 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)
