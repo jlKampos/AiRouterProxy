@@ -42,7 +42,7 @@ builder.Services.AddSwaggerGen(options =>
         Title = "AIRouterProxy",
         Version = serviceVersion,
         Description = "Local HTTPS proxy for AI model providers - enforces that secrets never leave " +
-                      "the machine, with multi-upstream routing. /admin endpoints require the local key (Bearer).",
+                      "the machine, with multi-upstream routing. /admin endpoints require the primary local key (Bearer).",
     });
 
     options.AddSecurityDefinition("LocalKey", new OpenApiSecurityScheme

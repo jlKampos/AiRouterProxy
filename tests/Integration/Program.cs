@@ -10,8 +10,11 @@ using System.Text.Json;
 //   dotnet run --project tests/Integration -- --key-file <path> [other flags]
 //
 // Flags:
-//   --key-file <path>   File containing the local proxy key (plain text, one line).
+//   --key-file <path>   File containing the PRIMARY local proxy key (plain text, one line).
 //                       The harness reads it at runtime; it is never printed.
+//   --extra-key-file <path>  Optional file with an engineer/extra local key (LocalKeys
+//                       entry). Enables the admin-split checks: the extra key must get
+//                       /v1/* but be rejected (401) on /admin/*.
 //   --base <url>        Proxy base URL (default: https://127.0.0.1:4000).
 //   --skip-paid         Skip the calls that can consume tokens (real forward / SSE).
 //   --brute-force       Run the 10-failure lockout test LAST (waits ~65s for the
@@ -25,6 +28,7 @@ class Program
     static int _passed;
     static int _failed;
     static string _key = string.Empty;
+    static string _extraKey = string.Empty;
 
     static void Check(string name, Func<bool> fn)
     {
@@ -40,6 +44,7 @@ class Program
     {
         var keyFile = GetArg(args, "--key-file")
                       ?? Environment.GetEnvironmentVariable("AIROUTERPROXY_LOCAL_KEY_FILE");
+        var extraKeyFile = GetArg(args, "--extra-key-file");
         var baseUrl = GetArg(args, "--base") ?? "https://127.0.0.1:4000";
         var skipPaid = HasFlag(args, "--skip-paid");
         var bruteForce = HasFlag(args, "--brute-force");
@@ -65,8 +70,29 @@ class Program
             return 2;
         }
 
+        if (extraKeyFile is not null)
+        {
+            if (!File.Exists(extraKeyFile))
+            {
+                Console.Error.WriteLine($"Extra key file not found: {extraKeyFile}");
+                return 2;
+            }
+
+            _extraKey = (await File.ReadAllTextAsync(extraKeyFile)).Trim();
+            if (_extraKey.Length == 0)
+            {
+                Console.Error.WriteLine("Extra key file is empty.");
+                return 2;
+            }
+        }
+
         Console.WriteLine($"key file: {keyFile}");
         Console.WriteLine($"key sha256: {ShaPrefix(_key)} (first 8 hex chars - never the key itself)");
+        if (extraKeyFile is not null)
+        {
+            Console.WriteLine($"extra key file: {extraKeyFile}");
+            Console.WriteLine($"extra key sha256: {ShaPrefix(_extraKey)} (first 8 hex chars - never the key itself)");
+        }
         Console.WriteLine($"base url : {baseUrl}");
         Console.WriteLine($"skip paid: {skipPaid}   brute-force: {bruteForce}   perf: {perf}");
         Console.WriteLine();
@@ -113,6 +139,26 @@ class Program
         Check("health with wrong key -> 401", () => wrongAuth.status == 401);
 
         Check("health with key -> 200 again", () => health.status == 200);
+
+        // ------------------------------------------------------------------
+        // 1b. Admin/local-key split: only the PRIMARY local key manages /admin.
+        //     An engineer key (LocalKeys) keeps /v1/* but gets 401 on /admin/*.
+        //     Runs only when --extra-key-file is provided.
+        // ------------------------------------------------------------------
+        if (_extraKey.Length > 0)
+        {
+            var extraAdmin = await GetWithKeyAsync(client, "/admin/health", _extraKey);
+            Check("extra (engineer) key on /admin/health -> 401 (admin = primary only)", () => extraAdmin.status == 401);
+
+            var extraV1 = await GetWithKeyAsync(client, "/v1/models", _extraKey);
+            Check("extra (engineer) key on /v1/models -> 200 (proxied API works)", () => extraV1.status == 200);
+
+            var primaryV1 = await GetWithKeyAsync(client, "/v1/models");
+            Check("primary key on /v1/models -> 200", () => primaryV1.status == 200);
+
+            var swaggerNoAuth = await GetNoKeyAsync(client, "/swagger/index.html");
+            Check("swagger docs page without auth -> 200 (read-only)", () => swaggerNoAuth.status == 200);
+        }
 
         // ------------------------------------------------------------------
         // 2. /admin surface never leaks the key
@@ -258,26 +304,36 @@ class Program
 
         var activity = await GetWithKeyAsync(client, "/admin/activity?hours=6&limit=100");
         Check("activity -> 200", () => activity.status == 200);
-        CheckTrue("activity reports a redacted request", () =>
+        // 'activity reports a redacted request' only holds when a redaction-observability
+        // call happened during the window - the one that produces redacted entries is
+        // skipped under --skip-paid, so assert only when a real call was sent.
+        if (!skipPaid)
         {
-            try
+            CheckTrue("activity reports a redacted request", () =>
             {
-                using var d = JsonDocument.Parse(activity.body);
-                foreach (var e in d.RootElement.GetProperty("entries").EnumerateArray())
+                try
                 {
-                    if (e.TryGetProperty("redacted", out var r) && r.GetInt32() > 0)
+                    using var d = JsonDocument.Parse(activity.body);
+                    foreach (var e in d.RootElement.GetProperty("entries").EnumerateArray())
                     {
-                        return true;
+                        if (e.TryGetProperty("redacted", out var r) && r.GetInt32() > 0)
+                        {
+                            return true;
+                        }
                     }
-                }
 
-                return false;
-            }
-            catch (JsonException)
-            {
-                return false;
-            }
-        });
+                    return false;
+                }
+                catch (JsonException)
+                {
+                    return false;
+                }
+            });
+        }
+        else
+        {
+            Info("skipping activity-redaction assertion (--skip-paid: no redaction-observability call was sent)");
+        }
 
         // ------------------------------------------------------------------
         // 6. Log leakage: activity / refusals / logs never contain the key

@@ -3,8 +3,9 @@ using Microsoft.Extensions.Options;
 namespace AIRouterProxy;
 
 /// <summary>
-/// Protects the /admin endpoints with the proxy's local key (Bearer, single or multi-key)
-/// and the same per-client rate limiting used by the proxy path.
+/// Protects the /admin endpoints with the proxy's PRIMARY local key (Bearer) and the
+/// same per-client rate limiting used by the proxy path. Extra local keys (LocalKeys,
+/// one per engineer) authenticate /v1 requests only - they never reach /admin.
 /// </summary>
 public sealed class AdminAuthMiddleware
 {
@@ -39,7 +40,7 @@ public sealed class AdminAuthMiddleware
         }
 
         var presented = SecurityHelpers.ExtractBearerToken(context.Request.Headers.Authorization.ToString());
-        if (!AuthenticationPolicy.IsValidLocalKey(presented, options.Keys))
+        if (!AuthenticationPolicy.IsValidAdminKey(presented, options.Keys))
         {
             if (options.RateLimit is { Enabled: true })
             {
