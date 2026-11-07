@@ -1,9 +1,12 @@
 # deploy-update.ps1 - stops, copies from publish-tmp to deploy (preserving config/cert in the
-# deploy's config/ subfolder) and starts the service.
+# deploy's config/ subfolder), registers the Windows service on FIRST INSTALL (when missing),
+# and starts the service.
 # Usage (deploy in the project's 'deploy' folder): powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1
 # Usage (existing install elsewhere):             powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir "C:\Path\To\deploy"
+# Usage (sandbox/override service name):          powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir "C:\Path" -ServiceName "MyProxy"
 param(
-    [string]$DeployDir = (Join-Path (Split-Path $PSScriptRoot -Parent) 'deploy')
+    [string]$DeployDir = (Join-Path (Split-Path $PSScriptRoot -Parent) 'deploy'),
+    [string]$ServiceName = 'AIRouterProxy'
 )
 # This script ships in scripts/, so the repo root is one level up from $PSScriptRoot.
 $repoRoot = Split-Path $PSScriptRoot -Parent
@@ -15,7 +18,7 @@ Set-Content $log '=== deploy-update start ==='
 $src = Join-Path $repoRoot 'publish-tmp'
 $dst = $DeployDir
 $cfg = Join-Path $dst 'config'
-$svc = Get-Service AIRouterProxy -EA SilentlyContinue
+$svc = Get-Service $ServiceName -EA SilentlyContinue
 
 # Config files that keep their values across updates (preserved at the destination).
 # Priority: destination config\ (new layout), then the legacy deploy root (migrated to config\).
@@ -23,11 +26,11 @@ $keep = @('appsettings.json','appsettings.Server.json','redaction.json','routes.
 
 W "stopping service..."
 if ($svc) {
-    Stop-Service AIRouterProxy -Force -EA SilentlyContinue
+    Stop-Service $ServiceName -Force -EA SilentlyContinue
     Start-Sleep -Seconds 3
-    W "status after stop: $((Get-Service AIRouterProxy).Status)"
+    W "status after stop: $((Get-Service $ServiceName).Status)"
 } else {
-    W "AIRouterProxy service not found - file copy only"
+    W "$ServiceName service not found - file copy only"
 }
 
 if (-not (Test-Path $cfg)) { New-Item -ItemType Directory -Path $cfg | Out-Null }
@@ -62,10 +65,28 @@ W "Server.json exists: $(Test-Path "$cfg\appsettings.Server.json")"
 if (Test-Path "$cfg\proxy-cert.pem") { W "cert deploy: $((Get-Item "$cfg\proxy-cert.pem").LastWriteTime)" }
 
 W "starting service..."
+$svc = Get-Service $ServiceName -EA SilentlyContinue
+if (-not $svc) {
+    # FIRST INSTALL: the service was not registered, so register it now pointing
+    # at the freshly deployed exe (auto-start, LocalSystem).
+    $newExe = Join-Path $dst 'AIRouterProxy.exe'
+    if (Test-Path $newExe) {
+        W "service not registered - registering $ServiceName (first install)..."
+        try {
+            New-Service -Name $ServiceName -BinaryPathName $newExe -StartupType Automatic -EA Stop | Out-Null
+            W "service registered: $ServiceName (auto-start)"
+        } catch {
+            W "service registration FAILED: $($_.Exception.Message)"
+        }
+    } else {
+        W "could not find $newExe - service NOT registered"
+    }
+}
+$svc = Get-Service $ServiceName -EA SilentlyContinue
 if ($svc) {
-    Start-Service AIRouterProxy -EA SilentlyContinue
+    Start-Service $ServiceName -EA SilentlyContinue
     Start-Sleep -Seconds 3
-    W "status: $((Get-Service AIRouterProxy).Status)"
+    W "status: $((Get-Service $ServiceName).Status)"
     W "port 4000: $([bool](Get-NetTCPConnection -LocalPort 4000 -State Listen -EA SilentlyContinue))"
 } else {
     W "service not installed - start the exe manually: $dst\AIRouterProxy.exe"

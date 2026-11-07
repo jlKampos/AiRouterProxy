@@ -27,6 +27,7 @@ route table lets you forward to several OpenAI-compatible providers, each with i
 - [Certificates](#certificates)
 - [Using from OpenCode (opencode.json)](#using-from-opencode-opencodejson)
 - [Tests](#tests)
+- [Interactive menu (proxy-menu.ps1)](#interactive-menu-proxymenups1)
 - [Deploy (installed service)](#deploy-installed-service)
 
 ## Why: a security layer for development environments
@@ -153,7 +154,8 @@ AiRouterProxy/
 |   |   `-- RedactorTests.csproj
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- scripts/
-|   |-- deploy-update.ps1          # deploy to the installed service (preserves secrets/certs on the destination)
+|   |-- proxy-menu.ps1             # interactive menu (build/deploy/verify/keys/event log) - the day-to-day entry point
+|   |-- deploy-update.ps1          # deploy engine (preserves secrets/certs; registers the Windows service on FIRST INSTALL)
 |   `-- genApiKey.ps1              # generates/prints/rotates local keys (-Print / -Write)
 |-- images/                        # README screenshots
 |-- README.md, LICENSE, .gitignore, AIRouterProxy.slnx
@@ -772,6 +774,7 @@ Use the models as `airouter/Qwen3.8` or `airouter/DeepSeek-V4-Flash`.
 | `404 No proxy route matches` | Prefix not present in routes.json | Check `routes.json` reloaded (hot reload) |
 | `502 Route 'X' has no API key configured` | Upstream key missing | Fill `Proxy:RouteKeys:X` or `UpstreamKey` in appsettings.Server.json |
 | TLS/certificate error on the client | CA not trusted | `mkcert -install` (or install the CA root store as above) |
+| Service installed but stays `Stopped` immediately | **Smart App Control** blocks the unsigned build (CodeIntegrity 3033/3077) | Disable SAC: Windows Security > App & browser control > Smart App Control > **Off** (menu option 1/3/4 warn when it is active) |
 
 ## Tests
 
@@ -813,13 +816,74 @@ real forward + SSE streaming, redaction observability (`redacted>0` in activity)
 > Note: the `Allow` response header is an **entity header** - `HttpClient` exposes it under
 > `resp.Content.Headers`, so the harness reads it from both the response and the content headers.
 
+## Interactive menu (proxy-menu.ps1)
+
+`scripts\proxy-menu.ps1` is the **single entry point** for the day-to-day build/deploy/verify/key
+workflows. It **delegates** to the engine scripts (`deploy-update.ps1`, `genApiKey.ps1`) - it never
+re-implements them and never reads sensitive files.
+
+```powershell
+# run the menu
+powershell -ExecutionPolicy Bypass -File .\scripts\proxy-menu.ps1
+```
+
+| Option | What it does | Elevates? |
+|---|---|---|
+| `1` | Build + deploy + verify (full pipeline, end-to-end) | yes (UAC) |
+| `2` | Build only (`dotnet publish` -> `publish-tmp`) | no |
+| `3` | Deploy only (from an existing `publish-tmp`) | yes (UAC) |
+| `4` | Verify service (port 4000 + version + status + `/admin/health`) | no |
+| `5` | Generate an engineer key (prints only, writes nothing) | no |
+| `6` | View Event Log (latest `AIRouterProxy` events) | no |
+| `7` | Certificate docs (show mkcert setup commands) | no |
+| `8` | ⚠ ROTATE PRIMARY KEY (edits `appsettings.Server.json`) | yes (UAC) |
+| `0` | Exit | - |
+
+- Options **1 / 3 / 8 self-elevate** (UAC) and run in a second, elevated window - the deploy and
+  its confirmations happen there.
+- Options **1 and 3** run a pre-flight check first: missing `dotnet`, missing destination certs /
+  `appsettings.Server.json` (**FIRST INSTALL** - the service will register but not serve yet),
+  and a **Smart App Control (SAC)** warning when the OS would block unsigned builds.
+- Option **4** checks the service port with TCP connect (works non-elevated) and
+  `GET /admin/health` (HTTP 401 while up, key required).
+
+Useful parameters:
+
+```powershell
+# deploy to a custom folder and/or under a custom service name (e.g. a sandbox)
+powershell -ExecutionPolicy Bypass -File .\scripts\proxy-menu.ps1 -DeployDir "C:\Services\AiRouterProxy-TEST" -ServiceName "AiRouterProxy-TEST"
+
+# non-interactive single action (used by the elevated child windows; handy for scripts / the event log)
+powershell -ExecutionPolicy Bypass -File .\scripts\proxy-menu.ps1 -Action Verify
+#   -Action: BuildDeploy | Build | Deploy | RotateKey | EventLog | Verify
+```
+
+> **Smart App Control (SAC) - Windows 11:** `AIRouterProxy.exe` is a local build and is **not
+> signed**. If SAC is **On**, Windows blocks it at startup (the service registers but stays
+> `Stopped`; Event Log shows CodeIntegrity 3033/3077 "Enterprise signing level"). Fix: disable SAC
+> in **Windows Security > App & browser control > Smart App Control > select Off**. Defender
+> (antivirus) stays active and SAC can be turned back on later. The menu warns before the deploy
+> when SAC is active - it is the common cause of a service that never starts.
+
 ## Deploy (installed service)
 
 The service runs as a Windows Service (`AIRouterProxy`) whose executable is deployed to a service
 folder. The recommended layout puts it under `C:\Services` (outside any repo), e.g.
 `C:\Services\AiRouterProxy\`. All config files (appsettings.*.json, redaction.json, routes.json and the TLS certs) live in a **`config`** subfolder next to the exe, so the deploy root only has the executable and the configs are easy to find (the server auto-detects `config/`; a flat install without it keeps working).
 
+**First install is automatic:** when the service is not registered on the destination, the deploy
+engine registers it itself (`New-Service`, auto-start, LocalSystem) pointing at the freshly
+deployed exe - no manual `sc.exe create` / `binPath` steps. The menu (option 1/3) and a direct
+`deploy-update.ps1` call both do this. A destination without `config\appsettings.Server.json`
+warns FIRST INSTALL before the deploy: the service is installed but will not serve until the
+following files are created in `config\` (the deploy never fabricates secrets):
+`appsettings.Server.json` (copy the `appsettings.Server.example.json` template) and the TLS
+`proxy-cert.pem` / `proxy-key.pem` (see [Certificates](#certificates) / menu option 7).
+
 ### Regular update of an existing service
+
+The **fastest** path is the menu: option **1** (build + deploy + verify) or **3** (deploy only).
+Below is the same thing done by hand - useful when you want the steps explicit or in a script.
 
 ```powershell
 # self-contained is REQUIRED: the host has no x64 .NET runtime installed, so a
@@ -830,9 +894,11 @@ dotnet publish src/AiRouterProxy/AIRouterProxy.csproj -c Release -r win-x64 --se
 powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1
 # installed service under C:\Services:
 powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir "C:\Services\AiRouterProxy"
+# (optional) custom service name, e.g. a sandbox install:
+powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir "C:\Services\AiRouterProxy-TEST" -ServiceName "AiRouterProxy-TEST"
 ```
 
-`deploy-update.ps1` preserves config/certs (keeping them in the destination `config/` folder and migrating an older flat install automatically) and restarts the service (when installed as a Windows Service). If the deploy carries inspection/rate-limit changes, refresh the destination `redaction.json` from the repo copy afterwards (the deploy script preserves the destination file by design).
+`deploy-update.ps1` preserves config/certs (keeping them in the destination `config/` folder and migrating an older flat install automatically), registers the service when it is missing (**first install**, see above) and restarts it (when installed as a Windows Service). If the deploy carries inspection/rate-limit changes, refresh the destination `redaction.json` from the repo copy afterwards (the deploy script preserves the destination file by design).
 
 ### Moving the deployed service to a new folder (generic)
 
