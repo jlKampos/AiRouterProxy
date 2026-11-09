@@ -50,6 +50,7 @@ public sealed class ProxyMiddleware
         var redactionKinds = string.Empty;
         List<SecretRedactor.RedactionPreview>? redactionPreviews = null;
         string? routeName = null;
+        RouteOptions? activeRoute = null;
 
         try
         {
@@ -167,6 +168,7 @@ public sealed class ProxyMiddleware
             }
 
             routeName = resolved.Route.Name;
+            activeRoute = resolved.Route;
             upstreamBase = (resolved.Route.Upstream ?? string.Empty).TrimEnd('/');
             upstreamPath = resolved.RewrittenPath;
             upstreamKey = resolved.Key;
@@ -337,6 +339,11 @@ public sealed class ProxyMiddleware
         var upstreamUri = new Uri(upstreamBase + upstreamPath + context.Request.QueryString, UriKind.Absolute);
 
         using var upstreamRequest = new HttpRequestMessage(new HttpMethod(context.Request.Method), upstreamUri);
+
+        // Per-route static headers (routes.json "headers", e.g. the "anthropic-version"
+        // header the Anthropic API requires). Reserved headers (Authorization/Content-Type/
+        // Accept...) that the proxy injects itself are never overridden.
+        RouteHeaders.Apply(upstreamRequest, activeRoute?.Headers);
 
         upstreamRequest.Headers.TryAddWithoutValidation("Authorization", "Bearer " + upstreamKey);
 

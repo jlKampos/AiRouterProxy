@@ -26,6 +26,19 @@
           "/v1/*"
         ],
         "requestTimeoutMs": 300000
+      },
+      {
+        "name": "anthropic",
+        "prefix": "/anthropic",
+        "upstream": "https://api.anthropic.com",
+        "keyRef": "ANTHROPIC",
+        "allowedPaths": [
+          "/v1/*"
+        ],
+        "requestTimeoutMs": 300000,
+        "headers": {
+          "anthropic-version": "2023-06-01"
+        }
       }
     ]
   }

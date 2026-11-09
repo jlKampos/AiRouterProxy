@@ -114,6 +114,17 @@ public static class SseStreamProcessor
 
         public async ValueTask TerminateAsync(Stream destination, SseEvent terminal, CancellationToken cancellationToken)
         {
+            if (_terminated)
+            {
+                // A terminal event already ended the stream (e.g. content_block_stop on an
+                // Anthropic stream that later emits message_stop): the notice was injected
+                // exactly once, before the first terminal. Drain everything through this
+                // second terminal without injecting again.
+                await FlushUpToAsync(destination, terminal.EndOffset, cancellationToken);
+                _held = null;
+                return;
+            }
+
             // Everything up to the terminal event (including the held one), then the notice,
             // then the terminal event itself.
             await FlushUpToAsync(destination, terminal.StartOffset, cancellationToken);
