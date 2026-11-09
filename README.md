@@ -768,6 +768,188 @@ shown above for OpenRouter):
 
 Use the models as `airouter/Qwen3.8` or `airouter/DeepSeek-V4-Flash`.
 
+### Both routes, one config — global example
+
+Both routes in a single `opencode.json`: the default route (`/v1`) serves the AI
+Router and the `/openrouter` route serves OpenRouter, all through the same proxy.
+This is a complete working setup — the client-side guardrails (`watcher` +
+`permissions`), a remote MCP server, both providers and two primary agents
+(`plan`, `build`) — validated on OpenCode V2.
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "watcher": {
+    "ignore": [
+      "**/appsettings.json",
+      "**/appsettings.*.json",
+      "**/secrets.json",
+      "**/.microsoft/usersecrets/**",
+      "**/.env",
+      "**/.env.*",
+      "**/google-services.json",
+      "**/GoogleService-Info.plist",
+      "**/firebase-config.json",
+      "**/firebase-secrets.json",
+      "**/firebase*.json",
+      "**/*cloud_services_config.json",
+      "cloud_services_config.json",
+      "**/*.keystore",
+      "**/*.jks",
+      "**/*.p12",
+      "**/*.pfx",
+      "**/*.pem",
+      "**/*.key",
+      "**/*.crt",
+      "**/*.cer",
+      "**/bin/**",
+      "**/obj/**",
+      "**/.vs/**",
+      "**/.vscode/**",
+      "**/publish/**",
+      "**/*.suo",
+      "**/*.user",
+      "**/*.userprefs",
+      "**/logs/**",
+      "**/*.log",
+      "**/*.db",
+      "**/*.sqlite",
+      "**/*.sqlite3",
+      "**/Properties/PublishProfiles/**",
+      "**/AndroidManifest.xml",
+      "**/Platforms/Android/google-services.json",
+      "**/node_modules/**",
+      "**/.git/**",
+      "**/.idea/**"
+    ]
+  },
+  "permissions": [
+    { "action": "read",  "resource": "**/appsettings*.json",                        "effect": "deny" },
+    { "action": "read",  "resource": "**/{secrets.json,credentials.json}",          "effect": "deny" },
+    { "action": "read",  "resource": "**/.env*",                                    "effect": "deny" },
+    { "action": "read",  "resource": "**/*.{pem,key,crt,cer,p12,pfx,jks,keystore}",  "effect": "deny" },
+    { "action": "read",  "resource": "**/connectionstrings.config",                 "effect": "deny" },
+    { "action": "read",  "resource": "**/{bin,obj,node_modules,logs,Logs}/**",       "effect": "deny" },
+    { "action": "edit",  "resource": "**/*.Designer.cs",                            "effect": "deny" },
+    { "action": "edit",  "resource": "**/*.resx",                                   "effect": "deny" },
+    { "action": "shell", "resource": "git push *",                                  "effect": "deny" },
+    { "action": "shell", "resource": "git fetch *",                                 "effect": "deny" },
+    { "action": "shell", "resource": "*{sqlcmd,sqlplus,sql,sqsh,psql}*",             "effect": "deny" }
+  ],
+  "mcp": {
+    "servers": {
+      "figma": {
+        "type": "remote",
+        "url": "https://mcp.figma.com/mcp"
+      }
+    }
+  },
+  "provider": {
+    "airouter": {
+      "name": "airouter-proxy",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://localhost:4000/v1",        // default route -> AI Router ("" prefix)
+        "apiKey": "sk-...your-LocalKey..."             // proxy LOCAL key, NOT the upstream key
+      },
+      "models": {
+        "Qwen3.8": {
+          "name": "Qwen3.8 (local)",
+          "variants": {
+            "none":   { "reasoningEffort": "none" },
+            "low":    { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "xhigh":  { "reasoningEffort": "xhigh" }
+          },
+          "limit": {
+            "context": 262144,
+            "input": 196608,
+            "output": 65536
+          },
+          "modalities": {
+            "input":  ["text", "image"],
+            "output": ["text"]
+          },
+          "reasoning": true,
+          "tool_call": true,
+          "options": {
+            "reasoningEffort": "xhigh",
+            "temperature": 0.6,
+            "topP": 0.95,
+            "topK": 20,
+            "minP": 0.0,
+            "presencePenalty": 0.0,
+            "repetitionPenalty": 1.0
+          }
+        },
+        "DeepSeek-V4-Flash": {
+          "name": "DeepSeek-V4-Flash (local)",
+          "variants": {
+            "none":    { "reasoningEffort": "none" },
+            "minimal": { "reasoningEffort": "minimal" },
+            "low":     { "reasoningEffort": "low" },
+            "medium":  { "reasoningEffort": "medium" },
+            "high":    { "reasoningEffort": "high" },
+            "xhigh":   { "reasoningEffort": "xhigh" }
+          },
+          "limit": {
+            "context": 262144,
+            "input": 229376,
+            "output": 32768
+          },
+          "modalities": {
+            "input":  ["text", "image"],
+            "output": ["text"]
+          },
+          "reasoning": true,
+          "tool_call": true,
+          "options": {
+            "reasoningEffort": "xhigh",
+            "textVerbosity": "low",
+            "reasoningSummary": "auto"
+          }
+        }
+      }
+    },
+    "openrouter-local": {
+      "name": "OpenRouter via proxy",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "https://localhost:4000/openrouter/v1",   // /openrouter route -> OpenRouter
+        "apiKey": "sk-...your-LocalKey..."                   // proxy LOCAL key, NOT the OpenRouter key
+      },
+      "models": {
+        "deepseek/deepseek-v4-flash-0731": {
+          "name": "DeepSeek V4 Flash 0731",
+          "tool_call": true
+        }
+      }
+    }
+  },
+  "model": "airouter/DeepSeek-V4-Flash",
+  "default_agent": "plan",
+  "agents": {
+    "plan": {
+      "description": "Complex planning and analysis",
+      "mode": "primary",
+      "model": "airouter/DeepSeek-V4-Flash",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" }
+      ]
+    },
+    "build": {
+      "description": "Fast implementation",
+      "mode": "primary",
+      "model": "airouter/DeepSeek-V4-Flash"
+    }
+  }
+}
+```
+
+- `apiKey` is the proxy's **LocalKey** in **both** provider blocks — never the upstream AI Router key nor the OpenRouter key (those live only server-side, see [appsettings.Server.json](#appsettingsserverjson) `Proxy:RouteKeys`).
+- `baseURL` uses `localhost`; on a network machine replace it with `https://<machine-name>:4000/...` — the mkcert certificate covers `localhost`, the machine name and the LAN IP (see [Certificates](#certificates)).
+- The provider blocks use the proven `provider`/`npm`/`options` form (the schema also accepts the V2 `providers`/`package`/`settings` form shown in the OpenRouter example above); the agents use V2-native `agents` + `permissions` — `plan` is read-only (`edit` denied), `build` implements, and `default_agent: "plan"` opens each session in planning mode.
+
 ### Troubleshooting
 
 | Symptom | Cause | Fix |
