@@ -44,12 +44,41 @@ class Program
         TestSecurityEdges();
         TestRouting();
         TestInspectionPolicy();
+        TestRouteHeaders();
         Console.WriteLine();
         Console.WriteLine($"RESULT: {_passed} PASS, {_failed} FAIL");
         Environment.ExitCode = _failed == 0 ? 0 : 1;
     }
 
     // --------------------------------------------------------------
+    static void TestRouteHeaders()
+    {
+        var req = new HttpRequestMessage(HttpMethod.Post, "http://upstream/v1/messages");
+        RouteHeaders.Apply(req, new Dictionary<string, string>
+        {
+            ["anthropic-version"] = "2023-06-01",
+            ["X-Tenant"] = "eng",
+            ["Authorization"] = "Bearer injected-by-route",  // reserved -> must not appear
+            ["Content-Type"] = "text/plain",                  // reserved -> must not appear
+            [""] = "skip",                                    // empty name -> skipped
+            ["X-Empty"] = "",                                 // empty value -> skipped
+        });
+
+        CheckTrue("route headers applied", () =>
+            req.Headers.TryGetValues("anthropic-version", out var v) && string.Join(",", v) == "2023-06-01"
+            && req.Headers.Contains("X-Tenant"));
+        CheckTrue("route headers reserved ignored", () =>
+            !req.Headers.Contains("Authorization")
+            && !req.Headers.Any(h => h.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase)));
+        CheckTrue("route headers empty skipped", () =>
+            !req.Headers.Contains("X-Empty"));
+
+        var none = new HttpRequestMessage(HttpMethod.Get, "http://upstream/x");
+        RouteHeaders.Apply(none, null);
+        RouteHeaders.Apply(none, new Dictionary<string, string>());
+        CheckTrue("route headers null/empty no-op", () => none.Headers.Count() == 0);
+    }
+
     static void TestFormats()
     {
         // sk-... in message content
@@ -376,6 +405,20 @@ class Program
         var rjson = Bytes("{\"id\":\"rsp\",\"object\":\"response\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi\"}]}]}");
         var injRJ = NoticeInjector.Inject(rjson, "application/json", notice);
         CheckTrue("Responses JSON injects", () => injRJ != null && Str(injRJ!).Contains("output_text") && Str(injRJ!).Contains("hi\\n\\n" + notice));
+
+        // Anthropic Messages API JSON -> appends to the last text block
+        var anj = Bytes("{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}],\"stop_reason\":\"end_turn\"}");
+        var injAN = NoticeInjector.Inject(anj, "application/json", notice);
+        CheckTrue("Anthropic JSON injects", () => injAN != null
+            && Str(injAN!).Contains("Hello\\n\\n" + notice)
+            && Str(injAN!).Contains("\"stop_reason\""));
+
+        // Anthropic JSON without a text part -> creates one
+        var anj2 = Bytes("{\"id\":\"msg_2\",\"type\":\"message\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"x\",\"input\":{}}]}");
+        var injAN2 = NoticeInjector.Inject(anj2, "application/json", notice);
+        CheckTrue("Anthropic JSON adds text part", () => injAN2 != null
+            && Str(injAN2!).Contains("\"type\":\"text\"")
+            && Str(injAN2!).Contains(notice));
 
         // Unsupported content-type -> null (body intact)
         CheckTrue("unknown ctype -> null", () => NoticeInjector.Inject(Bytes("plain"), "text/plain", notice) is null);
@@ -949,6 +992,35 @@ class Program
         CheckTrue("proc anthropic event", () => ao.Contains("event: content_block_delta\ndata: ")
             && ao.IndexOf("A") < ao.IndexOf("data: [DONE]"));
 
+        // Real Anthropic stream (production shape): message_start -> content_block_start ->
+        // deltas -> content_block_stop -> message_delta -> message_stop (no "[DONE]").
+        // The notice must land between the last text delta and content_block_stop (while the
+        // text block is still open, so @ai-sdk/anthropic renders it), exactly once, and the
+        // stream must still end with message_stop.
+        const string realAnth =
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+            + "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n"
+            + "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n"
+            + "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n"
+            + "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{}}\n\n"
+            + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        var ra = ProcessSseAsync(realAnth, "A").GetAwaiter().GetResult();
+        CheckTrue("proc real anthropic notice before content_block_stop", () =>
+        {
+            var iOk = ra.IndexOf("text\":\"ok\"}", StringComparison.Ordinal);
+            var iNotice = ra.IndexOf("\\n\\nA", StringComparison.Ordinal);   // the notice delta text
+            var iStop = ra.IndexOf("event: content_block_stop", StringComparison.Ordinal);
+            var iMsgStop = ra.IndexOf("event: message_stop", StringComparison.Ordinal);
+            return iOk >= 0 && iNotice > iOk && iStop >= 0 && iNotice < iStop
+                && iMsgStop > iStop
+                && ra.EndsWith("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        });
+        CheckTrue("proc real anthropic notice once (guard)", () =>
+        {
+            var first = ra.IndexOf("\\n\\nA", StringComparison.Ordinal);
+            return first >= 0 && ra.IndexOf("\\n\\nA", first + 1, StringComparison.Ordinal) < 0;
+        });
+
         const string raw = "data: 1\n\ndata: 2\n\n";
         var pt = ProcessSseAsync(raw, string.Empty).GetAwaiter().GetResult();
         CheckTrue("proc passthrough identical", () => pt == raw);
@@ -970,6 +1042,8 @@ class Program
             SseProtocolRegistry.Resolve(Evt("{\"type\":\"response.output_text.delta\",\"delta\":\"oi\"}")) is OpenAiResponsesAdapter);
         CheckTrue("resolve anthropic", () =>
             SseProtocolRegistry.Resolve(Evt("{\"type\":\"content_block_delta\",\"index\":0}", "content_block_delta")) is AnthropicAdapter);
+        CheckTrue("resolve anthropic (message_start)", () =>
+            SseProtocolRegistry.Resolve(Evt("{}", "message_start")) is AnthropicAdapter);
         CheckTrue("resolve chat", () =>
             SseProtocolRegistry.Resolve(Evt("{\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}")) is OpenAiChatAdapter);
         CheckTrue("resolve generic", () =>
@@ -1004,6 +1078,12 @@ class Program
         CheckTrue("classify anthropic start/content", () =>
             new AnthropicAdapter().Classify(Evt("{}", "message_start")) == SseEventKind.Start
             && new AnthropicAdapter().Classify(Evt("{\"type\":\"content_block_delta\"}", "content_block_delta")) == SseEventKind.Content);
+
+        CheckTrue("classify anthropic message_stop terminal", () =>
+            new AnthropicAdapter().Classify(Evt("{}", "message_stop")) == SseEventKind.Terminal);
+
+        CheckTrue("classify anthropic content_block_stop terminal", () =>
+            new AnthropicAdapter().Classify(Evt("{}", "content_block_stop")) == SseEventKind.Terminal);
 
         // Notice chunks: byte-exact per protocol (identical to Sprint 4 output)
         CheckTrue("chat notice chunk exact", () =>

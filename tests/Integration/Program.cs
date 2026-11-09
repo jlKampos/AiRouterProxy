@@ -22,6 +22,10 @@ using System.Text.Json;
 //                       duration - default 5 minutes). Off by default.
 //   --perf              Run only the performance battery (TTFT / total latency per
 //                       model, small token spend) and exit.
+//   --anthropic         Run the Claude (Anthropic) live battery against the real
+//                       /anthropic route (WARNING: consumes Anthropic account
+//                       credits - the trial budget). Opt-in; combined with
+//                       --skip-paid it is ignored (skip-paid is a hard gate).
 // ---------------------------------------------------------------------------
 class Program
 {
@@ -49,6 +53,7 @@ class Program
         var skipPaid = HasFlag(args, "--skip-paid");
         var bruteForce = HasFlag(args, "--brute-force");
         var perf = HasFlag(args, "--perf");
+        var anthropic = HasFlag(args, "--anthropic");
 
         if (keyFile is null)
         {
@@ -94,7 +99,7 @@ class Program
             Console.WriteLine($"extra key sha256: {ShaPrefix(_extraKey)} (first 8 hex chars - never the key itself)");
         }
         Console.WriteLine($"base url : {baseUrl}");
-        Console.WriteLine($"skip paid: {skipPaid}   brute-force: {bruteForce}   perf: {perf}");
+        Console.WriteLine($"skip paid: {skipPaid}   brute-force: {bruteForce}   perf: {perf}   anthropic: {anthropic}");
         Console.WriteLine();
 
         using var client = NewClient(baseUrl);
@@ -302,6 +307,26 @@ class Program
             Warn("skipping image data-URL probe (--skip-paid)");
         }
 
+        // ------------------------------------------------------------------
+        // 4.7. Anthropic live battery (opt-in --anthropic; consumes Anthropic
+        //      account credits - the trial budget). Skipped under --skip-paid.
+        // ------------------------------------------------------------------
+        if (anthropic)
+        {
+            if (skipPaid)
+            {
+                Warn("--anthropic ignored: conflicts with --skip-paid (which hard-skips every paid call).");
+            }
+            else
+            {
+                await RunAnthropicBatteryAsync(client);
+            }
+        }
+        else
+        {
+            Info("anthropic live battery skipped (add --anthropic to run it - it spends Anthropic account credits)");
+        }
+
         var activity = await GetWithKeyAsync(client, "/admin/activity?hours=6&limit=100");
         Check("activity -> 200", () => activity.status == 200);
         // 'activity reports a redacted request' only holds when a redaction-observability
@@ -468,6 +493,98 @@ class Program
         static double Avg(List<double> vs) => vs.Average();
         static double P(List<double> vs) => vs.OrderBy(v => v).Skip(vs.Count / 2).First();
         static double MaxV(List<double> vs) => vs.Max();
+    }
+
+    // ------------------------------------------------------------------
+    // Anthropic (Claude) live battery (--anthropic, opt-in). Calls the
+    // real /anthropic route -> real Anthropic API, which CONSUMES ANTHROPIC
+    // ACCOUNT CREDITS (trial budget). Off by default; combined with
+    // --skip-paid it is ignored. Verified against the deployed 2.4.0 proxy:
+    // stream redaction -> the notice is a content_block_delta delivered
+    // BEFORE content_block_stop (so @ai-sdk/anthropic renders it); non-stream
+    // -> the notice is appended to the JSON plus X-AIRouter-Redacted: 1.
+    // ------------------------------------------------------------------
+    static async Task RunAnthropicBatteryAsync(HttpClient client)
+    {
+        const string path = "/anthropic/v1/messages";
+        const string fakeKey = "sk-ant-9876543210fedcba";
+        const string model = "claude-haiku-4-5"; // cheapest model the trial key can access
+
+        Warn("Anthropic battery is LIVE: it calls the real Anthropic API and consumes account credits (trial budget).");
+
+        var (sStatus, sBody, _) = await SendAnthropicMessagesAsync(client, path, model, stream: true, fakeSecret: true);
+        Check("anthropic stream -> 200", () => sStatus == 200);
+        Check("anthropic stream literal absent", () => !sBody.Contains(fakeKey, StringComparison.Ordinal));
+        Check("anthropic stream notice exactly once", () =>
+        {
+            var i = sBody.IndexOf("Proxy notice", StringComparison.Ordinal);
+            return i >= 0 && sBody.IndexOf("Proxy notice", i + 1, StringComparison.Ordinal) < 0;
+        });
+        Check("anthropic stream notice before content_block_stop", () =>
+        {
+            var iN = sBody.IndexOf("Proxy notice", StringComparison.Ordinal);
+            var iS = sBody.IndexOf("event: content_block_stop", StringComparison.Ordinal);
+            return iN >= 0 && iS >= 0 && iN < iS;
+        });
+        Check("anthropic stream last event is message_stop", () =>
+        {
+            var last = string.Empty;
+            foreach (var line in sBody.Split('\n'))
+            {
+                if (line.StartsWith("event:", StringComparison.Ordinal)) last = line.TrimEnd('\r');
+            }
+
+            return last == "event: message_stop";
+        });
+
+        var (jStatus, jBody, jRedacted) = await SendAnthropicMessagesAsync(client, path, model, stream: false, fakeSecret: true);
+        Check("anthropic json -> 200", () => jStatus == 200);
+        Check("anthropic json literal absent", () => !jBody.Contains(fakeKey, StringComparison.Ordinal));
+        Check("anthropic json notice appended", () => jBody.Contains("Proxy notice", StringComparison.Ordinal));
+        Check("anthropic json redacted header", () => jRedacted == 1);
+    }
+
+    /// <summary>Posts one Anthropic Messages request (stream or not, with or without a
+    /// fake key) and returns status + full body + the X-AIRouter-Redacted value.</summary>
+    static async Task<(int status, string body, int redacted)> SendAnthropicMessagesAsync(
+        HttpClient client, string path, string model, bool stream, bool fakeSecret)
+    {
+        var content = fakeSecret ? "my key is sk-ant-9876543210fedcba test" : "hi";
+        var payload = JsonSerializer.Serialize(new
+        {
+            model,
+            max_tokens = 32,
+            stream,
+            messages = new[] { new { role = "user", content } },
+        });
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, path)
+        {
+            Content = new StringContent(payload, Encoding.UTF8, "application/json"),
+        };
+        req.Headers.Authorization = new("Bearer", _key);
+
+        try
+        {
+            using var resp = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
+            var status = (int)resp.StatusCode;
+            var body = await resp.Content.ReadAsStringAsync();
+            var redacted = 0;
+            if (resp.Headers.TryGetValues("X-AIRouter-Redacted", out var vals))
+            {
+                foreach (var v in vals)
+                {
+                    if (int.TryParse(v, out redacted)) break;
+                }
+            }
+
+            return (status, body, redacted);
+        }
+        catch (HttpRequestException ex)
+        {
+            Info($"anthropic request failed: {ex.Message}");
+            return (0, string.Empty, 0);
+        }
     }
 
     /// <summary>Extracts the chat path from an /admin/endpoints payload (route prefix + /chat/completions),

@@ -101,7 +101,9 @@ public static class NoticeInjector
             return null;
         }
 
-        var done = TryAppendToLastChoice(root, notice) || TryAppendToResponsesOutput(root, notice);
+        var done = TryAppendToLastChoice(root, notice)
+            || TryAppendToResponsesOutput(root, notice)
+            || TryAppendToAnthropic(root, notice);
 
         return done ? JsonSerializer.SerializeToUtf8Bytes(root, JsonOptions) : null;
     }
@@ -178,6 +180,23 @@ public static class NoticeInjector
 
         parts.Add(new JsonObject { ["type"] = partType, ["text"] = notice });
         return true;
+    }
+
+    /// <summary>
+    /// Anthropic Messages API JSON: appends the notice to the last text block of the
+    /// content array (or adds a text block). Recognized by "type":"message" (chat and
+    /// Responses JSON have already been ruled out at this point).
+    /// </summary>
+    private static bool TryAppendToAnthropic(JsonNode? root, string notice)
+    {
+        if (root is not JsonObject obj
+            || obj["type"]?.GetValue<string>() != "message"
+            || obj["content"] is not JsonArray parts)
+        {
+            return false;
+        }
+
+        return AppendTextPart(parts, notice, "text");
     }
 
     private static string Serialize(object payload)

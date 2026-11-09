@@ -2,7 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.3.1 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.4.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ☕ Found this useful? [**Support the project**](https://buymeacoffee.com/jlkampos) with a coffee — every cup keeps the redaction growing.
 
@@ -252,7 +252,8 @@ The only place where keys live. Created on the target machine (never committed):
     },
     "RouteKeys": {
       "OPENROUTER": "sk-or-...  (key used by the /openrouter route)",
-      "GROQ": "gsk_...  (optional, used by any route with keyRef GROQ)"
+      "GROQ": "gsk_...  (optional, used by any route with keyRef GROQ)",
+      "ANTHROPIC": "sk-ant-...  (key used by the /anthropic route)"
     }
   }
 }
@@ -289,6 +290,17 @@ and the route key is selected by `keyRef`:
         "keyRef": "OPENROUTER",                       // uses Proxy:RouteKeys:OPENROUTER
         "allowedPaths": ["/v1/*"],
         "requestTimeoutMs": 300000
+      },
+      {
+        "name": "anthropic",
+        "prefix": "/anthropic",                       // activates on /anthropic/...
+        "upstream": "https://api.anthropic.com",
+        "keyRef": "ANTHROPIC",                        // uses Proxy:RouteKeys:ANTHROPIC
+        "allowedPaths": ["/v1/*"],
+        "requestTimeoutMs": 300000,
+        "headers": {                                  // static headers merged into every request
+          "anthropic-version": "2023-06-01"           // required by the Anthropic API
+        }
       }
     ]
   }
@@ -298,12 +310,14 @@ and the route key is selected by `keyRef`:
 Mapping example:
 - `https://localhost:4000/v1/chat/completions` -> `https://api.airouter.ch/v1/chat/completions` (default route)
 - `https://localhost:4000/openrouter/v1/chat/completions` -> `https://openrouter.ai/api/v1/chat/completions` (prefix removed before forwarding)
+- `https://localhost:4000/anthropic/v1/messages` -> `https://api.anthropic.com/v1/messages` (prefix removed before forwarding)
 
 Rules:
 - Only one route can have `prefix: ""`.
 - `prefix` must start with `/` and match on a **segment boundary** (`/openrouter` does not match `/openrouterX`).
 - `allowedPaths` matches the path **after** prefix removal; supports a trailing `*`.
 - A route whose key is missing is **inactive** (returns 502, not a proxy crash).
+- `headers` (optional) adds **static headers** to every request forwarded along the route — e.g. the `anthropic-version` header the Anthropic API requires. Reserved headers the proxy sets itself (`Authorization`, `Content-Type`, `Accept`, ...) are **never overridden** — the proxy's credentials and content framing always win. Supports hot reload (edit `routes.json`, no restart).
 
 ### redaction.json
 
@@ -768,13 +782,13 @@ shown above for OpenRouter):
 
 Use the models as `airouter/Qwen3.8` or `airouter/DeepSeek-V4-Flash`.
 
-### Both routes, one config — global example
+### All routes, one config — global example
 
-Both routes in a single `opencode.json`: the default route (`/v1`) serves the AI
-Router and the `/openrouter` route serves OpenRouter, all through the same proxy.
-This is a complete working setup — the client-side guardrails (`watcher` +
-`permissions`), a remote MCP server, both providers and two primary agents
-(`plan`, `build`) — validated on OpenCode V2.
+All routes in a single `opencode.json`: the default route (`/v1`) serves the AI
+Router, `/openrouter` serves OpenRouter and `/anthropic` serves Anthropic — all
+through the same proxy. This is a complete working setup — the client-side
+guardrails (`watcher` + `permissions`), a remote MCP server, the providers and two
+primary agents (`plan`, `build`) — validated on OpenCode V2.
 
 ```jsonc
 {
@@ -924,6 +938,27 @@ This is a complete working setup — the client-side guardrails (`watcher` +
           "tool_call": true
         }
       }
+    },
+    "anthropic-local": {
+      "name": "Anthropic via proxy",
+      "npm": "@ai-sdk/anthropic",
+      "options": {
+        "baseURL": "https://localhost:4000/anthropic/v1",   // /anthropic route -> Anthropic
+        "apiKey": "sk-...your-LocalKey...",                 // SDK sends this as x-api-key (proxy ignores it)
+        "headers": {
+          "authorization": "Bearer sk-...your-LocalKey..."  // this is what the proxy authenticates
+        }
+      },
+      "models": {
+        "claude-haiku-4-5": {
+          "name": "Claude Haiku 4.5",
+          "tool_call": true
+        },
+        "claude-sonnet-4-5": {
+          "name": "Claude Sonnet 4.5",
+          "tool_call": true
+        }
+      }
     }
   },
   "model": "airouter/DeepSeek-V4-Flash",
@@ -946,9 +981,85 @@ This is a complete working setup — the client-side guardrails (`watcher` +
 }
 ```
 
-- `apiKey` is the proxy's **LocalKey** in **both** provider blocks — never the upstream AI Router key nor the OpenRouter key (those live only server-side, see [appsettings.Server.json](#appsettingsserverjson) `Proxy:RouteKeys`).
+- `apiKey` is the proxy's **LocalKey** in **all three** provider blocks — never an upstream key (AI Router / OpenRouter / Anthropic; those live only server-side, see [appsettings.Server.json](#appsettingsserverjson) `Proxy:RouteKeys`).
 - `baseURL` uses `localhost`; on a network machine replace it with `https://<machine-name>:4000/...` — the mkcert certificate covers `localhost`, the machine name and the LAN IP (see [Certificates](#certificates)).
 - The provider blocks use the proven `provider`/`npm`/`options` form (the schema also accepts the V2 `providers`/`package`/`settings` form shown in the OpenRouter example above); the agents use V2-native `agents` + `permissions` — `plan` is read-only (`edit` denied), `build` implements, and `default_agent: "plan"` opens each session in planning mode.
+
+### Anthropic (Claude) route — example config
+
+Added in 2.4.0: the route table accepts a `headers` object per route, so the proxy can
+attach the **static headers a provider demands** — the Anthropic Messages API rejects
+requests without `anthropic-version`, and that header has no OpenAI-compatible
+counterpart the proxy could forward, so it is declared in `routes.json` and merged into
+every request along the route.
+
+**Configure in three steps:**
+
+1. **Route + static header** — a ready-made `/anthropic` route ships in the repo's
+   `routes.json` (see above):
+   ```jsonc
+   {
+     "name": "anthropic",
+     "prefix": "/anthropic",                          // activates on /anthropic/...
+     "upstream": "https://api.anthropic.com",
+     "headers": { "anthropic-version": "2023-06-01" } // required by the Anthropic API
+   }
+   ```
+   Only the upstream key is filled **server-side** — `appsettings.Server.json`
+   `Proxy:RouteKeys:ANTHROPIC` (sensitive; see [appsettings.Server.json](#appsettingsserverjson)).
+   The route answers `502` while it is missing; routes hot-reload, no restart needed.
+
+2. **OpenCode provider** — the `anthropic-local` block, exactly as tested (annotated):
+   ```jsonc
+   "anthropic-local": {
+     "name": "Anthropic via proxy",
+     "npm": "@ai-sdk/anthropic",
+     "options": {
+       "baseURL": "https://localhost:4000/anthropic/v1",  // /anthropic route -> Anthropic
+       "apiKey": "",                                      // any value: the proxy ignores x-api-key
+       "headers": {
+         "authorization": "Bearer sk-...your-LocalKey..." // this is what the proxy authenticates
+       }
+     },
+     "models": {
+       "claude-haiku-4-5":  { "name": "Claude Haiku 4.5",  "tool_call": true },
+       "claude-sonnet-4-5": { "name": "Claude Sonnet 4.5", "tool_call": true }
+     }
+   }
+   ```
+   This block is also part of the [global example](#all-routes-one-config--global-example) above.
+
+3. **Test — offline first (free); live only if you accept the cost:**
+
+   - **⚠ Live calls spend Anthropic credits.** The real API bills your Anthropic account
+     (e.g. the $5 trial). Keep live runs opt-in: the integration harness only runs its
+     Claude battery with an explicit `--anthropic` flag (see [below](#integration-harness-black-box-against-the-real-deployed-proxy--ai-router)).
+   - **Free path:** `scripts\mock-anthropic.ps1` is a local mock of the Messages API
+     (`http://127.0.0.1:9999`, SSE + JSON) that enforces the same contract as the real
+     API: `400` when `anthropic-version` is missing, `401` without a Bearer token. To
+     test end-to-end against the mock in a sandbox:
+     1. Change the `anthropic` route's `upstream` to `http://127.0.0.1:9999` (sandbox copy).
+     2. Add a dummy `Proxy:RouteKeys:ANTHROPIC` in the sandbox's `appsettings.Server.json`
+        (sensitive — the route is `502` while it is missing; keep the real value out of repos).
+     3. Run `powershell -ExecutionPolicy Bypass -File .\scripts\mock-anthropic.ps1`.
+     4. Call through the proxy — stream and non-stream, with and without redaction — and check
+        `/admin/endpoints` shows the route `headers` and `/admin/activity` records the route.
+
+   Live call (against the real API — remember the cost):
+   ```powershell
+   curl.exe --ssl-no-revoke https://localhost:4000/anthropic/v1/messages `
+     -H "Authorization: Bearer sk-...your-LocalKey..." `
+     -H "Content-Type: application/json" `
+     -d "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":64,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+   ```
+
+One honest note: the `@ai-sdk/anthropic` package authenticates with the **`x-api-key`**
+header, which the proxy intentionally drops — it only ever accepts **`Authorization:
+Bearer`** (the proxy's own credentials, from `Proxy:RouteKeys:ANTHROPIC`, are what the
+upstream sees). The provider block therefore passes the LocalKey via an explicit
+`authorization` header in `options.headers`, and `apiKey` (sent as `x-api-key` by the
+SDK) is ignored by the proxy — it may be left empty. A plain HTTP client (curl, etc.)
+just uses `Authorization: Bearer <LocalKey>`.
 
 ### Troubleshooting
 
@@ -971,7 +1082,7 @@ limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE pro
 
 ```powershell
 dotnet run --project tests/Unit/RedactorTests.csproj -c Release
-# -> RESULT: 287 PASS, 0 FAIL
+# -> RESULT: 298 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)
@@ -990,12 +1101,16 @@ dotnet run --project tests/Integration/Integration.csproj -c Release `
 Key file flag (`--key-file <path>` or `AIROUTERPROXY_LOCAL_KEY_FILE`) points at a file containing
 only the proxy **LocalKey** (one line). Flags: `--base <url>`, `--skip-paid` (skip token-consuming
 calls), `--brute-force` (10-failure lockout test, LAST - locks the IP ~5 min), `--perf` (performance
-battery: TTFT / total SSE latency per model, small token spend).
+battery: TTFT / total SSE latency per model, small token spend), `--anthropic` (Claude live battery
+— **⚠ consumes Anthropic account credits**; opt-in, combined with `--skip-paid` it is ignored).
 
 What it verifies: health/auth (401 vs 200), `/admin` never leaks the key (payload + activity +
 refusals + logs), malformed/oversized requests blocked upstream-free (400/415/405+Allow/404/413),
 real forward + SSE streaming, redaction observability (`redacted>0` in activity), rate limit
-(429 + `Retry-After >= 1`).
+(429 + `Retry-After >= 1`); with `--anthropic`, the real Claude route: the redaction notice is
+delivered as a `content_block_delta` **before** `content_block_stop` on the stream (so
+`@ai-sdk/anthropic` renders it), the fake key never reaches the response, and the non-stream
+JSON carries the appended notice + `X-AIRouter-Redacted: 1`.
 
 > Note: the `Allow` response header is an **entity header** - `HttpClient` exposes it under
 > `resp.Content.Headers`, so the harness reads it from both the response and the content headers.

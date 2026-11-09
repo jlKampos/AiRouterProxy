@@ -15,6 +15,7 @@
     <Compile Include="..\..\src\AiRouterProxy\Observability\NoticeInjector.cs" Link="NoticeInjector.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\RouteResolver.cs" Link="RouteResolver.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\ProxyOptions.cs" Link="ProxyOptions.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Routing\RouteHeaders.cs" Link="Routing\RouteHeaders.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Policies\InspectionPolicy.cs" Link="InspectionPolicy.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Detection\SecretDetector.cs" Link="SecretDetector.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\ConfigPaths.cs" Link="ConfigPaths.cs" />
