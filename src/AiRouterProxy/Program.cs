@@ -132,6 +132,7 @@ app.MapGet("/admin/endpoints", (IOptionsMonitor<ProxyOptions> opts) =>
             active = key is not null,
             allowedPaths = r.AllowedPaths.Count > 0 ? r.AllowedPaths : new List<string> { "*" },
             requestTimeoutMs = r.RequestTimeoutMs > 0 ? r.RequestTimeoutMs : o.RequestTimeoutMs,
+            maxBodySize = RouteResolver.EffectiveMaxBodySize(r, o.MaxBodySize),
             headers = r.Headers,
         };
     }).ToArray();

@@ -36,6 +36,11 @@
           "/v1/*"
         ],
         "requestTimeoutMs": 300000,
+        // 128 MB cap, Anthropic route: each in-flight request buffers the whole body up to this
+        // limit (read + parse + re-serialization ≈ up to ~4x the size); 128 MB x N concurrent
+        // requests can weigh on the process memory - keep it aligned with the largest legitimate
+        // body and the expected concurrency. 0/omission = inherits Proxy.MaxBodySize (20 MB).
+        "maxBodySize": 134217728,
         "headers": {
           "anthropic-version": "2023-06-01"
         }

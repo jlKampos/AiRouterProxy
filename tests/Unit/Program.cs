@@ -45,6 +45,7 @@ class Program
         TestRouting();
         TestInspectionPolicy();
         TestRouteHeaders();
+        TestRouteMaxBodySize();
         Console.WriteLine();
         Console.WriteLine($"RESULT: {_passed} PASS, {_failed} FAIL");
         Environment.ExitCode = _failed == 0 ? 0 : 1;
@@ -77,6 +78,32 @@ class Program
         RouteHeaders.Apply(none, null);
         RouteHeaders.Apply(none, new Dictionary<string, string>());
         CheckTrue("route headers null/empty no-op", () => none.Headers.Count() == 0);
+    }
+
+    static void TestRouteMaxBodySize()
+    {
+        const long global = 20 * 1024 * 1024;   // Proxy.MaxBodySize default
+        const long anthropic = 134217728;       // 128 MB - routes.json "maxBodySize" on /anthropic
+
+        // Legacy mode (null route) always uses the global value.
+        CheckTrue("maxBodySize legacy null uses global",
+            () => RouteResolver.EffectiveMaxBodySize(null, global) == global);
+
+        // Route without an explicit value (0) inherits the global Proxy.MaxBodySize.
+        var inherits = new RouteOptions();
+        CheckTrue("maxBodySize default zero",
+            () => inherits.MaxBodySize == 0
+                  && RouteResolver.EffectiveMaxBodySize(inherits, global) == global);
+
+        // Route with an explicit maxBodySize uses its own value.
+        var explicitRoute = new RouteOptions { MaxBodySize = anthropic };
+        CheckTrue("maxBodySize route explicit 128MB",
+            () => RouteResolver.EffectiveMaxBodySize(explicitRoute, global) == anthropic);
+
+        // Global only kicks in when the route has none - no cross-contamination.
+        var small = new RouteOptions { MaxBodySize = 1 * 1024 * 1024 };
+        CheckTrue("maxBodySize route smaller than global honored",
+            () => RouteResolver.EffectiveMaxBodySize(small, global) == 1 * 1024 * 1024);
     }
 
     static void TestFormats()

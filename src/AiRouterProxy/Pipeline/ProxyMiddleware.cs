@@ -15,7 +15,16 @@ public sealed class ProxyMiddleware
     private readonly RateLimiter _rateLimiter;
 
     private static readonly string[] HeadersToForward =
-        { "content-type", "cache-control", "retry-after", "x-request-id" };
+        { "content-type", "cache-control", "retry-after", "x-request-id",
+          "request-id", "anthropic-organization-id", "anthropic-workspace-id",
+          "anthropic-ratelimit-requests-limit", "anthropic-ratelimit-requests-remaining",
+          "anthropic-ratelimit-requests-reset",
+          "anthropic-ratelimit-input-tokens-limit", "anthropic-ratelimit-input-tokens-remaining",
+          "anthropic-ratelimit-input-tokens-reset",
+          "anthropic-ratelimit-output-tokens-limit", "anthropic-ratelimit-output-tokens-remaining",
+          "anthropic-ratelimit-output-tokens-reset",
+          "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining",
+          "anthropic-ratelimit-tokens-reset" };
 
     public ProxyMiddleware(
         RequestDelegate _next,
@@ -145,6 +154,7 @@ public sealed class ProxyMiddleware
         string upstreamPath;
         string upstreamKey;
         int requestTimeoutMs;
+        long maxBodySize;
 
         if (options.Routes is { Count: > 0 })
         {
@@ -175,6 +185,7 @@ public sealed class ProxyMiddleware
             requestTimeoutMs = resolved.Route.RequestTimeoutMs > 0
                 ? resolved.Route.RequestTimeoutMs
                 : options.RequestTimeoutMs;
+            maxBodySize = RouteResolver.EffectiveMaxBodySize(resolved.Route, options.MaxBodySize);
 
             if (!RouteResolver.IsPathAllowed(resolved.Route.AllowedPaths, upstreamPath))            {
                 finalStatus = StatusCodes.Status404NotFound;
@@ -191,6 +202,7 @@ public sealed class ProxyMiddleware
             upstreamPath = pathname;
             upstreamKey = options.Keys.UpstreamKey ?? string.Empty;
             requestTimeoutMs = options.RequestTimeoutMs;
+            maxBodySize = options.MaxBodySize;
 
             if (!options.AllowedPaths.Contains(pathname))
             {
@@ -227,8 +239,10 @@ public sealed class ProxyMiddleware
 
             try
             {
+                // Per-route cap (routes.json "maxBodySize") with global fallback in legacy mode;
+                // the whole body is buffered up to this limit before inspection/redaction.
                 bodyBytes = await ReadBodyWithLimitAsync(
-                    context.Request.Body, options.MaxBodySize, context.RequestAborted);
+                    context.Request.Body, maxBodySize, context.RequestAborted);
 
                 if (bodyBytes.Length > 0
                     && InspectionPolicy.IsJson(context.Request.ContentType))
