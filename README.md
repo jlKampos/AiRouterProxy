@@ -2,7 +2,7 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.4.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.5.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
 
 ☕ Found this useful? [**Support the project**](https://buymeacoffee.com/jlkampos) with a coffee — every cup keeps the redaction growing.
 
@@ -152,7 +152,7 @@ AiRouterProxy/
 |       `-- Properties/launchSettings.json
 |-- tests/
 |   |-- Unit/                      # offline unit harness (compiles the app sources directly)
-|   |   |-- Program.cs             #   no framework - 287 PASS
+|   |   |-- Program.cs             #   no framework - 302 PASS
 |   |   `-- RedactorTests.csproj
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- scripts/
@@ -298,6 +298,7 @@ and the route key is selected by `keyRef`:
         "keyRef": "ANTHROPIC",                        // uses Proxy:RouteKeys:ANTHROPIC
         "allowedPaths": ["/v1/*"],
         "requestTimeoutMs": 300000,
+        "maxBodySize": 134217728,                     // 128 MB (routes.json "maxBodySize"); 0/omission = Proxy.MaxBodySize (20 MB)
         "headers": {                                  // static headers merged into every request
           "anthropic-version": "2023-06-01"           // required by the Anthropic API
         }
@@ -317,6 +318,17 @@ Rules:
 - `prefix` must start with `/` and match on a **segment boundary** (`/openrouter` does not match `/openrouterX`).
 - `allowedPaths` matches the path **after** prefix removal; supports a trailing `*`.
 - A route whose key is missing is **inactive** (returns 502, not a proxy crash).
+- `maxBodySize` (optional, bytes) is the route's own request-body cap: requests larger than it
+  are rejected with **413** before anything is forwarded. `0` (or omitted) inherits the global
+  `Proxy:MaxBodySize` (default 20 MB) - use it to raise the cap for routes that legitimately
+  carry large payloads (e.g. `"maxBodySize": 134217728` = 128 MB on the `/anthropic` route).
+  Hot reload applies (edit `routes.json`, no restart).
+  **Memory trade-off:** every in-flight request is fully buffered up to the route cap
+  (read + parse + re-serialization ≈ up to ~4x the body size), so size the value for the
+  largest legitimate body and the number of concurrent requests - e.g. 128 MB × N simultaneous
+  requests consumes roughly ~0.5-1 GB transient per request. Local auth + rate-limit run
+  **before** the buffer is allocated, so the exposure is limited to whoever already holds a
+  local key.
 - `headers` (optional) adds **static headers** to every request forwarded along the route — e.g. the `anthropic-version` header the Anthropic API requires. Reserved headers the proxy sets itself (`Authorization`, `Content-Type`, `Accept`, ...) are **never overridden** — the proxy's credentials and content framing always win. Supports hot reload (edit `routes.json`, no restart).
 
 ### redaction.json
@@ -1436,6 +1448,21 @@ upstream sees). The provider block therefore passes the LocalKey via an explicit
 SDK) is ignored by the proxy — it may be left empty. A plain HTTP client (curl, etc.)
 just uses `Authorization: Bearer <LocalKey>`.
 
+**Response-header parity** — the proxy re-forwards `request-id`,
+`anthropic-organization-id`, `anthropic-workspace-id` and the `anthropic-ratelimit-*`
+headers (`-requests-limit/-requests-remaining/-requests-reset`,
+`-tokens-limit/-tokens-remaining/-tokens-reset`) from every upstream response, next to
+the usual `content-type`/`cache-control`/`retry-after`/`x-request-id`. Client-sent
+`anthropic-beta`, `anthropic-workspace-id` and `x-api-key` are **ignored by design**
+(the proxy never forwards client credentials or beta flags) — declare the route's static
+`headers` in `routes.json` instead.
+
+**API-surface limitations** — the **Message Batches API is supported** (batch requests
+are JSON, so they are inspected and redacted like any other body; results are fetched
+with `GET`). The **Files API is not supported**: file uploads are `multipart`/non-JSON,
+which the fail-closed inspection rejects with **415**, and `DELETE` is refused with
+**405 + `Allow: GET, POST`** (the proxy only forwards `GET` and `POST`).
+
 ### Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -1457,7 +1484,7 @@ limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE pro
 
 ```powershell
 dotnet run --project tests/Unit/RedactorTests.csproj -c Release
-# -> RESULT: 298 PASS, 0 FAIL
+# -> RESULT: 302 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)

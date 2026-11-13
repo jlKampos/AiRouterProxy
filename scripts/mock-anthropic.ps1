@@ -10,6 +10,9 @@
   Enforces the same contract the real API does:
     - 400 when the "anthropic-version" header is missing (proves the proxy forwards it)
     - 401 when "Authorization: Bearer" is missing/empty (proves the proxy injects the route key)
+  Responses carry representative `request-id` + `anthropic-ratelimit-*` headers
+  (requests / input-tokens / output-tokens / tokens × limit-remaining-reset) so the proxy's
+  response-header forwarding (HeadersToForward) can be verified offline, without a real account.
   Logs what arrived (version header, model, stream flag, redaction mask) so the proxy
   plumbing can be verified end to end.
 
@@ -33,7 +36,25 @@ catch {
     exit 1
 }
 
+function Set-RateLimitHeaders([System.Net.HttpListenerResponse]$response) {
+    $reset = "2026-11-13T10:00:00Z"   # fixed representative timestamp (ISO 8601, like the real API)
+    $response.Headers.Add("request-id", "req_mock_0001")
+    $response.Headers.Add("anthropic-ratelimit-requests-limit", "100")
+    $response.Headers.Add("anthropic-ratelimit-requests-remaining", "99")
+    $response.Headers.Add("anthropic-ratelimit-requests-reset", $reset)
+    $response.Headers.Add("anthropic-ratelimit-input-tokens-limit", "111000")
+    $response.Headers.Add("anthropic-ratelimit-input-tokens-remaining", "110900")
+    $response.Headers.Add("anthropic-ratelimit-input-tokens-reset", $reset)
+    $response.Headers.Add("anthropic-ratelimit-output-tokens-limit", "111000")
+    $response.Headers.Add("anthropic-ratelimit-output-tokens-remaining", "110950")
+    $response.Headers.Add("anthropic-ratelimit-output-tokens-reset", $reset)
+    $response.Headers.Add("anthropic-ratelimit-tokens-limit", "222000")
+    $response.Headers.Add("anthropic-ratelimit-tokens-remaining", "221850")
+    $response.Headers.Add("anthropic-ratelimit-tokens-reset", $reset)
+}
+
 function Send-Json([System.Net.HttpListenerResponse]$response, [int]$status, [object]$payload) {
+    Set-RateLimitHeaders $response
     $bytes = [System.Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 20 -Compress))
     $response.StatusCode = $status
     $response.ContentType = "application/json; charset=utf-8"
@@ -43,6 +64,7 @@ function Send-Json([System.Net.HttpListenerResponse]$response, [int]$status, [ob
 }
 
 function Send-Sse([System.Net.HttpListenerResponse]$response, [string]$model) {
+    Set-RateLimitHeaders $response
     $events = @()
 
     $events += "event: message_start" + "`n" + "data: " + (@{

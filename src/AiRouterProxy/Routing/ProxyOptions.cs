@@ -74,6 +74,9 @@ public sealed class RouteOptions
     /// <summary>Route-specific timeout (ms). 0 = inherits Proxy.RequestTimeoutMs.</summary>
     public int RequestTimeoutMs { get; set; }
 
+    /// <summary>Route-specific max request body size (bytes). 0 = inherits Proxy.MaxBodySize.</summary>
+    public long MaxBodySize { get; set; }
+
     /// <summary>
     /// Static headers merged into every request forwarded along this route
     /// (e.g. the "anthropic-version" header the Anthropic API requires).

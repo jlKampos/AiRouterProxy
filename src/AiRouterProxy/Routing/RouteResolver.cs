@@ -134,4 +134,12 @@ public static class RouteResolver
 
         return false;
     }
+
+    /// <summary>
+    /// Effective max request body size for a route: the route's own value when it
+    /// is &gt; 0 (routes.json "maxBodySize"), otherwise the global Proxy.MaxBodySize.
+    /// Null route (legacy mode) always uses the global value.
+    /// </summary>
+    public static long EffectiveMaxBodySize(RouteOptions? route, long globalMax)
+        => route is { MaxBodySize: > 0 } ? route.MaxBodySize : globalMax;
 }
