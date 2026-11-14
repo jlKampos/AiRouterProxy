@@ -1059,79 +1059,371 @@ a remote MCP server, the three providers and a full team of specialized agents
         ]
     },
     "permissions": [
-        { "action": "*", "resource": "*", "effect": "allow" },
-        { "action": "read", "resource": "**/appsettings*.json", "effect": "deny" },
-        { "action": "read", "resource": "**/secrets.json", "effect": "deny" },
-        { "action": "read", "resource": "**/credentials.json", "effect": "deny" },
-        { "action": "read", "resource": "**/.env*", "effect": "deny" },
-        { "action": "read", "resource": "**/*.pem", "effect": "deny" },
-        { "action": "read", "resource": "**/*.key", "effect": "deny" },
-        { "action": "read", "resource": "**/*.crt", "effect": "deny" },
-        { "action": "read", "resource": "**/*.cer", "effect": "deny" },
-        { "action": "read", "resource": "**/*.p12", "effect": "deny" },
-        { "action": "read", "resource": "**/*.pfx", "effect": "deny" },
-        { "action": "read", "resource": "**/*.jks", "effect": "deny" },
-        { "action": "read", "resource": "**/*.keystore", "effect": "deny" },
-        { "action": "read", "resource": "**/connectionstrings.config", "effect": "deny" },
-        { "action": "read", "resource": "**/bin/**", "effect": "deny" },
-        { "action": "read", "resource": "**/obj/**", "effect": "deny" },
-        { "action": "read", "resource": "**/node_modules/**", "effect": "deny" },
-        { "action": "read", "resource": "**/logs/**", "effect": "deny" },
-        { "action": "read", "resource": "**/Logs/**", "effect": "deny" },
-        { "action": "read", "resource": "**/Properties/PublishProfiles/**", "effect": "deny" },
-        { "action": "read", "resource": "**/google-services.json", "effect": "deny" },
-        { "action": "read", "resource": "**/GoogleService-Info.plist", "effect": "deny" },
-        { "action": "read", "resource": "**/cloud_services_config.json", "effect": "deny" },
-        { "action": "read", "resource": "**/firebase*.json", "effect": "deny" },
-        { "action": "read", "resource": "**/LOCAL_KEY.txt", "effect": "deny" },
-        { "action": "read", "resource": "**/.microsoft/usersecrets/**", "effect": "deny" },
-        { "action": "read", "resource": "**/deploy/**", "effect": "deny" },
-        { "action": "read", "resource": "**/publish-tmp/**", "effect": "deny" },
-        { "action": "read", "resource": "**/*.bak", "effect": "deny" },
-        { "action": "edit", "resource": "**/appsettings*.json", "effect": "deny" },
-        { "action": "edit", "resource": "**/secrets.json", "effect": "deny" },
-        { "action": "edit", "resource": "**/credentials.json", "effect": "deny" },
-        { "action": "edit", "resource": "**/.env*", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.pem", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.key", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.crt", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.cer", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.p12", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.pfx", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.jks", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.keystore", "effect": "deny" },
-        { "action": "edit", "resource": "**/connectionstrings.config", "effect": "deny" },
-        { "action": "edit", "resource": "**/google-services.json", "effect": "deny" },
-        { "action": "edit", "resource": "**/GoogleService-Info.plist", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.Designer.cs", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.resx", "effect": "deny" },
-        { "action": "edit", "resource": "**/bin/**", "effect": "deny" },
-        { "action": "edit", "resource": "**/obj/**", "effect": "deny" },
-        { "action": "edit", "resource": "**/Properties/PublishProfiles/**", "effect": "deny" },
-        { "action": "edit", "resource": "**/cloud_services_config.json", "effect": "deny" },
-        { "action": "edit", "resource": "**/firebase*.json", "effect": "deny" },
-        { "action": "edit", "resource": "**/LOCAL_KEY.txt", "effect": "deny" },
-        { "action": "edit", "resource": "**/.microsoft/usersecrets/**", "effect": "deny" },
-        { "action": "edit", "resource": "**/deploy/**", "effect": "deny" },
-        { "action": "edit", "resource": "**/publish-tmp/**", "effect": "deny" },
-        { "action": "edit", "resource": "**/*.bak", "effect": "deny" },
-        { "action": "shell", "resource": "*", "effect": "ask" },
-        { "action": "shell", "resource": "git status *", "effect": "allow" },
-        { "action": "shell", "resource": "git diff *", "effect": "allow" },
-        { "action": "shell", "resource": "git log *", "effect": "allow" },
-        { "action": "shell", "resource": "git branch *", "effect": "allow" },
-        { "action": "shell", "resource": "git show *", "effect": "allow" },
-        { "action": "shell", "resource": "git push *", "effect": "deny" },
-        { "action": "shell", "resource": "git fetch *", "effect": "deny" },
-        { "action": "shell", "resource": "*sqlcmd*", "effect": "deny" },
-        { "action": "shell", "resource": "*sqlplus*", "effect": "deny" },
-        { "action": "shell", "resource": "*sqsh*", "effect": "deny" },
-        { "action": "shell", "resource": "*psql*", "effect": "deny" },
-        { "action": "shell", "resource": "*Invoke-Sqlcmd*", "effect": "deny" },
-        { "action": "shell", "resource": "*mysql*", "effect": "deny" },
-        { "action": "shell", "resource": "*sqlite3*", "effect": "deny" },
-        { "action": "shell", "resource": "*mongosh*", "effect": "deny" },
-        { "action": "external_directory", "resource": "*", "effect": "ask" }
+        {
+            "action": "*",
+            "resource": "*",
+            "effect": "allow"
+        },
+        {
+            "action": "read",
+            "resource": "**/appsettings*.json",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/secrets.json",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/credentials.json",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/.env*",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.pem",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.key",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.crt",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.cer",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.p12",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.pfx",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.jks",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.keystore",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/connectionstrings.config",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/bin/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/obj/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/node_modules/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/logs/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/Logs/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/Properties/PublishProfiles/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/google-services.json",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/GoogleService-Info.plist",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/cloud_services_config.json",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/firebase*.json",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/LOCAL_KEY.txt",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/.microsoft/usersecrets/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/deploy/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/publish-tmp/**",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.bak",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/appsettings*.json",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/secrets.json",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/credentials.json",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/.env*",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.pem",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.key",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.crt",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.cer",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.p12",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.pfx",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.jks",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.keystore",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/connectionstrings.config",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/google-services.json",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/GoogleService-Info.plist",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.Designer.cs",
+            "effect": "allow"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.resx",
+            "effect": "allow"
+        },
+        {
+            "action": "edit",
+            "resource": "**/bin/**",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/obj/**",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/Properties/PublishProfiles/**",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/cloud_services_config.json",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/firebase*.json",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/LOCAL_KEY.txt",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/.microsoft/usersecrets/**",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/deploy/**",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/publish-tmp/**",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.bak",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*",
+            "effect": "ask"
+        },
+        {
+            "action": "shell",
+            "resource": "git status *",
+            "effect": "allow"
+        },
+        {
+            "action": "shell",
+            "resource": "git diff *",
+            "effect": "allow"
+        },
+        {
+            "action": "shell",
+            "resource": "git log *",
+            "effect": "allow"
+        },
+        {
+            "action": "shell",
+            "resource": "git branch *",
+            "effect": "allow"
+        },
+        {
+            "action": "shell",
+            "resource": "git show *",
+            "effect": "allow"
+        },
+        {
+            "action": "shell",
+            "resource": "git push *",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "git fetch *",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*sqlcmd*",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*sqlplus*",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*sqsh*",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*psql*",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*Invoke-Sqlcmd*",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*mysql*",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*sqlite3*",
+            "effect": "deny"
+        },
+        {
+            "action": "shell",
+            "resource": "*mongosh*",
+            "effect": "deny"
+        },
+        {
+            "action": "external_directory",
+            "resource": "*",
+            "effect": "ask"
+        }
     ],
     "mcp": {
         "servers": {
@@ -1154,9 +1446,16 @@ a remote MCP server, the three providers and a full team of specialized agents
                     "name": "Qwen3.8 (local)",
                     "capabilities": {
                         "tools": true,
-                        "input": ["text", "image"],
-                        "output": ["text"],
-                        "reasoning": { "supported": true }
+                        "input": [
+                            "text",
+                            "image"
+                        ],
+                        "output": [
+                            "text"
+                        ],
+                        "reasoning": {
+                            "supported": true
+                        }
                     },
                     "limit": {
                         "context": 262144,
@@ -1173,19 +1472,46 @@ a remote MCP server, the three providers and a full team of specialized agents
                         "repetitionPenalty": 1.0
                     },
                     "variants": [
-                        { "id": "none", "settings": { "reasoningEffort": "none" } },
-                        { "id": "low", "settings": { "reasoningEffort": "low" } },
-                        { "id": "medium", "settings": { "reasoningEffort": "medium" } },
-                        { "id": "xhigh", "settings": { "reasoningEffort": "xhigh" } }
+                        {
+                            "id": "none",
+                            "settings": {
+                                "reasoningEffort": "none"
+                            }
+                        },
+                        {
+                            "id": "low",
+                            "settings": {
+                                "reasoningEffort": "low"
+                            }
+                        },
+                        {
+                            "id": "medium",
+                            "settings": {
+                                "reasoningEffort": "medium"
+                            }
+                        },
+                        {
+                            "id": "xhigh",
+                            "settings": {
+                                "reasoningEffort": "xhigh"
+                            }
+                        }
                     ]
                 },
                 "DeepSeek-V4-Flash": {
                     "name": "DeepSeek-V4-Flash (local)",
                     "capabilities": {
                         "tools": true,
-                        "input": ["text", "image"],
-                        "output": ["text"],
-                        "reasoning": { "supported": true }
+                        "input": [
+                            "text",
+                            "image"
+                        ],
+                        "output": [
+                            "text"
+                        ],
+                        "reasoning": {
+                            "supported": true
+                        }
                     },
                     "limit": {
                         "context": 262144,
@@ -1198,12 +1524,42 @@ a remote MCP server, the three providers and a full team of specialized agents
                         "reasoningSummary": "auto"
                     },
                     "variants": [
-                        { "id": "none", "settings": { "reasoningEffort": "none" } },
-                        { "id": "minimal", "settings": { "reasoningEffort": "minimal" } },
-                        { "id": "low", "settings": { "reasoningEffort": "low" } },
-                        { "id": "medium", "settings": { "reasoningEffort": "medium" } },
-                        { "id": "high", "settings": { "reasoningEffort": "high" } },
-                        { "id": "xhigh", "settings": { "reasoningEffort": "xhigh" } }
+                        {
+                            "id": "none",
+                            "settings": {
+                                "reasoningEffort": "none"
+                            }
+                        },
+                        {
+                            "id": "minimal",
+                            "settings": {
+                                "reasoningEffort": "minimal"
+                            }
+                        },
+                        {
+                            "id": "low",
+                            "settings": {
+                                "reasoningEffort": "low"
+                            }
+                        },
+                        {
+                            "id": "medium",
+                            "settings": {
+                                "reasoningEffort": "medium"
+                            }
+                        },
+                        {
+                            "id": "high",
+                            "settings": {
+                                "reasoningEffort": "high"
+                            }
+                        },
+                        {
+                            "id": "xhigh",
+                            "settings": {
+                                "reasoningEffort": "xhigh"
+                            }
+                        }
                     ]
                 }
             }
@@ -1218,7 +1574,9 @@ a remote MCP server, the three providers and a full team of specialized agents
             "models": {
                 "deepseek/deepseek-v4-flash-0731": {
                     "name": "DeepSeek V4 Flash 0731",
-                    "capabilities": { "tools": true }
+                    "capabilities": {
+                        "tools": true
+                    }
                 }
             }
         },
@@ -1246,52 +1604,130 @@ a remote MCP server, the three providers and a full team of specialized agents
     "default_agent": "orchestrator",
     "agents": {
         "orchestrator": {
-            "description": "Primary agent that coordinates research, solution design, planning, implementation, and review.",
+            "description": "Primary agent that coordinates research, solution design, planning, implementation, and review. Requires explicit user approval before implementation.",
             "mode": "primary",
-            "model": "airouter/DeepSeek-V4-Flash",
-            "system": "You are a senior software architect and the project's main orchestrator.\n\nObjective:\nCoordinate the work and delegate each phase to the appropriate specialized agent. Don't do all the work alone when delegation adds value.\n\nFlow:\n1. Clarify requirements only when there is blocking ambiguity.\n2. Use Explore to investigate the code and identify existing patterns.\n3. Use Brainstorm to compare approaches when there are architectural decisions or more than one reasonable solution.\n4. Use Plan to structure complex changes.\n5. Use Build to implement.\n6. Use Reviewer to review the implementation.\n7. Consolidate the results, tests, limitations, and decisions for the user.\n\nRules:\n- Don't invent files, APIs, test results, or capabilities.\n- Before proposing changes, consider the existing architecture and conventions.\n- For small tasks, avoid unnecessary delegation.\n- Don't ask every agent to do the same analysis.\n- Don't bypass permissions or read protected files.\n- Don't run destructive operations, deploys, commits, pushes, infrastructure changes, or SQL commands without explicit approval.\n- If the review finds issues, route fixes to Build and request review again.\n- Respond in European Portuguese unless instructed otherwise.\n- At the end, present a summary, changed files, tests run, and risks/pending items.",
+            "model": "airouter/DeepSeek-V4-Flash#xhigh",
+            "system": "You are a senior software architect and the project's main orchestrator.\n\nObjective:\nCoordinate the work and delegate each phase to the appropriate specialized agent. Don't do all the work alone when delegation adds value.\n\nFlow:\n1. Clarify requirements only when there is blocking ambiguity.\n2. Use Explore to investigate the code and identify existing patterns.\n3. Use Brainstorm to compare approaches when there are architectural decisions or more than one reasonable solution.\n4. Use Plan to structure complex changes.\n5. Present the complete implementation plan to the user.\n6. STOP and wait for explicit user approval.\n7. Only after approval, invoke Build to implement the approved plan.\n8. Use Reviewer to review the implementation.\n9. If the review finds issues, route fixes to Build and request review again.\n10. Consolidate the results, tests, limitations, and decisions for the user.\n\nMANDATORY HUMAN APPROVAL:\n- NEVER invoke Build before presenting the implementation plan to the user.\n- NEVER implement changes immediately after planning.\n- Present the problem analysis, proposed solution, affected files, implementation steps, risks and tests.\n- Explicitly ask the user whether they approve the plan.\n- WAIT for the user's response.\n- If the user requests modifications, update the plan and ask again.\n- If the user rejects the plan, do not implement it.\n- Silence or ambiguous responses are not approval.\n- Once approved, implement only the approved plan.\n- If significant changes to the approved plan become necessary, stop and request approval again.\n- Approval for one task does not authorize future tasks.\n\nRules:\n- Don't invent files, APIs, test results, or capabilities.\n- Before proposing changes, consider the existing architecture and conventions.\n- For small tasks, avoid unnecessary delegation.\n- Don't ask every agent to do the same analysis.\n- Don't bypass permissions or read protected files.\n- Don't run destructive operations, deploys, commits, pushes, infrastructure changes, or SQL commands without explicit approval.\n- Respond in European Portuguese unless instructed otherwise.\n- At the end, present a summary, changed files, tests run, and risks/pending items.",
             "permissions": [
-                { "action": "edit", "resource": "*", "effect": "deny" },
-                { "action": "shell", "resource": "*", "effect": "allow" },
-                { "action": "subagent", "resource": "*", "effect": "deny" },
-                { "action": "subagent", "resource": "explore", "effect": "allow" },
-                { "action": "subagent", "resource": "brainstorm", "effect": "allow" },
-                { "action": "subagent", "resource": "plan", "effect": "allow" },
-                { "action": "subagent", "resource": "build", "effect": "allow" },
-                { "action": "subagent", "resource": "reviewer", "effect": "allow" }
+                {
+                    "action": "edit",
+                    "resource": "*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*",
+                    "effect": "ask"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "explore",
+                    "effect": "allow"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "brainstorm",
+                    "effect": "allow"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "plan",
+                    "effect": "allow"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "build",
+                    "effect": "ask"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "reviewer",
+                    "effect": "allow"
+                }
             ]
         },
         "explore": {
             "description": "Investigates the codebase, architecture, dependencies, and integration points without changing files.",
             "mode": "all",
-            "model": "airouter/Qwen3.8#medium",
+            "model": "airouter/DeepSeek-V4-Flash#xhigh",
             "system": "You are a senior software engineer specialized in code exploration.\n\nInvestigate the project structure, technologies, dependencies, patterns, classes, interfaces, flows, and integration points relevant to the task.\n\nConstraints:\n- Strictly read-only mode: never create, edit, delete, or apply patches.\n- Don't implement solutions.\n- Don't read secret files or protected configurations.\n- Don't run commands that change the project's state.\n- Use targeted search and reading; avoid dumping huge files unnecessarily.\n\nDeliverables:\n1. Summary of relevant architecture.\n2. Important files and symbols (with paths).\n3. Current behavior.\n4. Dependencies and integrations.\n5. Risks or technical debt.\n6. Factual recommendations for the Orchestrator.\nAlways distinguish observed facts from hypotheses.",
             "permissions": [
-                { "action": "edit", "resource": "*", "effect": "deny" },
-                { "action": "shell", "resource": "*", "effect": "allow" },
-                { "action": "subagent", "resource": "*", "effect": "deny" }
+                {
+                    "action": "edit",
+                    "resource": "*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*",
+                    "effect": "allow"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "*",
+                    "effect": "deny"
+                }
             ]
         },
         "brainstorm": {
             "description": "Generates and compares technical solutions, architectural options, and design patterns without changing code.",
             "mode": "all",
-            "model": "airouter/DeepSeek-V4-Flash",
+            "model": "airouter/DeepSeek-V4-Flash#xhigh",
             "system": "You are a senior software architect specialized in systems design and alternatives analysis.\n\nAnalyze the problem and, when it makes sense, present up to three technically distinct approaches. Consider compatibility with the existing architecture, simplicity, security, performance, scalability, observability, testability, and maintainability.\n\nDon't:\n- change files;\n- implement code in the project;\n- assume requirements that were not provided;\n- recommend dependencies without justifying the cost.\n\nDeliverables:\n1. Interpretation of the problem and assumptions.\n2. Possible options.\n3. Advantages and disadvantages of each option.\n4. Risks and impact.\n5. Well-founded recommendation.\n6. High-level plan for implementation.\nIf there is only one reasonable option, explain why instead of inventing alternatives.",
             "permissions": [
-                { "action": "edit", "resource": "*", "effect": "deny" },
-                { "action": "shell", "resource": "*", "effect": "ask" },
-                { "action": "subagent", "resource": "*", "effect": "deny" }
+                {
+                    "action": "edit",
+                    "resource": "*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*",
+                    "effect": "ask"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "*",
+                    "effect": "deny"
+                }
             ]
         },
         "plan": {
-            "description": "Transforms requirements and research into a phased technical plan without changing code.",
+            "description": "Transforms requirements and research into a phased technical plan without changing application code.",
             "mode": "all",
-            "model": "airouter/DeepSeek-V4-Flash",
+            "model": "airouter/DeepSeek-V4-Flash#xhigh",
             "system": "You are a technical lead responsible for producing clear and verifiable implementation plans.\n\nUse the available requirements and research. Identify dependencies, execution order, likely files, acceptance criteria, tests, and risks.\n\nConstraints:\n- Don't change application files.\n- Don't implement the solution.\n- Don't assume a file or component exists without evidence.\n- Keep the plan proportional to the size of the task.\n\nDeliverables:\n1. Objective and scope.\n2. Technical decisions and assumptions.\n3. Ordered steps.\n4. Components/files to analyze or change.\n5. Acceptance criteria.\n6. Testing strategy.\n7. Risks and rollback, when applicable.",
             "permissions": [
-                { "action": "edit", "resource": "*", "effect": "deny" },
-                { "action": "shell", "resource": "*", "effect": "allow" },
-                { "action": "subagent", "resource": "*", "effect": "deny" }
+                {
+                    "action": "edit",
+                    "resource": "*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*",
+                    "effect": "allow"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "brainstorm",
+                    "effect": "allow"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "explore",
+                    "effect": "allow"
+                }
             ]
         },
         "build": {
@@ -1300,57 +1736,229 @@ a remote MCP server, the three providers and a full team of specialized agents
             "model": "airouter/DeepSeek-V4-Flash",
             "system": "You are a senior software engineer responsible for implementation.\n\nRules:\n- Follow the requirements and the approved plan.\n- Inspect the context before editing.\n- Respect the architecture, conventions, style, and versions already used in the project.\n- Make small, cohesive, necessary changes.\n- Don't introduce dependencies without justification.\n- Don't change generated files, secrets, protected configurations, or out-of-scope files.\n- Don't run deploy, commit, push, destructive operations, or SQL commands.\n- Request approval for shell commands that require it.\n- Run appropriate tests/builds when allowed.\n- Don't claim tests passed if you didn't run them.\n\nAt the end, report:\n1. What was implemented.\n2. Changed files.\n3. Tests/builds run and results.\n4. Limitations, risks, or pending work.",
             "permissions": [
-                { "action": "edit", "resource": "*", "effect": "allow" },
-                { "action": "edit", "resource": "**/appsettings*.json", "effect": "deny" },
-                { "action": "edit", "resource": "**/secrets.json", "effect": "deny" },
-                { "action": "edit", "resource": "**/credentials.json", "effect": "deny" },
-                { "action": "edit", "resource": "**/.env*", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.pem", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.key", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.crt", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.cer", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.p12", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.pfx", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.jks", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.keystore", "effect": "deny" },
-                { "action": "edit", "resource": "**/connectionstrings.config", "effect": "deny" },
-                { "action": "edit", "resource": "**/google-services.json", "effect": "deny" },
-                { "action": "edit", "resource": "**/GoogleService-Info.plist", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.Designer.cs", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.resx", "effect": "deny" },
-                { "action": "edit", "resource": "**/bin/**", "effect": "deny" },
-                { "action": "edit", "resource": "**/obj/**", "effect": "deny" },
-                { "action": "edit", "resource": "**/Properties/PublishProfiles/**", "effect": "deny" },
-                { "action": "edit", "resource": "**/cloud_services_config.json", "effect": "deny" },
-                { "action": "edit", "resource": "**/firebase*.json", "effect": "deny" },
-                { "action": "edit", "resource": "**/LOCAL_KEY.txt", "effect": "deny" },
-                { "action": "edit", "resource": "**/.microsoft/usersecrets/**", "effect": "deny" },
-                { "action": "edit", "resource": "**/deploy/**", "effect": "deny" },
-                { "action": "edit", "resource": "**/publish-tmp/**", "effect": "deny" },
-                { "action": "edit", "resource": "**/*.bak", "effect": "deny" },
-                { "action": "shell", "resource": "*", "effect": "ask" },
-                { "action": "shell", "resource": "git push *", "effect": "deny" },
-                { "action": "shell", "resource": "git fetch *", "effect": "deny" },
-                { "action": "shell", "resource": "*sqlcmd*", "effect": "deny" },
-                { "action": "shell", "resource": "*sqlplus*", "effect": "deny" },
-                { "action": "shell", "resource": "*sqsh*", "effect": "deny" },
-                { "action": "shell", "resource": "*psql*", "effect": "deny" },
-                { "action": "shell", "resource": "*Invoke-Sqlcmd*", "effect": "deny" },
-                { "action": "shell", "resource": "*mysql*", "effect": "deny" },
-                { "action": "shell", "resource": "*sqlite3*", "effect": "deny" },
-                { "action": "shell", "resource": "*mongosh*", "effect": "deny" },
-                { "action": "subagent", "resource": "*", "effect": "deny" }
+                {
+                    "action": "edit",
+                    "resource": "*",
+                    "effect": "allow"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/appsettings*.json",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/secrets.json",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/credentials.json",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/.env*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.pem",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.key",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.crt",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.cer",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.p12",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.pfx",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.jks",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.keystore",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/connectionstrings.config",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/google-services.json",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/GoogleService-Info.plist",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.Designer.cs",
+                    "effect": "allow"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.resx",
+                    "effect": "allow"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/bin/**",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/obj/**",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/Properties/PublishProfiles/**",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/cloud_services_config.json",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/firebase*.json",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/LOCAL_KEY.txt",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/.microsoft/usersecrets/**",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/deploy/**",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/publish-tmp/**",
+                    "effect": "deny"
+                },
+                {
+                    "action": "edit",
+                    "resource": "**/*.bak",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*",
+                    "effect": "ask"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git push *",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git fetch *",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*sqlcmd*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*sqlplus*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*sqsh*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*psql*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*Invoke-Sqlcmd*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*mysql*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*sqlite3*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*mongosh*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "*",
+                    "effect": "deny"
+                }
             ]
         },
         "reviewer": {
             "description": "Reviews changes without modifying them, focusing on bugs, security, performance, and maintainability.",
-            "mode": "subagent",
-            "model": "airouter/DeepSeek-V4-Flash#high",
+            "mode": "all",
+            "model": "airouter/DeepSeek-V4-Flash#xhigh",
             "system": "You are an independent and rigorous code reviewer.\n\nReview the changes against the requirements. Look for bugs, regressions, security issues, insufficient validation, error handling, concurrency, performance, accessibility when applicable, and lack of tests.\n\nConstraints:\n- Read-only: don't change files or apply fixes.\n- Don't flag stylistic preferences as bugs.\n- Don't invent issues without evidence.\n- Prioritize concrete, reproducible issues.\n\nFor each finding, indicate:\n- Severity (critical, high, medium, low).\n- File and location.\n- Issue and impact.\n- Condition under which it occurs.\n- Fix recommendation.\n\nEnd with a conclusion: approved, approved with reservations, or changes required.",
             "permissions": [
-                { "action": "edit", "resource": "*", "effect": "deny" },
-                { "action": "shell", "resource": "*", "effect": "ask" },
-                { "action": "subagent", "resource": "*", "effect": "deny" }
+                {
+                    "action": "edit",
+                    "resource": "*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*",
+                    "effect": "ask"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "*",
+                    "effect": "deny"
+                }
             ]
         }
     }
