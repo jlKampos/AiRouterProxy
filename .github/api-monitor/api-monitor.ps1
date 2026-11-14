@@ -23,10 +23,10 @@
   Simulate: report UNCHANGED / CHANGED (would open issue / no relevant keywords). No writes.
 
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\api-monitor\api-monitor.ps1 -BakeBaseline
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\.github\api-monitor\api-monitor.ps1 -BakeBaseline
 
 .EXAMPLE
-  powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\api-monitor\api-monitor.ps1 -DryRun
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\.github\api-monitor\api-monitor.ps1 -DryRun
 
 .NOTES
   Exit codes:
@@ -393,7 +393,7 @@ function Update-SourceStateGit {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        # the script lives in <repo>\scripts\api-monitor\ -> repo root is TWO levels up
+        # the script lives in <repo>\.github\api-monitor\ -> repo root is TWO levels up
         $repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
         Write-Output ("[api-monitor] repo root: {0}" -f $repoRoot)
         Push-Location $repoRoot
@@ -401,7 +401,7 @@ function Update-SourceStateGit {
             $null = & git config user.name 'github-actions[bot]' 2>&1
             $null = & git config user.email '41898282+github-actions[bot]@users.noreply.github.com' 2>&1
 
-            $null = & git add 'scripts/api-monitor/state.json' 2>&1
+            $null = & git add '.github/api-monitor/state.json' 2>&1
             if ($LASTEXITCODE -ne 0) { throw ("git add failed (exit {0})" -f $LASTEXITCODE) }
 
             # nothing staged (file already identical to HEAD) -> no commit/push needed
