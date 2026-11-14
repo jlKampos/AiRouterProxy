@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "name": "anthropic-release-notes",
+      "provider": "anthropic",
+      "url": "https://docs.claude.com/en/release-notes/api.md",
+      "kind": "markdown",
+      "watch": [
+        { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
+        { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
+        { "pattern": "request size|maximum request|128 MB|32 MB|max_body|maxBodySize|payload", "area": "Body size limits (MaxBodySize)" },
+        { "pattern": "system prompt|tool result|content type|application/json|multipart", "area": "Request inspection / redaction" },
+        { "pattern": "429|503|400|401|error code|slow_down|server_is_overloaded|lockout|backoff", "area": "Rate limiting / error mapping" },
+        { "pattern": "deprecat|breaking|migrat|remov|retired|shut down|endpoint|beta header", "area": "Route config / auth" }
+      ]
+    },
+    {
+      "name": "anthropic-messages-ref",
+      "provider": "anthropic",
+      "url": "https://docs.claude.com/en/api/messages.md",
+      "kind": "markdown",
+      "watch": [
+        { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
+        { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
+        { "pattern": "request size|maximum request|128 MB|32 MB|max_body|maxBodySize|payload", "area": "Body size limits (MaxBodySize)" },
+        { "pattern": "system prompt|tool result|content type|application/json|multipart", "area": "Request inspection / redaction" },
+        { "pattern": "429|503|400|401|error code|slow_down|server_is_overloaded|lockout|backoff", "area": "Rate limiting / error mapping" },
+        { "pattern": "deprecat|breaking|migrat|remov|retired|shut down|endpoint|beta header", "area": "Route config / auth" }
+      ]
+    },
+    {
+      "name": "anthropic-rate-limits",
+      "provider": "anthropic",
+      "url": "https://docs.claude.com/en/api/rate-limits.md",
+      "kind": "markdown",
+      "watch": [
+        { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
+        { "pattern": "429|503|400|401|error code|slow_down|server_is_overloaded|lockout|backoff", "area": "Rate limiting / error mapping" },
+        { "pattern": "request size|maximum request|128 MB|32 MB|max_body|maxBodySize|payload", "area": "Body size limits (MaxBodySize)" }
+      ]
+    },
+    {
+      "name": "openai-changelog",
+      "provider": "openai",
+      "url": "https://platform.openai.com/docs/changelog.md",
+      "kind": "markdown",
+      "watch": [
+        { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
+        { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
+        { "pattern": "request size|maximum request|128 MB|32 MB|max_body|maxBodySize|payload", "area": "Body size limits (MaxBodySize)" },
+        { "pattern": "system prompt|tool result|content type|application/json|multipart", "area": "Request inspection / redaction" },
+        { "pattern": "429|503|400|401|error code|slow_down|server_is_overloaded|lockout|backoff", "area": "Rate limiting / error mapping" },
+        { "pattern": "deprecat|breaking|migrat|remov|retired|shut down|endpoint|beta header", "area": "Route config / auth" }
+      ]
+    },
+    {
+      "name": "openai-deprecations",
+      "provider": "openai",
+      "url": "https://platform.openai.com/docs/deprecations.md",
+      "kind": "markdown",
+      "watch": [
+        { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
+        { "pattern": "429|503|400|401|error code|slow_down|server_is_overloaded|lockout|backoff", "area": "Rate limiting / error mapping" },
+        { "pattern": "deprecat|breaking|migrat|remov|retired|shut down|endpoint|beta header", "area": "Route config / auth" }
+      ]
+    },
+    {
+      "name": "openai-sdk-releases",
+      "provider": "openai",
+      "url": "https://github.com/openai/openai-python/releases.atom",
+      "kind": "atom",
+      "watch": [
+        { "pattern": "deprecat|breaking|remov|renam|migrat", "area": "Route config / auth" },
+        { "pattern": "schema", "area": "Rate limiting / error mapping" }
+      ]
+    },
+    {
+      "name": "anthropic-sdk-releases",
+      "provider": "anthropic",
+      "url": "https://github.com/anthropics/anthropic-sdk-python/releases.atom",
+      "kind": "atom",
+      "watch": [
+        { "pattern": "deprecat|breaking|remov|renam|migrat", "area": "Route config / auth" },
+        { "pattern": "schema", "area": "Rate limiting / error mapping" }
+      ]
+    },
+    {
+      "name": "openrouter-docs",
+      "provider": "openrouter",
+      "url": "https://openrouter.ai/docs/llms-full.txt",
+      "kind": "markdown",
+      "watch": [
+        { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
+        { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
+        { "pattern": "request size|maximum request|128 MB|32 MB|max_body|maxBodySize|payload", "area": "Body size limits (MaxBodySize)" },
+        { "pattern": "system prompt|tool result|content type|application/json|multipart", "area": "Request inspection / redaction" },
+        { "pattern": "429|503|400|401|error code|slow_down|server_is_overloaded|lockout|backoff", "area": "Rate limiting / error mapping" },
+        { "pattern": "deprecat|breaking|migrat|remov|retired|shut down|endpoint|beta header", "area": "Route config / auth" }
+      ]
+    }
+  ]
+}
