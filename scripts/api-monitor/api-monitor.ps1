@@ -173,11 +173,18 @@ function Get-FirstDiffIndex {
 function Test-Keywords {
     # Case-insensitive regex match of the watch patterns against the changed lines
     # (removed AND added), passed in as a single text block.
+    #
+    # A missing/empty "watch" in sources.json arrives here as @($null). Without a
+    # guard the pattern would degrade to '' and '-match ""' would match EVERY
+    # string - opening an issue with an empty area on any change. Null/empty watch
+    # is treated as "no relevant keywords" -> empty match list, the change is
+    # consumed without an issue.
     param([string]$Text, [object[]]$Watch)
     $areas = New-Object System.Collections.Generic.List[string]
     $pats  = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrEmpty($Text)) {
-        foreach ($w in $Watch) {
+    $watchList = @($Watch | Where-Object { $null -ne $_ })
+    if (-not [string]::IsNullOrEmpty($Text) -and $watchList.Count -gt 0) {
+        foreach ($w in $watchList) {
             $re = [string]$w.pattern
             try {
                 if ($Text -match $re) {
@@ -408,13 +415,19 @@ function Update-SourceStateGit {
             $null = & git remote set-url origin ("https://{0}@github.com/{1}.git" -f $env:GH_TOKEN, $env:REPO) 2>&1
             if ($LASTEXITCODE -ne 0) { throw ("git remote set-url failed (exit {0})" -f $LASTEXITCODE) }
 
+            # Each rev-parse exit code is checked: if both fail with the same error
+            # text the old code saw $committed=false and reported "no new commit
+            # produced - nothing to push" even though a local commit might exist.
+            # A failing rev-parse now throws (visible failure, no false state report).
             $headBefore = @(& git rev-parse HEAD 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw ("git rev-parse HEAD failed before commit (exit {0})" -f $LASTEXITCODE) }
             $headBefore = ($headBefore | Out-String).Trim()
             $commitOut = @(& git commit -m 'api-monitor: update state' 2>&1)
             if ($LASTEXITCODE -ne 0) {
                 throw ('git commit failed (exit {0}): {1}' -f $LASTEXITCODE, (($commitOut | Out-String).Trim()))
             }
             $headAfter = @(& git rev-parse HEAD 2>&1)
+            if ($LASTEXITCODE -ne 0) { throw ("git rev-parse HEAD failed after commit (exit {0})" -f $LASTEXITCODE) }
             $headAfter = ($headAfter | Out-String).Trim()
             $committed = (-not [string]::IsNullOrWhiteSpace($headAfter)) -and ($headAfter -ne $headBefore)
 
@@ -710,8 +723,19 @@ foreach ($src in $script:sources) {
 # ---------------------------------------------------------------------------
 # Finalize
 # ---------------------------------------------------------------------------
+# A state-write failure (disk full, locked file, ACL) is a PARTIAL failure: with
+# EAP=Stop it would otherwise kill the script before the RESULT/summary and exit
+# as a "total failure". Tolerate it (documented exit semantics: 0 = ok with
+# partial failures) - report clearly and keep going; the next run re-writes it.
 if (-not $DryRun) {
-    $null = Write-StateFile
+    try {
+        $null = Write-StateFile
+    }
+    catch {
+        $msg = ('ERROR writing state.json: {0}' -f $_.Exception.Message)
+        Write-Warning $msg
+        $script:failures.Add($msg)
+    }
 }
 
 $total = $script:sources.Count
