@@ -170,6 +170,225 @@ function Get-FirstDiffIndex {
     return $n
 }
 
+function Get-SectionKey {
+    # Key used to match a section between snapshots: "<occurrence>::<heading>".
+    # Occurrence is the n-th appearance of the exact heading text, so inserting or
+    # removing one section does NOT re-key every later section (a positional index
+    # would shift and flag the whole tail of the document as changed).
+    param([string]$Heading, [int]$Occurrence)
+    return ("{0}::{1}" -f $Occurrence, $Heading)
+}
+
+function Get-MarkdownSections {
+    # Split normalized markdown lines into sections on heading lines (^#{1,6} ).
+    # The text before the first heading is its own section with Heading='' (the
+    # preamble - never dropped). Each section carries: Index (document order),
+    # Heading (raw heading line, empty for the preamble), Lines (content lines,
+    # heading excluded) and Key (occurrence-based match key, see Get-SectionKey).
+    param([string[]]$Lines)
+    $sections = New-Object System.Collections.Generic.List[object]
+    if ($Lines -and $Lines.Count -gt 0) {
+        $curHeading = ''
+        $curLines = New-Object System.Collections.Generic.List[string]
+        $occCount = @{}
+        foreach ($l in $Lines) {
+            if ($l -match '^#{1,6}\s+') {
+                $occ = 0
+                if ($occCount.ContainsKey($curHeading)) { $occ = $occCount[$curHeading] }
+                $sections.Add([pscustomobject]@{
+                    Index   = $sections.Count
+                    Heading = $curHeading
+                    Lines   = @($curLines)
+                    Key     = (Get-SectionKey -Heading $curHeading -Occurrence $occ)
+                })
+                $occCount[$curHeading] = $occ + 1
+                $curHeading = $l
+                $curLines = New-Object System.Collections.Generic.List[string]
+            }
+            else {
+                $curLines.Add($l)
+            }
+        }
+        # flush the last section
+        $occ = 0
+        if ($occCount.ContainsKey($curHeading)) { $occ = $occCount[$curHeading] }
+        $sections.Add([pscustomobject]@{
+            Index   = $sections.Count
+            Heading = $curHeading
+            Lines   = @($curLines)
+            Key     = (Get-SectionKey -Heading $curHeading -Occurrence $occ)
+        })
+    }
+    return $sections
+}
+
+function Get-SectionText {
+    # Full section text for hashing: the heading line (if any) plus its content.
+    param([object]$Section)
+    $parts = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace([string]$Section.Heading)) { $parts.Add([string]$Section.Heading) }
+    foreach ($l in $Section.Lines) { $parts.Add([string]$l) }
+    return ($parts -join "`n")
+}
+
+function Get-SectionHash {
+    param([object]$Section)
+    return Get-Sha256Hex -Text (Get-SectionText -Section $Section)
+}
+
+function Get-SectionMap {
+    # Lookup table keyed by section Key for fast old/new matching.
+    param([object[]]$Sections)
+    $map = @{}
+    foreach ($s in $Sections) {
+        $map[[string]$s.Key] = $s
+    }
+    return $map
+}
+
+function Get-SaneHeading {
+    # Sanitize a markdown heading for use in an issue title: strip markdown syntax
+    # characters, collapse whitespace, cap at 60 chars. A preamble (no heading) is
+    # reported as (preamble).
+    param([string]$Heading)
+    $h = [string]$Heading
+    if ([string]::IsNullOrWhiteSpace($h)) { return '(preamble)' }
+    $h = [regex]::Replace($h, '[#*_`\[\]()]', '')
+    $h = [regex]::Replace($h, '\s+', ' ').Trim()
+    if ($h.Length -gt 60) {
+        $h = $h.Substring(0, 60).TrimEnd() + '...'
+    }
+    if ([string]::IsNullOrWhiteSpace($h)) { return '(preamble)' }
+    return $h
+}
+
+function Get-MarkdownDiffInfo {
+    # Section-scoped diff for markdown sources (P1). Matches old/new sections by
+    # occurrence-based heading keys, restricts the diff to the changed sections and
+    # reports:
+    #   UseSections - $true when sections give a meaningful scoped diff
+    #   Count       - number of changed sections
+    #   Heading     - sanitized heading of the first changed section ((preamble))
+    #   Snippet     - first changed section: heading + up to 40 content lines
+    #   DiffText    - +/- prefixed lines restricted to the changed sections only
+    # Falls back (UseSections=$false) when the document has no sections, no section
+    # changed, or the changed sections cover >= 90% of the document's lines (a full
+    # page rewrite - the positional diff is the honest answer there).
+    param([string[]]$OldLines, [string[]]$NewLines)
+    $fallback = [pscustomobject]@{ UseSections = $false; Count = 0; Heading = ''; Snippet = ''; DiffText = '' }
+
+    $oldSecs = @(Get-MarkdownSections -Lines $OldLines)
+    $newSecs = @(Get-MarkdownSections -Lines $NewLines)
+    $oldMap = Get-SectionMap -Sections $oldSecs
+    $newMap = Get-SectionMap -Sections $newSecs
+
+    $changed = New-Object System.Collections.Generic.List[object]
+    $changedKeys = @{}
+    foreach ($s in $newSecs) {
+        $key = [string]$s.Key
+        $old = $oldMap[$key]
+        if (($null -eq $old) -or ((Get-SectionHash -Section $s) -ne (Get-SectionHash -Section $old))) {
+            $changed.Add($s)
+            $changedKeys[$key] = $true
+        }
+    }
+    foreach ($s in $oldSecs) {
+        $key = [string]$s.Key
+        if (-not $newMap.ContainsKey($key)) {
+            $changed.Add($s)
+            $changedKeys[$key] = $true
+        }
+    }
+    if ($changed.Count -eq 0) { return $fallback }
+
+    # coverage guard: >= 90% of the document lines belong to changed sections ->
+    # effectively a rewrite of the page -> positional diff
+    $totalLines = [Math]::Max($OldLines.Count, $NewLines.Count)
+    $changedLines = 0
+    foreach ($s in $changed) {
+        $changedLines += @($s.Lines).Count
+        if (-not [string]::IsNullOrWhiteSpace([string]$s.Heading)) { $changedLines++ }
+    }
+    if (($totalLines -gt 0) -and (($changedLines / [double]$totalLines)) -ge 0.9) {
+        return $fallback
+    }
+
+    # diff text: line-level diff INSIDE changed sections (matched pairs), all new
+    # lines for added sections, all old lines for removed sections
+    $diffLines = New-Object System.Collections.Generic.List[string]
+    $handledKeys = @{}
+    foreach ($s in $newSecs) {
+        $key = [string]$s.Key
+        if (-not $changedKeys.ContainsKey($key)) { continue }
+        $handledKeys[$key] = $true
+        $old = $oldMap[$key]
+        if ($null -eq $old) {
+            # added section: every new line
+            if (-not [string]::IsNullOrWhiteSpace([string]$s.Heading)) { $diffLines.Add('+' + [string]$s.Heading) }
+            foreach ($l in $s.Lines) { $diffLines.Add('+' + [string]$l) }
+            continue
+        }
+        # changed section: pairwise diff of its own lines (keeps the keyword text tight)
+        $oldSecLines = @($old.Lines)
+        $newSecLines = @($s.Lines)
+        $maxS = [Math]::Max($oldSecLines.Count, $newSecLines.Count)
+        for ($j = 0; $j -lt $maxS; $j++) {
+            if (($j -lt $oldSecLines.Count) -and ($j -lt $newSecLines.Count) -and ($oldSecLines[$j] -eq $newSecLines[$j])) { continue }
+            if ($j -lt $oldSecLines.Count) { $diffLines.Add('-' + [string]$oldSecLines[$j]) }
+            if ($j -lt $newSecLines.Count) { $diffLines.Add('+' + [string]$newSecLines[$j]) }
+        }
+    }
+    foreach ($s in $oldSecs) {
+        $key = [string]$s.Key
+        if ($handledKeys.ContainsKey($key)) { continue }
+        if (-not $changedKeys.ContainsKey($key)) { continue }
+        # removed section: every old line
+        if (-not [string]::IsNullOrWhiteSpace([string]$s.Heading)) { $diffLines.Add('-' + [string]$s.Heading) }
+        foreach ($l in $s.Lines) { $diffLines.Add('-' + [string]$l) }
+    }
+
+    # snippet: first changed section (heading + up to 40 content lines) plus notes
+    $first = $changed[0]
+    $firstRemoved = -not $newMap.ContainsKey([string]$first.Key)
+    $snipLines = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrWhiteSpace([string]$first.Heading)) { $snipLines.Add([string]$first.Heading) }
+    $firstBody = @($first.Lines)
+    $headCount = $snipLines.Count
+    $take = [Math]::Min(40 - $headCount, $firstBody.Count)
+    for ($k = 0; $k -lt $take; $k++) { $snipLines.Add([string]$firstBody[$k]) }
+    if ($firstRemoved) {
+        $snipLines.Add('(section removed from the source)')
+    }
+    elseif ($changed.Count -gt 1) {
+        $snipLines.Add(('... (truncated: {0} sections changed - snippet shows the first)' -f $changed.Count))
+    }
+    elseif ($firstBody.Count -gt $take) {
+        $snipLines.Add('... (truncated)')
+    }
+    $snippet = ($snipLines -join "`n")
+    if ([string]::IsNullOrWhiteSpace($snippet)) { $snippet = '(section changed - see source link)' }
+
+    return [pscustomobject]@{
+        UseSections = $true
+        Count       = $changed.Count
+        Heading     = Get-SaneHeading -Heading ([string]$first.Heading)
+        Snippet     = $snippet
+        DiffText    = ($diffLines -join "`n")
+    }
+}
+
+function Split-PatternAlternatives {
+    # Split a watch pattern into individual sub-patterns on '|' when it is safe to
+    # do so (no escaped pipe, no capture/non-capture groups). Ambiguous patterns
+    # stay whole - the full group is the keyword entry in that case.
+    param([string]$Pattern)
+    if ([string]::IsNullOrWhiteSpace($Pattern)) { return @() }
+    if ($Pattern.Contains('\|') -or $Pattern.Contains('(')) { return @($Pattern) }
+    $subs = @($Pattern -split '\|' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($subs.Count -lt 2) { return @($Pattern) }
+    return @($subs)
+}
+
 function Test-Keywords {
     # Case-insensitive regex match of the watch patterns against the changed lines
     # (removed AND added), passed in as a single text block.
@@ -182,15 +401,29 @@ function Test-Keywords {
     param([string]$Text, [object[]]$Watch)
     $areas = New-Object System.Collections.Generic.List[string]
     $pats  = New-Object System.Collections.Generic.List[string]
+    $ctxs  = New-Object System.Collections.Generic.List[string]
     $watchList = @($Watch | Where-Object { $null -ne $_ })
     if (-not [string]::IsNullOrEmpty($Text) -and $watchList.Count -gt 0) {
+        $diffLines = @(Get-TextLines -Text $Text)
         foreach ($w in $watchList) {
             $re = [string]$w.pattern
             try {
                 if ($Text -match $re) {
                     $ar = [string]$w.area
                     if (-not $areas.Contains($ar)) { $areas.Add($ar) }
-                    if (-not $pats.Contains($re))   { $pats.Add($re) }
+                    # report the individual sub-patterns that actually matched (P2),
+                    # each with the first changed line where it appears as context
+                    foreach ($sub in @(Split-PatternAlternatives -Pattern $re)) {
+                        if (-not $pats.Contains($sub) -and $Text -match $sub) {
+                            $pats.Add($sub)
+                            $ctx = ''
+                            foreach ($dl in $diffLines) {
+                                if ($dl -match $sub) { $ctx = $dl; break }
+                            }
+                            if ($ctx.Length -gt 140) { $ctx = $ctx.Substring(0, 140) + '...' }
+                            $ctxs.Add($ctx)
+                        }
+                    }
                 }
             }
             catch {
@@ -198,7 +431,7 @@ function Test-Keywords {
             }
         }
     }
-    return [pscustomobject]@{ matched = $areas; patterns = $pats }
+    return [pscustomobject]@{ matched = $areas; patterns = $pats; contexts = $ctxs }
 }
 
 function Get-AtomSnippet {
@@ -231,6 +464,7 @@ function Get-IssueBody {
         [string]$Snippet,
         [System.Collections.Generic.List[string]]$Areas,
         [System.Collections.Generic.List[string]]$Patterns,
+        [System.Collections.Generic.List[string]]$Contexts,
         [string]$Hash
     )
     # Non-ASCII glyphs are composed at runtime so this script stays pure ASCII and
@@ -242,7 +476,21 @@ function Get-IssueBody {
 
     $data = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
     $areaList = ($Areas | ForEach-Object { "- [ ] $_" }) -join "`n"
-    $kw = ($Patterns) -join ', '
+    # one bullet per matched sub-pattern, each with the first matching changed line
+    # as context (P2). The context is untrusted doc text: strip backticks so it can
+    # never break the inline-code span, and keep it within one line.
+    $patternLines = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $Patterns.Count; $i++) {
+        $p = [string]$Patterns[$i]
+        $c = ''
+        if ($Contexts -and ($i -lt $Contexts.Count)) { $c = [string]$Contexts[$i] }
+        $c = ($c -replace '[`]', '').Trim()
+        if ($c.Length -gt 140) { $c = $c.Substring(0, 140) + '...' }
+        if ([string]::IsNullOrWhiteSpace($c)) { $c = '(no context line)' }
+        $patternLines.Add(('- `{0}` -> "{1}"' -f $p, $c))
+    }
+    $patternsBlock = ($patternLines -join "`n")
+    if ([string]::IsNullOrWhiteSpace($patternsBlock)) { $patternsBlock = '_(none)_' }
 
     $tpl = @'
 ## {MAG} Upstream API docs changed {EMDASH} {NAME}
@@ -263,7 +511,8 @@ function Get-IssueBody {
 {AREAS}
 
 ### Keywords matched
-`{KEYWORDS}`
+
+{PATTERNS}
 
 <!-- source: {NAME} --> <!-- hash: {HASH} -->
 _This issue was opened automatically by the api-monitor workflow. Close it after triage._
@@ -273,7 +522,7 @@ _This issue was opened automatically by the api-monitor workflow. Close it after
     $body = $body.Replace('{MAG}', $mag).Replace('{EMDASH}', $emDash).Replace('{MIDDOT}', $middot)
     $body = $body.Replace('{NAME}', $Name).Replace('{DATA}', $data).Replace('{PROVIDER}', $Provider)
     $body = $body.Replace('{URL}', $Url).Replace('{SHORT}', $ShortHash).Replace('{HASH}', $Hash)
-    $body = $body.Replace('{AREAS}', $areaList).Replace('{KEYWORDS}', $kw)
+    $body = $body.Replace('{AREAS}', $areaList).Replace('{PATTERNS}', $patternsBlock)
     # snippet last: it is untrusted doc text and must not be re-tokenized. Inside the
     # ```text fence a literal ``` would close the block - split it so it cannot.
     $safeSnippet = $Snippet.Replace('```', '` ``')
@@ -593,36 +842,58 @@ foreach ($src in $script:sources) {
         $newLines = @(Get-TextLines -Text $norm)
         $fdi = Get-FirstDiffIndex -Old $oldLines -New $newLines
 
-        # Keyword matching runs over ALL lines that differ (removed AND added), not just
-        # the first diverging region - so a removal (e.g. a deleted rate-limit notice)
-        # is still detected. The issue snippet below stays limited to ~25 new lines.
-        $diffLines = New-Object System.Collections.Generic.List[string]
-        $maxIdx = [Math]::Max($oldLines.Count, $newLines.Count)
-        for ($i = 0; $i -lt $maxIdx; $i++) {
-            if ($i -lt $oldLines.Count -and $i -lt $newLines.Count -and $oldLines[$i] -eq $newLines[$i]) { continue }
-            if ($i -lt $oldLines.Count) { $diffLines.Add('-' + $oldLines[$i]) }
-            if ($i -lt $newLines.Count) { $diffLines.Add('+' + $newLines[$i]) }
-        }
-        if ($diffLines.Count -gt 0) { $diffText = $diffLines -join "`n" } else { $diffText = '' }
-
-        # snippet (issue body context): ~25 new lines from the first point of difference
-        # (atom: first 3-5 entries)
+        # P1: for markdown sources, narrow the diff to the changed SECTION(S), so a
+        # large page (e.g. openrouter's llms-full.txt) no longer matches every keyword
+        # area. Falls back to the positional page-wide diff when the document has no
+        # usable headings, nothing matched section-wise, or >=90% of the page changed
+        # (rewrite -> the page-level alert is the honest one).
+        $sectionCount = 0
+        $sectionHeading = ''
+        $useSections = $false
+        $diffText = ''
         $snippet = ''
-        if ($fdi -lt $newLines.Count) {
-            if ($src.kind -eq 'atom') {
-                $snippet = Get-AtomSnippet -Lines $newLines[$fdi..($newLines.Count - 1)]
+        if ($src.kind -eq 'markdown') {
+            $secInfo = Get-MarkdownDiffInfo -OldLines $oldLines -NewLines $newLines
+            if ($null -ne $secInfo -and $secInfo.UseSections) {
+                $useSections = $true
+                $sectionCount = [int]$secInfo.Count
+                $sectionHeading = [string]$secInfo.Heading
+                $diffText = [string]$secInfo.DiffText
+                $snippet = [string]$secInfo.Snippet
+            }
+        }
+        if (-not $useSections) {
+            # Keyword matching runs over ALL lines that differ (removed AND added), not
+            # just the first diverging region - so a removal (e.g. a deleted rate-limit
+            # notice) is still detected.
+            $diffLines = New-Object System.Collections.Generic.List[string]
+            $maxIdx = [Math]::Max($oldLines.Count, $newLines.Count)
+            for ($i = 0; $i -lt $maxIdx; $i++) {
+                if ($i -lt $oldLines.Count -and $i -lt $newLines.Count -and $oldLines[$i] -eq $newLines[$i]) { continue }
+                if ($i -lt $oldLines.Count) { $diffLines.Add('-' + $oldLines[$i]) }
+                if ($i -lt $newLines.Count) { $diffLines.Add('+' + $newLines[$i]) }
+            }
+            if ($diffLines.Count -gt 0) { $diffText = $diffLines -join "`n" } else { $diffText = '' }
+
+            # snippet (issue body context): ~25 new lines from the first point of
+            # difference (atom: first 3-5 entries)
+            $snippet = ''
+            if ($fdi -lt $newLines.Count) {
+                if ($src.kind -eq 'atom') {
+                    $snippet = Get-AtomSnippet -Lines $newLines[$fdi..($newLines.Count - 1)]
+                }
+                else {
+                    $snippetEnd = [Math]::Min($newLines.Count - 1, $fdi + 24)
+                    $snippet = ($newLines[$fdi..$snippetEnd] -join "`n")
+                    if ($snippetEnd -lt ($newLines.Count - 1)) { $snippet = $snippet + "`n... (truncated)" }
+                }
             }
             else {
-                $snippetEnd = [Math]::Min($newLines.Count - 1, $fdi + 24)
-                $snippet = ($newLines[$fdi..$snippetEnd] -join "`n")
-                if ($snippetEnd -lt ($newLines.Count - 1)) { $snippet = $snippet + "`n... (truncated)" }
+                $snippet = '... (content removed at the end of the document)'
             }
-        }
-        else {
-            $snippet = '... (content removed at the end of the document)'
-        }
-        if ([string]::IsNullOrWhiteSpace($snippet)) {
-            $snippet = '(no textual context available - see source link)'
+            if ([string]::IsNullOrWhiteSpace($snippet)) {
+                $snippet = '(no textual context available - see source link)'
+            }
         }
 
         $match = Test-Keywords -Text $diffText -Watch $script:watchMap[$name]
@@ -693,8 +964,17 @@ foreach ($src in $script:sources) {
         # 7) open the issue; advance state ONLY after gh confirms success
         $dateStamp = [DateTime]::UtcNow.ToString('yyyy-MM-dd')
         $title = "[api-monitor] {0}: upstream docs changed ({1})" -f $name, $dateStamp
+        if ($useSections -and $sectionCount -gt 0) {
+            if ($sectionCount -eq 1) {
+                $title = "[api-monitor] {0}: '{1}' section changed ({2})" -f $name, $sectionHeading, $dateStamp
+            }
+            else {
+                $title = "[api-monitor] {0}: {1} sections changed ({2})" -f $name, $sectionCount, $dateStamp
+            }
+        }
         $body = Get-IssueBody -Name $name -Provider ([string]$src.provider) -Url ([string]$src.url) `
-            -ShortHash $shortHash -Snippet $snippet -Areas $match.matched -Patterns $match.patterns -Hash $hash
+            -ShortHash $shortHash -Snippet $snippet -Areas $match.matched -Patterns $match.patterns `
+            -Contexts $match.contexts -Hash $hash
         $newUrl = New-GhIssue -Title $title -Body $body
         if ($newUrl -notmatch '/issues/\d+') {
             throw ("gh issue create returned no issue URL: {0}" -f $newUrl)
