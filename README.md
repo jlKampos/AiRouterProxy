@@ -1,4 +1,7 @@
-# AiRouterProxy
+# AiRouterProxy — Security Gateway for AI Coding Agents
+
+*Your AI agent can read your code. It doesn't need to expose your secrets.*
+
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
