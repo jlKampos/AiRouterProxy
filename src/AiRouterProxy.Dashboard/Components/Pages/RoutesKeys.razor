@@ -1,0 +1,604 @@
+@page "/routes"
+@using RouteView = AiRouterProxy.Dashboard.Models.RouteView
+@inject IDashboardFacade Facade
+@inject IDashboardAdminService Admin
+
+<h1 class="title"><span class="grad">Routes &amp; Keys</span></h1>
+<p class="sub">Edit the route table (routes.json, hot-reloaded) and manage key references. Key values are write-only: they leave the browser once, are stored in the server config and are never shown again.</p>
+
+<ResultBanner Result="@_result" />
+
+@if (_busy)
+{
+    <div class="note amber"><b>Working...</b> writing configuration.</div>
+}
+
+<div class="panel">
+    <h2>Routes</h2>
+    <div class="h2-rule"></div>
+    <p class="head-desc">Saved as a whole set with <b>Save routes</b> (no admin key needed - route data has no secrets). Prefix match against the incoming path; the prefix is stripped before forwarding to the upstream.</p>
+
+    @if (_rows.Count == 0)
+    {
+        <div class="empty">No routes yet - the proxy runs in single-upstream mode until you add one.</div>
+    }
+    else
+    {
+        <div class="tbl-wrap">
+            <table class="editable">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Prefix</th>
+                        <th>Upstream</th>
+                        <th>KeyRef</th>
+                        <th>Allowed paths</th>
+                        <th>Timeout (ms)</th>
+                        <th>Max body (bytes)</th>
+                        <th>State</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @for (var i = 0; i < _rows.Count; i++)
+                    {
+                        var idx = i;
+                        var row = _rows[idx];
+                        <tr>
+                            <td><input class="cell-input" @bind="row.Name" placeholder="route name" /></td>
+                            <td><input class="cell-input mono-cell" @bind="row.Prefix" placeholder="/openrouter" /></td>
+                            <td><input class="cell-input wide" @bind="row.Upstream" placeholder="https://api.example.com" /></td>
+                            <td>
+                                <select class="cell-input" @bind="row.KeyRef">
+                                    @if (!string.IsNullOrEmpty(row.KeyRef) && !_keyRefNames.Contains(row.KeyRef))
+                                    {
+                                        <option value="@row.KeyRef">@row.KeyRef</option>
+                                    }
+                                    <option value="">(global key)</option>
+                                    @foreach (var refName in _keyRefNames)
+                                    {
+                                        <option value="@refName">@refName</option>
+                                    }
+                                </select>
+                            </td>
+                            <td><input class="cell-input wide" @bind="row.AllowedPaths" placeholder="/v1/* /v1/models (space separated)" /></td>
+                            <td><input class="cell-input num" type="number" min="0" step="1000" @bind="row.TimeoutMs" placeholder="300000" /></td>
+                            <td><input class="cell-input num" type="number" min="0" @bind="row.MaxBody" placeholder="20971520" /></td>
+                            <td>
+                                @if (RowActive(row))
+                                {
+                                    <span class="chip ok" style="--c: var(--green);"><i class="d"></i>active</span>
+                                }
+                                else
+                                {
+                                    <span class="chip bad" style="--c: var(--red);"><i class="d"></i>no key</span>
+                                    <div class="hint">inactive until a key is set</div>
+                                }
+                            </td>
+                            <td>
+                                <button class="btn small" type="button" @onclick="() => RemoveRouteRow(idx)" title="Removes this row from the table. Saved when you click 'Save routes'.">Remove</button>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+
+    <div class="tbl-actions">
+        <button class="btn ghost" type="button" @onclick="AddRoute">+ Add route</button>
+        <button class="btn primary" type="button" disabled="@_busy" @onclick="SaveRoutes">Save routes</button>
+    </div>
+</div>
+
+<div class="panel">
+    <h2>Route keys</h2>
+    <div class="h2-rule"></div>
+    <p class="head-desc">Each route references a key by name (KeyRef). "Configured" means a value exists in the server config. Setting or rotating a secret requires the admin key (re-auth).</p>
+
+    <div class="form-line" style="margin: 0 0 14px 0;">
+        <input class="cell-input wide" @bind="_newKeyRef" placeholder="new keyRef (e.g. MISTRAL / OPENROUTER)" autocomplete="off" />
+        <button class="btn small" type="button" disabled="@(_busy || string.IsNullOrWhiteSpace(_newKeyRef))" @onclick="AskAddKeyRef">+ Add keyRef</button>
+        <span class="hint" style="margin-left: 8px;">Declares the ref with no secret yet, so routes and the dropdown can use it.</span>
+    </div>
+
+    @if (_keyRefs.Count == 0)
+    {
+        <div class="empty">No key references yet - create the first one with the field above, then set its secret.</div>
+    }
+    else
+    {
+        <div class="tbl-wrap">
+            <table class="editable">
+                <thead>
+                    <tr>
+                        <th>KeyRef</th>
+                        <th>Configured</th>
+                        <th>Used by</th>
+                        <th>Owner (meta)</th>
+                        <th>Purpose (meta)</th>
+                        <th>Secret</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var k in _keyRefs)
+                    {
+                        var inUse = k.UsageCount > 0;
+                        <tr>
+                            <td><code>@k.KeyRef</code></td>
+                            <td>
+                                @if (k.Configured)
+                                {
+                                    <span class="chip ok" style="--c: var(--green);"><i class="d"></i>set</span>
+                                }
+                                else
+                                {
+                                    <span class="chip bad" style="--c: var(--red);"><i class="d"></i>not set</span>
+                                }
+                            </td>
+                            <td><span class="mono">@k.UsageCount route(s)</span></td>
+                            <td><input class="cell-input" @bind="_ownerInputs[k.KeyRef]" placeholder="owner" /></td>
+                            <td>
+                                <div class="form-line">
+                                    <input class="cell-input" @bind="_purposeInputs[k.KeyRef]" placeholder="purpose" />
+                                    <button class="btn small" type="button" disabled="@_busy" @onclick="() => AskSaveMeta(k.KeyRef)">Save</button>
+                                </div>
+                            </td>
+                            <td class="secret-cell">
+                                <input class="cell-input" type="password" @bind="_secretInputs[k.KeyRef]"
+                                       placeholder="••••••• never shows the value"
+                                       autocomplete="new-password" />
+                                <button class="btn small" type="button" disabled="@_busy" @onclick="() => AskSetSecret(k.KeyRef)">Set / rotate</button>
+                            </td>
+                            <td>
+                                @if (inUse)
+                                {
+                                    <span class="hint" title="Remove the keyRef from its routes (or delete them) before deleting the key.">in use</span>
+                                }
+                                else
+                                {
+                                    <button class="btn small" type="button" disabled="@_busy" @onclick="() => AskDeleteKey(k.KeyRef)">Delete</button>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+        <div class="note amber">
+            <b>Meta</b> (owner / purpose) is stored locally and only helps humans read this dashboard. Save each row with its button. A keyRef used by a route cannot be deleted while referenced.
+        </div>
+    }
+</div>
+
+<div class="row2">
+    <div class="panel">
+        <h2>Global upstream key</h2>
+        <div class="h2-rule"></div>
+        <div class="kv"><span class="k">Configured</span><span class="v @(_hasGlobalKey ? "good" : "bad")">@(_hasGlobalKey ? "yes" : "no")</span></div>
+        <div class="kv"><span class="k">Used by</span><span class="v">routes without a keyRef</span></div>
+        <div class="form-line">
+            <input class="cell-input" type="password" @bind="_upstreamSecret" placeholder="••••••• new upstream key" autocomplete="new-password" />
+            <button class="btn small" type="button" disabled="@_busy" @onclick="AskSetUpstreamKey">Set</button>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Local keys</h2>
+        <div class="h2-rule"></div>
+        <div class="kv"><span class="k">Primary (admin)</span><span class="v @(_hasPrimaryLocalKey ? "good" : "bad")">@(_hasPrimaryLocalKey ? "configured" : "missing")</span></div>
+
+        @if (_localKeys.Count == 0)
+        {
+            <div class="empty">No extra local keys configured.</div>
+        }
+        else
+        {
+            <div class="local-keys">
+                @for (var i = 0; i < _localKeys.Count; i++)
+                {
+                    var lk = _localKeys[i];
+                    <span class="hash-chip">
+                        @if (lk.IsPrimary)
+                        {
+                            <span class="hint">primary (admin)</span>
+                            <code class="hash">@lk.Hash</code>
+                        }
+                        else
+                        {
+                            <input class="cell-input" style="width: 175px; margin-bottom: 2px;" @bind="_localKeyLabels[lk.Hash]"
+                                   placeholder="@($"extra #{i + 1} - nome (ex.: engenheiro 1)")" autocomplete="off"
+                                   title="Name this extra local key: who or which PC it was issued to." />
+                            <button class="btn small" type="button" disabled="@_busy" @onclick="() => AskSaveLocalLabel(lk)" title="Saves the display name for this key.">Save</button>
+                            <code class="hash">@lk.Hash</code>
+                            <button class="btn small" type="button" disabled="@_busy" @onclick="() => AskRemoveLocalKey(lk)" title="Removes this extra local key.">Remove</button>
+                        }
+                    </span>
+                }
+            </div>
+        }
+
+        <div class="form-line">
+            <input class="cell-input" type="password" @bind="_newLocalKey" placeholder="••••••• add extra local key" autocomplete="new-password" />
+            <button class="btn small" type="button" disabled="@(_busy || string.IsNullOrWhiteSpace(_newLocalKey))" @onclick="AskAddLocalKey" title="Adds an extra local key.">+</button>
+        </div>
+        <p class="head-desc" style="margin-top: 10px;">Values are write-only; only a fingerprint and the name you give are listed. Extra keys authenticate the proxied API, never /admin.</p>
+    </div>
+</div>
+
+<AdminKeyPrompt @bind-Visible="_promptVisible"
+                Title="@_promptTitle"
+                Message="@_promptMessage"
+                OnSubmit="@_pendingPrompt"
+                OnCompleted="OnPromptCompleted"
+                OnCancel="CancelPrompt" />
+
+<ConfirmDialog @bind-Visible="_confirmVisible"
+               Title="@_confirmTitle"
+               Message="@_confirmMessage"
+               OnConfirm="DoConfirm"
+               OnCancel="() => { }" />
+
+@code {
+    private List<RouteRow> _rows = new();
+    private List<KeyRefDetailView> _keyRefs = new();
+    private List<string> _keyRefNames = new();
+    private List<LocalKeyView> _localKeys = new();
+    private bool _hasGlobalKey;
+    private bool _hasPrimaryLocalKey;
+    private RouteDefaultsView _routeDefaults = new(300000, 20 * 1024 * 1024);
+
+    private readonly Dictionary<string, string> _ownerInputs = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _purposeInputs = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _secretInputs = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _localKeyLabels = new(StringComparer.OrdinalIgnoreCase);
+    private string _upstreamSecret = string.Empty;
+    private string _newLocalKey = string.Empty;
+    private string _newKeyRef = string.Empty;
+
+    private AdminResult? _result;
+    private bool _busy;
+
+    // Modal state
+    private bool _promptVisible;
+    private string _promptTitle = "Admin key required";
+    private string? _promptMessage;
+    private Func<string, Task<AdminResult>>? _pendingPrompt;
+
+    private bool _confirmVisible;
+    private string _confirmTitle = "Confirm";
+    private string? _confirmMessage;
+    private string _pendingDeleteKey = string.Empty;
+    private LocalKeyView? _pendingRemoveLocal;
+    private string _pendingSetKeyRef = string.Empty;
+
+    protected override void OnInitialized() => Load();
+
+    private void Load()
+    {
+        var overview = Facade.GetKeysOverview();
+        _keyRefs = overview.KeyRefs.ToList();
+        _keyRefNames = _keyRefs.Select(k => k.KeyRef).Distinct(StringComparer.Ordinal).ToList();
+        _localKeys = overview.LocalKeys.ToList();
+        _localKeyLabels.Clear();
+        foreach (var lk in _localKeys) _localKeyLabels[lk.Hash] = lk.Label ?? string.Empty;
+        _hasGlobalKey = overview.HasGlobalKey;
+        _hasPrimaryLocalKey = overview.HasPrimaryLocalKey;
+        _routeDefaults = Facade.GetRouteDefaults();
+
+        _rows = Facade.GetRoutes().Select(RouteRow.FromView).ToList();
+
+        foreach (var k in _keyRefs)
+        {
+            _ownerInputs.TryAdd(k.KeyRef, k.Owner);
+            _purposeInputs.TryAdd(k.KeyRef, k.Purpose);
+            _secretInputs.TryAdd(k.KeyRef, string.Empty);
+        }
+    }
+
+    /// <summary>
+    /// Refresh from the saved files instead of the (debounced, still-stale) live snapshot:
+    /// right after SaveAtomic the IOptionsMonitor has not reloaded yet, so routes, keyRefs,
+    /// chips and local-key rows must reflect what was just written. A read that fails (file
+    /// absent/corrupt) keeps that section's current state; if BOTH reads fail nothing
+    /// happens - stale live values are never shown.
+    /// </summary>
+    private void LoadAllFromDisk()
+    {
+        var keys = Facade.GetKeysOverviewFromDisk();
+        if (keys is not null)
+        {
+            _keyRefs = keys.KeyRefs.ToList();
+            _keyRefNames = _keyRefs.Select(k => k.KeyRef).Distinct(StringComparer.Ordinal).ToList();
+            _localKeys = keys.LocalKeys.ToList();
+            _localKeyLabels.Clear();
+            foreach (var lk in _localKeys) _localKeyLabels[lk.Hash] = lk.Label ?? string.Empty;
+            _hasGlobalKey = keys.HasGlobalKey;
+            _hasPrimaryLocalKey = keys.HasPrimaryLocalKey;
+            _routeDefaults = Facade.GetRouteDefaults();
+        }
+
+        var routes = Facade.GetRoutesFromDisk();
+        if (routes is not null)
+        {
+            _rows = routes.Select(RouteRow.FromView).ToList();
+        }
+
+        foreach (var k in _keyRefs)
+        {
+            _ownerInputs.TryAdd(k.KeyRef, k.Owner);
+            _purposeInputs.TryAdd(k.KeyRef, k.Purpose);
+            _secretInputs.TryAdd(k.KeyRef, string.Empty);
+        }
+    }
+
+    private bool RowActive(RouteRow row)
+    {
+        if (string.IsNullOrEmpty(row.KeyRef))
+        {
+            return _hasGlobalKey;
+        }
+
+        return _keyRefs.FirstOrDefault(k => string.Equals(k.KeyRef, row.KeyRef, StringComparison.Ordinal))?.Configured ?? false;
+    }
+
+    // ----------------------------------------------------------
+    // Routes editing
+    // ----------------------------------------------------------
+
+    private void AddRoute()
+    {
+        // Pre-fill the proxy-level defaults so a new row starts with the same
+        // timeout/max body the dashboard shows elsewhere (instead of writing 0).
+        _rows.Add(new RouteRow
+        {
+            Prefix = "/",
+            KeyRef = string.Empty,
+            TimeoutMs = _routeDefaults.RequestTimeoutMs.ToString(),
+            MaxBody = _routeDefaults.MaxBodySize.ToString(),
+        });
+    }
+
+    private void RemoveRouteRow(int index)
+    {
+        if (index >= 0 && index < _rows.Count)
+        {
+            _rows.RemoveAt(index);
+        }
+    }
+
+    private void DoConfirm()
+    {
+        if (!string.IsNullOrEmpty(_pendingDeleteKey))
+        {
+            var deleteKey = _pendingDeleteKey;
+            _pendingPrompt = key => Task.FromResult(Admin.DeleteRouteKey(deleteKey, key));
+            _promptTitle = "Delete key";
+            _promptMessage = $"Delete keyRef '{_pendingDeleteKey}' and its metadata? This cannot be undone.";
+            _promptVisible = true;
+        }
+        else if (_pendingRemoveLocal is not null)
+        {
+            _promptMessage = $"Remove local key '{_pendingRemoveLocal.Label}'?";
+            _promptTitle = "Remove local key";
+            _pendingPrompt = key => RemoveLocalKeyWith(key);
+            _promptVisible = true;
+        }
+
+        _pendingDeleteKey = string.Empty;
+    }
+
+    private void SaveRoutes()
+    {
+        _busy = true;
+        try
+        {
+            _result = Admin.ApplyRoutes(_rows.Select(r => r.ToDraft()).ToList());
+            if (_result.Ok)
+            {
+                LoadAllFromDisk();
+            }
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    // ----------------------------------------------------------
+    // Keys (re-auth via AdminKeyPrompt)
+    // ----------------------------------------------------------
+
+    private void AskSetSecret(string keyRef)
+    {
+        // Empty secrets are rejected by the server; fail visibly BEFORE the modal so the
+        // reason is never lost in a banner while the modal closes.
+        var secret = _secretInputs.TryGetValue(keyRef, out var s) ? (s ?? string.Empty) : string.Empty;
+        if (string.IsNullOrWhiteSpace(secret))
+        {
+            _result = AdminResult.Failure(
+                "Write the new key value in the Secret field of the row first - empty values are not saved.",
+                AdminResult.TypeValidation);
+            return;
+        }
+
+        _pendingSetKeyRef = keyRef;
+        _promptTitle = "Set / rotate secret";
+        _promptMessage = $"Write the new upstream key for keyRef '{keyRef}'. The value is stored in the server config and never shown again.";
+        _pendingPrompt = key => Task.FromResult(Admin.SetRouteKeySecret(keyRef, secret, key));
+        _promptVisible = true;
+    }
+
+    private void AskSetUpstreamKey()
+    {
+        var secret = _upstreamSecret;
+        if (string.IsNullOrWhiteSpace(secret))
+        {
+            _result = AdminResult.Failure(
+                "Write the new upstream key first - empty values are not saved.",
+                AdminResult.TypeValidation);
+            return;
+        }
+
+        _promptTitle = "Set global upstream key";
+        _promptMessage = "Write the new global upstream key (used by routes without a keyRef). Write-only.";
+        _pendingPrompt = key => Task.FromResult(Admin.SetUpstreamKey(secret, key));
+        _promptVisible = true;
+    }
+
+    private void AskDeleteKey(string keyRef)
+    {
+        _pendingDeleteKey = keyRef;
+        _confirmTitle = "Delete key";
+        _confirmMessage = $"Delete keyRef '{keyRef}'? Routes using it would lose their key. Requires re-auth.";
+        _confirmVisible = true;
+    }
+
+    private void AskAddKeyRef()
+    {
+        var refName = _newKeyRef.Trim();
+        if (string.IsNullOrWhiteSpace(refName))
+        {
+            return;
+        }
+
+        _promptTitle = "Add keyRef";
+        _promptMessage = $"Create keyRef '{refName}' with no secret yet? It appears in the route dropdowns; routes using it are inactive until a key is set.";
+        _pendingPrompt = key => Task.FromResult(Admin.EnsureRouteKeyRef(refName, key));
+        _promptVisible = true;
+    }
+
+    private void AskSaveMeta(string keyRef)
+    {
+        _busy = true;
+        try
+        {
+            var owner = _ownerInputs.TryGetValue(keyRef, out var o) ? o ?? string.Empty : string.Empty;
+            var purpose = _purposeInputs.TryGetValue(keyRef, out var p) ? p ?? string.Empty : string.Empty;
+            _result = Admin.UpdateKeyMeta(keyRef, new KeyMeta(owner, purpose));
+            if (_result.Ok)
+            {
+                Load();
+            }
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void AskAddLocalKey()
+    {
+        var value = _newLocalKey;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        _promptTitle = "Add local key";
+        _promptMessage = "Add one extra local key? Only a fingerprint is stored in the dashboard; the value goes into the server config.";
+        _pendingPrompt = key => Task.FromResult(Admin.AddLocalKey(value, key));
+        _promptVisible = true;
+    }
+
+    private void AskRemoveLocalKey(LocalKeyView localKey)
+    {
+        _pendingRemoveLocal = localKey;
+        _confirmTitle = "Remove local key";
+        _confirmMessage = $"Remove local key '{localKey.Label}'? It will no longer authenticate against the proxied API.";
+        _confirmVisible = true;
+    }
+
+    private Task<AdminResult> RemoveLocalKeyWith(string key)
+        => _pendingRemoveLocal is not null
+            ? Task.FromResult(Admin.RemoveLocalKeyByHash(_pendingRemoveLocal.Hash, key))
+            : Task.FromResult(AdminResult.Failure("Local key not found.", AdminResult.TypeNotFound));
+
+    private void AskSaveLocalLabel(LocalKeyView localKey)
+    {
+        var label = _localKeyLabels.TryGetValue(localKey.Hash, out var l) ? (l ?? string.Empty) : string.Empty;
+        _busy = true;
+        try
+        {
+            _result = Admin.SetLocalKeyLabel(localKey.Hash, label);
+            if (_result.Ok)
+            {
+                LoadAllFromDisk();
+            }
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task OnPromptCompleted(AdminResult result)
+    {
+        _result = result;
+        if (result.Ok)
+        {
+            if (!string.IsNullOrEmpty(_pendingSetKeyRef))
+            {
+                _secretInputs[_pendingSetKeyRef] = string.Empty;
+            }
+
+            if (!string.IsNullOrEmpty(_upstreamSecret))
+            {
+                _upstreamSecret = string.Empty;
+            }
+
+            _newLocalKey = string.Empty;
+            _newKeyRef = string.Empty;
+            LoadAllFromDisk();
+        }
+    }
+
+    private void CancelPrompt()
+    {
+        _pendingPrompt = null;
+        _pendingSetKeyRef = string.Empty;
+    }
+
+    // ----------------------------------------------------------
+    // Row model
+    // ----------------------------------------------------------
+
+    private sealed class RouteRow
+    {
+        public string Name = string.Empty;
+        public string Prefix = string.Empty;
+        public string Upstream = string.Empty;
+        public string KeyRef = string.Empty;
+        public string AllowedPaths = string.Empty;
+        public string TimeoutMs = string.Empty;
+        public string MaxBody = string.Empty;
+        public Dictionary<string, string> Headers = new(StringComparer.OrdinalIgnoreCase);
+
+        public static RouteRow FromView(RouteView v) => new()
+        {
+            Name = v.Name,
+            Prefix = v.Prefix,
+            Upstream = v.Upstream,
+            KeyRef = v.KeyRef,
+            AllowedPaths = v.AllowedPaths.Count == 1 && v.AllowedPaths[0] == "*" ? string.Empty : string.Join(" ", v.AllowedPaths),
+            TimeoutMs = v.RequestTimeoutMs > 0 ? v.RequestTimeoutMs.ToString() : string.Empty,
+            MaxBody = v.MaxBodySize > 0 ? v.MaxBodySize.ToString() : string.Empty,
+        };
+
+        public RouteDraft ToDraft() => new(
+            Name: Name?.Trim() ?? string.Empty,
+            Prefix: Prefix?.Trim() ?? string.Empty,
+            Upstream: Upstream?.Trim() ?? string.Empty,
+            KeyRef: string.IsNullOrEmpty(KeyRef) ? string.Empty : KeyRef.Trim(),
+            AllowedPaths: SplitPaths(AllowedPaths),
+            RequestTimeoutMs: int.TryParse(TimeoutMs, out var t) ? Math.Max(0, t) : 0,
+            MaxBodySize: long.TryParse(MaxBody, out var mb) ? Math.Max(0, mb) : 0,
+            Headers: Headers);
+
+        private static List<string> SplitPaths(string? text)
+            => string.IsNullOrWhiteSpace(text)
+                ? new List<string>()
+                : text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+    }
+}

@@ -1,0 +1,33 @@
+@inherits LayoutComponentBase
+@inject IDashboardFacade Facade
+
+<header class="topbar">
+    <a class="brand" href="@DashboardGlobals.BaseHref">
+        <span class="logo">AP</span>
+        <h1>AiRouter<em class="accent">Proxy</em></h1>
+        <span class="tag">Admin</span>
+    </a>
+
+    <NavMenu />
+
+    <div class="topbar-right">
+        @{
+            var st = Facade.GetStatus();
+            <span class="badge @(st.Status == "ok" ? "online" : "offline")"><i class="dot"></i><span>@st.Status</span></span>
+            <span class="badge"><span class="mono">v@(st.Version)</span></span>
+        }
+    </div>
+</header>
+
+<main class="page">
+    @Body
+</main>
+
+<footer>
+    <span><b>AiRouterProxy</b> - local security gateway for AI coding agents</span>
+    <span>Config JSON are the source of truth &middot; edits are validated and written atomically</span>
+</footer>
+
+<div id="blazor-error-ui" data-nosnippet>
+    An unhandled error has occurred. <a href="." class="reload">Reload</a>
+</div>

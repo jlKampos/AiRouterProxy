@@ -1,0 +1,107 @@
+@page "/activity"
+@inject IDashboardFacade Facade
+
+@{
+    var activity = Facade.GetActivity(_hours, 200);
+}
+
+<h1 class="title"><span class="grad">Activity</span></h1>
+<p class="sub">In-memory request log (500 newest entries). Metadata only - hashes, status, duration and redaction counts. Keys and payloads never appear here.</p>
+
+<div class="filters">
+    @foreach (var h in new[] { 1, 6, 24, 72 })
+    {
+        <button class="fc @(h == _hours ? "on" : "")" type="button" @onclick="() => _hours = h">@h h</button>
+    }
+    <button class="fc" type="button" @onclick="() => { }">refresh</button>
+</div>
+
+<div class="panel">
+    <div class="tbl-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Client</th>
+                    <th>Method</th>
+                    <th>Path</th>
+                    <th>Route</th>
+                    <th>Status</th>
+                    <th>Dur</th>
+                    <th>Red</th>
+                    <th>Presented hash</th>
+                    <th>Expected hash</th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (activity.Count == 0)
+                {
+                    <tr><td colspan="10"><span class="empty" style="padding: 14px;">No entries in this window.</span></td></tr>
+                }
+                @foreach (var e in activity)
+                {
+                    <tr>
+                        <td><span class="mono">@e.Timestamp.ToLocalTime().ToString("MM-dd HH:mm:ss")</span></td>
+                        <td><span class="mono">@(string.IsNullOrEmpty(e.Client) ? "-" : e.Client)</span></td>
+                        <td><span class="mono">@e.Method</span></td>
+                        <td><span class="mono">@(Trunc(e.Path, 30))</span></td>
+                        <td><code>@(string.IsNullOrEmpty(e.Route) ? "-" : e.Route)</code></td>
+                        <td>
+                            @if (e.Status >= 200 && e.Status < 400)
+                            {
+                                <span class="up"><b>@e.Status</b></span>
+                            }
+                            else
+                            {
+                                <span class="down"><b>@e.Status</b></span>
+                            }
+                        </td>
+                        <td><span class="mono">@e.DurationMs</span></td>
+                        <td>
+                            @if (e.Redacted > 0)
+                            {
+                                <span class="chip" style="--c: var(--amber);"><i class="d"></i>@e.Redacted</span>
+                            }
+                            else
+                            {
+                                <span class="hint">-</span>
+                            }
+                        </td>
+                        <td><span class="hash @(HashClass(e))">@(e.PresentedHash ?? "-")</span></td>
+                        <td><span class="hash">@(ExpectedCell(e))</span></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="note teal">
+    <b>Reading hashes:</b> the presented hash is a fingerprint of the local key used in this
+    request (recorded for every request, so traffic can be attributed to a key without ever
+    storing keys). The expected hash - shown only on refused authentication - is the fingerprint
+    of the primary local key; with several local keys there is no single expected value, hence
+    "(multiple keys)". A mismatch with a refused status means the caller used a key that is not valid.
+</div>
+
+@code {
+    private int _hours = 24;
+
+    private static bool KeyOk(ActivityView e)
+        => e.ExpectedHash is { Length: > 0 } && e.ExpectedHash != "-" && e.PresentedHash == e.ExpectedHash;
+
+    private static string HashClass(ActivityView e)
+    {
+        if (KeyOk(e)) return "good";
+        if (e.ExpectedHash is { Length: > 0 } && e.ExpectedHash != "-") return "bad";
+        return e.Refused ? "bad" : "";
+    }
+
+    private static string ExpectedCell(ActivityView e)
+        => e.ExpectedHash is { Length: > 0 } && e.ExpectedHash != "-"
+            ? e.ExpectedHash
+            : (e.Refused ? "(multiple keys)" : "-");
+
+    private static string Trunc(string? value, int max)
+        => string.IsNullOrEmpty(value) ? "-" : value.Length <= max ? value : value[..max] + "...";
+}

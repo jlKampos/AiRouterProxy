@@ -1,0 +1,127 @@
+@page "/"
+@inject IDashboardFacade Facade
+
+@{
+    var st = Facade.GetStatus();
+    var activity = Facade.GetActivity(24, 8);
+}
+
+<h1 class="title"><span class="grad">Overview</span></h1>
+<p class="sub">Local security gateway for AI coding agents - live view of routing, keys and redaction, straight from the running process.</p>
+
+<div class="hostline">
+    <span><b>@(st.RoutingEnabled ? "multi-upstream" : "single upstream")</b> routing</span>
+    <span class="mono">v@st.Version</span>
+    <span class="mono">uptime @FormatUptime(st.UptimeSec)</span>
+    <span class="mono">@st.Timestamp.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</span>
+</div>
+
+<div class="hero">
+    <div class="herocard c-blue">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Status</h2></div>
+        <div class="hc-num"><em>@st.Status.ToUpperInvariant()</em></div>
+        <div class="hc-sub">running inside the proxy service</div>
+    </div>
+    <div class="herocard c-purple">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Requests (24h)</h2></div>
+        <div class="hc-num">@st.ActivityCount</div>
+        <div class="hc-sub">in-memory activity buffer</div>
+    </div>
+    <div class="herocard c-teal">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Routes</h2></div>
+        <div class="hc-num">@st.RouteCount</div>
+        <div class="hc-sub">@(st.RoutingEnabled ? "route table active" : "fallback: fixed upstream")</div>
+    </div>
+    <div class="herocard c-cyan">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Route keys</h2></div>
+        <div class="hc-num">@st.ConfiguredRouteKeys</div>
+        <div class="hc-sub">of @st.RouteCount routes have a key</div>
+    </div>
+    <div class="herocard c-amber">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Local keys</h2></div>
+        <div class="hc-num">@Facade.LocalKeyCount()</div>
+        <div class="hc-sub">1 primary + extra (never shown)</div>
+    </div>
+    <div class="herocard @(st.RateLimitEnabled ? "c-green" : "c-red")">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Rate limit</h2></div>
+        <div class="hc-num">@(st.RateLimitEnabled ? "ON" : "OFF")</div>
+        <div class="hc-sub">per-client, sliding window</div>
+    </div>
+</div>
+
+<div class="row2">
+    <div class="panel" style="grid-column: 1 / -1;">
+        <h2>Recent activity</h2>
+        <div class="h2-rule"></div>
+        <p class="head-desc">Latest entries from the in-memory buffer - hashes only, never keys or payloads.</p>
+
+        @if (activity.Count == 0)
+        {
+            <div class="empty">No activity recorded yet in the last 24h.</div>
+        }
+        else
+        {
+            <div class="tbl-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Route</th>
+                            <th>Model</th>
+                            <th>Status</th>
+                            <th>Dur</th>
+                            <th>Redacted</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var e in activity)
+                        {
+                            <tr>
+                                <td><span class="mono">@e.Timestamp.ToLocalTime().ToString("HH:mm:ss")</span></td>
+                                <td><code>@(string.IsNullOrEmpty(e.Route) ? "-" : e.Route)</code></td>
+                                <td><span class="mono">@(string.IsNullOrEmpty(e.Model) ? "-" : e.Model)</span></td>
+                                <td>
+                                    @if (e.Status >= 200 && e.Status < 400)
+                                    {
+                                        <span class="up"><b>@e.Status</b></span>
+                                    }
+                                    else
+                                    {
+                                        <span class="down"><b>@e.Status</b></span>
+                                    }
+                                </td>
+                                <td><span class="mono">@e.DurationMs ms</span></td>
+                                <td>
+                                    @if (e.Redacted > 0)
+                                    {
+                                        <span class="chip" style="--c: var(--amber);"><i class="d"></i>@e.Redacted</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="hint">-</span>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+            <div class="tbl-actions">
+                <button class="btn ghost" @onclick="Refresh">Refresh</button>
+                <a class="btn" href="activity">View all activity</a>
+            </div>
+        }
+    </div>
+</div>
+
+@code {
+    private void Refresh() { }
+
+    private static string FormatUptime(long totalSeconds)
+    {
+        var t = TimeSpan.FromSeconds(Math.Max(0, totalSeconds));
+        if (t.TotalDays >= 1) return $"{(int)t.TotalDays}d {t.Hours}h";
+        if (t.TotalHours >= 1) return $"{(int)t.TotalHours}h {t.Minutes}m";
+        return $"{(int)t.TotalMinutes}m {t.Seconds}s";
+    }
+}

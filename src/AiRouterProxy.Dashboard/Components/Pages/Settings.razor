@@ -1,0 +1,181 @@
+@page "/settings"
+@using System.Text.Json
+@using System.Text.Json.Nodes
+@inject IDashboardFacade Facade
+@inject IDashboardAdminService Admin
+@inject IJSRuntime JS
+
+<h1 class="title"><span class="grad">Settings</span></h1>
+<p class="sub">Runtime facts, filesystem layout, and the export/import flow for the non-secret configuration (routes + redaction + inspection). Key values are never part of an export and cannot be imported.</p>
+
+<ResultBanner Result="@_result" />
+
+@if (_busy)
+{
+    <div class="note amber"><b>Working...</b> handling configuration.</div>
+}
+
+<div class="row2">
+    <div class="panel">
+        <h2>Runtime</h2>
+        <div class="h2-rule"></div>
+        <div class="kv"><span class="k">Version</span><span class="v">@_status.Version</span></div>
+        <div class="kv"><span class="k">Uptime</span><span class="v">@FormatUptime(_status.UptimeSec)</span></div>
+        <div class="kv"><span class="k">Status snapshot</span><span class="v">@_status.Timestamp.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</span></div>
+        <div class="kv"><span class="k">Routing</span><span class="v">@(_status.RoutingEnabled ? "route table" : "fixed upstream")</span></div>
+        <div class="kv"><span class="k">Activity buffer</span><span class="v">@_status.ActivityCount entries</span></div>
+    </div>
+
+    <div class="panel">
+        <h2>Filesystem layout</h2>
+        <div class="h2-rule"></div>
+        <p class="head-desc">Where the proxy reads and writes its configuration (paths only - never file contents).</p>
+        <div class="kv"><span class="k">Config dir</span><span class="v"><code class="path">@_paths.ConfigDir</code></span></div>
+        <div class="kv"><span class="k">Data dir</span><span class="v"><code class="path">@_paths.DataDir</code></span></div>
+        <div class="kv"><span class="k">Backups</span><span class="v"><code class="path">@_paths.BackupDir</code></span></div>
+        <div class="kv"><span class="k">Backup retention</span><span class="v">@_paths.Retention per file</span></div>
+        <div class="kv"><span class="k">Audit log</span><span class="v"><code class="path">@_paths.AuditLogPath</code></span></div>
+        <div class="kv"><span class="k">Key metadata</span><span class="v"><code class="path">@_paths.KeyMetaPath</code></span></div>
+        <div class="kv"><span class="k">Hot reload</span><span class="v">routes + redaction + server keys, no restart</span></div>
+        <div class="kv"><span class="k">Restart required</span><span class="v">rate limit, cert, host/port</span></div>
+    </div>
+</div>
+
+<div class="row2">
+    <div class="panel">
+        <h2>Export</h2>
+        <div class="h2-rule"></div>
+        <p class="head-desc">Downloads a JSON bundle with the route table (keyRef references only - never key values), the redaction rules and the inspection policy. Safe to store or share.</p>
+        <button class="btn primary" type="button" disabled="@_busy" @onclick="DoExport">Download export bundle</button>
+    </div>
+
+    <div class="panel">
+        <h2>Import</h2>
+        <div class="h2-rule"></div>
+        <p class="head-desc">Restores routes + redaction/inspection from an exported bundle. The file is validated first; applying it rewrites the config files and requires the admin key (re-auth).</p>
+        <div class="file-import">
+            <InputFile accept=".json,application/json" OnChange="PickImport" />
+        </div>
+        @if (_importReady)
+        {
+            <div class="form-line" style="margin-top: 10px;">
+                <button class="btn primary" type="button" disabled="@_busy" @onclick="AskApplyImport">Apply import (admin key)</button>
+            </div>
+        }
+    </div>
+</div>
+
+<div class="note">
+    <b>Operator notes.</b> The local service reads config from its install dir
+    (<code class="path">C:\Services\AIRouterProxy</code> - editable files live in the <b>config</b> subfolder).
+    Every write made here is backed up to <code class="path">data\backups</code> before it lands, re-read and
+    shape-checked afterwards (the previous version is restored if the reload fails), and recorded in the audit log.
+    After editing a hot-reload file the dashboard reflects it immediately; after a restart the process uptime resets here.
+    Event log: <code class="path">AIRouterProxy</code> (start / stop / errors).
+</div>
+
+<AdminKeyPrompt @bind-Visible="_promptVisible"
+                Title="Admin key required"
+                Message="Applying an import rewrites routes.json and/or redaction.json. The admin key re-authenticates this sensitive operation."
+                OnSubmit="_pendingPrompt"
+                OnCompleted="OnPromptCompleted"
+                OnCancel="() => { }" />
+
+@code {
+    private DashboardStatus _status = new("ok", "0.0.0", DateTimeOffset.UtcNow, 0, 0, false, 0, 0, false, false, false);
+    private ConfigPathsView _paths = new(string.Empty, string.Empty, string.Empty, string.Empty, string.Empty, 0);
+
+    private AdminResult? _result;
+    private bool _busy;
+
+    private JsonNode? _importBundle;
+    private bool _importReady;
+    private bool _promptVisible;
+    private Func<string, Task<AdminResult>>? _pendingPrompt;
+
+    protected override void OnInitialized()
+    {
+        _status = Facade.GetStatus();
+        _paths = Facade.GetConfigPaths();
+    }
+
+    private async Task DoExport()
+    {
+        _busy = true;
+        try
+        {
+            var result = Admin.Export();
+            _result = result;
+            if (result.Ok && result.Data is not null)
+            {
+                var stamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss");
+                var json = result.Data.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+                await JS.InvokeVoidAsync("airproxyDownload", $"airproxy-export-{stamp}.json", json);
+            }
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task PickImport(InputFileChangeEventArgs e)
+    {
+        _result = null;
+        _importBundle = null;
+        _importReady = false;
+
+        var file = e.File;
+        if (file is null || file.Size <= 0)
+        {
+            _result = AdminResult.Failure("No file selected.", AdminResult.TypeValidation);
+            return;
+        }
+
+        try
+        {
+            await using var stream = file.OpenReadStream(maxAllowedSize: 5 * 1024 * 1024);
+            using var reader = new StreamReader(stream);
+            var text = await reader.ReadToEndAsync();
+            _importBundle = JsonNode.Parse(text);
+        }
+        catch (Exception ex) when (ex is JsonException or IOException or UnauthorizedAccessException)
+        {
+            _result = AdminResult.Failure("The selected file could not be read as JSON.", AdminResult.TypeValidation, new[] { ex.Message });
+            return;
+        }
+
+        _result = Admin.ValidateImport(_importBundle!);
+        _importReady = _result.Ok;
+    }
+
+    private void AskApplyImport()
+    {
+        if (_importBundle is null)
+        {
+            return;
+        }
+
+        var bundle = _importBundle;
+        _pendingPrompt = key => Task.FromResult(Admin.Import(bundle, key));
+        _promptVisible = true;
+    }
+
+    private async Task OnPromptCompleted(AdminResult result)
+    {
+        _result = result;
+        if (result.Ok)
+        {
+            _importBundle = null;
+            _importReady = false;
+        }
+    }
+
+    private static string FormatUptime(long totalSeconds)
+    {
+        var t = TimeSpan.FromSeconds(Math.Max(0, totalSeconds));
+        if (t.TotalDays >= 1) return $"{(int)t.TotalDays}d {t.Hours}h {t.Minutes}m";
+        if (t.TotalHours >= 1) return $"{(int)t.TotalHours}h {t.Minutes}m";
+        return $"{(int)t.TotalMinutes}m {t.Seconds}s";
+    }
+}

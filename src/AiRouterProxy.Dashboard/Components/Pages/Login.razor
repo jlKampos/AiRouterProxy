@@ -1,0 +1,36 @@
+@page "/login"
+
+<div class="login-wrap">
+    <div class="login-card">
+        <span class="logo">AP</span>
+        <h1>AiRouterProxy <span class="grad">Admin</span></h1>
+        <p class="sub">Administrative UI. Sign in with the primary local key - the same one used for /admin (Bearer).</p>
+
+        @if (Lockout)
+        {
+            <div class="note error">Too many failed attempts - rate limited. Try again later.</div>
+        }
+        else if (Invalid)
+        {
+            <div class="note error">Invalid local key. Check LOCAL_PROXY_KEY and try again.</div>
+        }
+
+        <form method="post" action="login">
+            <label for="key">Local key (primary)</label>
+            <input id="key" type="password" name="key" autocomplete="current-password" required />
+            <button class="btn primary" type="submit">Sign in</button>
+        </form>
+
+        <p class="hint">
+            Same authentication as /admin: the primary local key. Session cookie is HttpOnly + Secure and expires after 12h.
+        </p>
+    </div>
+</div>
+
+@code {
+    [SupplyParameterFromQuery(Name = "error")]
+    public string? Error { get; set; }
+
+    private bool Lockout => string.Equals(Error, "lockout", StringComparison.Ordinal);
+    private bool Invalid => string.Equals(Error, "1", StringComparison.Ordinal);
+}

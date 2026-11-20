@@ -5,7 +5,8 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.5.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases))
+**Current version:** 2.6.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases)) — the admin dashboard and admin
+API v1 described below are under development (2.6.x) and not yet part of a tagged release.
 
 ☕ Found this useful? [**Support the project**](https://buymeacoffee.com/jlkampos) with a coffee — every cup keeps the redaction growing.
 
@@ -29,6 +30,8 @@ route table lets you forward to several OpenAI-compatible providers, each with i
   - [Verify your changes](#verify-your-changes)
   - [Hot reload](#hot-reload)
 - [Local key](#local-key)
+- [Dashboard (admin UI)](#dashboard-admin-ui)
+- [Admin API (v1)](#admin-api-v1)
 - [Certificates](#certificates)
 - [Using from OpenCode (opencode.json)](#using-from-opencode-opencodejson)
 - [Tests](#tests)
@@ -113,7 +116,8 @@ non-sensitive content passing through untouched:
 - **Multiple accepted local keys** (`Proxy:Keys:LocalKeys`) for auth rotation
 - **SSE protocol adapters** (`src/AiRouterProxy/Sse/SseProtocol/`) for streamed forwards (OpenAI chat/responses,
   Anthropic, generic)
-- Admin endpoints protected by the primary local key only (`/admin/*`)
+- Admin Blazor dashboard (`/admin/ui`) + admin REST API v1 (`/admin/api/v1/*`) - both protected by
+  the primary local key only (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
 - Versioned via assembly info (SemVer, e.g. 2.0.4); reported by /admin/health
 
@@ -122,7 +126,7 @@ non-sensitive content passing through untouched:
 ```
 AiRouterProxy/
 |-- src/
-|   `-- AiRouterProxy/             # C# source, grouped by responsibility
+|   |-- AiRouterProxy/             # C# source (host), grouped by responsibility
 |       |-- Program.cs             # bootstrap + pipeline wiring
 |       |-- Pipeline/              # request pipeline (rate limit -> auth -> method -> route -> inspect -> redact -> forward)
 |       |   |-- ProxyMiddleware.cs
@@ -152,11 +156,27 @@ AiRouterProxy/
 |       |   |-- appsettings.Server.example.json  # TEMPLATE for the keys (copy to appsettings.Server.json)
 |       |   |-- redaction.json
 |       |   `-- routes.json
+|       |-- AdminUi/               # dashboard facade + read models (consumed by the Blazor pages)
+|       |   `-- HostDashboardFacade.cs
+|       |-- AdminApi/              # /admin/api/v1 REST endpoints (MapAdminApiV1.cs)
+|       |-- AdminServices/         # dashboard write operations (validate -> backup -> atomic write -> confirm -> audit)
+|       |   `-- DashboardAdminService.cs
+|       |-- AdminPersistence/      # config file IO, atomic writes, backups, key meta, audit log
+|       |   |-- ConfigFileReader.cs
+|       |   |-- AtomicJsonWriter.cs
+|       |   |-- ConfigBackup.cs            # timestamped backups in data\backups
+|       |   |-- KeyMetaStore.cs           # data\key-meta.json (owner/purpose + local-key labels)
+|       |   `-- AuditLog.cs               # data\audit.log (JSONL)
+|       |-- AdminValidation/       # dashboard model validation (routes/keys/security)
 |       `-- Properties/launchSettings.json
+|   `-- AiRouterProxy.Dashboard/   # Blazor Web App (admin UI): Components/Pages (Login, RoutesKeys, ActivityLog, Security, Settings, Home)
 |-- tests/
 |   |-- Unit/                      # offline unit harness (compiles the app sources directly)
 |   |   |-- Program.cs             #   no framework - 302 PASS
 |   |   `-- RedactorTests.csproj
+|   |-- Dashboard.Tests/           # admin dashboard harness (compiles app sources directly)
+|   |   |-- Program.cs             #   no framework - 224 PASS
+|   |   `-- DashboardTests.csproj
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- scripts/
 |   |-- proxy-menu.ps1             # interactive menu (build/deploy/verify/keys/event log) - the day-to-day entry point
@@ -179,6 +199,9 @@ AiRouterProxy/
 | `redaction.json` | Redaction flags, mask, allow-list + inspection & rate-limit policy (non-secret) | Yes |
 | `proxy-cert.pem` / `proxy-key.pem` | TLS certificate + private key (SECRET) | **No** (gitignored). Generated on the server |
 | `LOCAL_KEY.txt` | Last local key generated (SECRET) | **No** (gitignored) |
+| `data/key-meta.json` | Dashboard metadata only: keyRef owner/purpose + labels of extra local keys (fingerprints, **never key values**) | **No** (generated at runtime) |
+| `data/audit.log` | JSONL audit trail of dashboard admin writes (never secrets) | **No** (generated at runtime) |
+| `data/backups/` | Timestamped config backups taken before each dashboard write | **No** (generated at runtime) |
 | `deploy/`, `publish-tmp/` | Local service install and build output | **No** (gitignored) |
 
 > At the installed service, all config files live in a config subfolder next to the exe (the server reads from there when present - see [Deploy (installed service)](#deploy-installed-service)).
@@ -469,11 +492,23 @@ Per-client (by IP) request limiting and brute-force lockout.
 
 ### Verify your changes
 
-`/admin` endpoints are protected by the local key (`Proxy:Keys:LocalKey`):
+`/admin` endpoints are protected by the local key (`Proxy:Keys:LocalKey`). The admin REST API
+v1 is the current interface; the legacy endpoints below still work unchanged:
 
 ```powershell
+# admin API v1 (current)
+curl.exe --ssl-no-revoke https://localhost:4000/admin/api/v1/status -H "Authorization: Bearer <LocalKey>"
+# {"status":"ok","version":"2.6.x","routes":N,"redactionEnabled":true,...}
+
+curl.exe --ssl-no-revoke https://localhost:4000/admin/api/v1/routes -H "Authorization: Bearer <LocalKey>"
+# the current route table (key refs, never key values)
+
+curl.exe --ssl-no-revoke https://localhost:4000/admin/api/v1/keys -H "Authorization: Bearer <LocalKey>"
+# key refs (set/not set, in use) + local keys (fingerprints + labels)
+
+# legacy endpoints (still available, same answers)
 curl.exe --ssl-no-revoke https://localhost:4000/admin/health -H "Authorization: Bearer <LocalKey>"
-# {"status":"ok","version":"2.0.4",...}
+# {"status":"ok","version":"2.6.x",...}
 
 curl.exe --ssl-no-revoke https://localhost:4000/admin/endpoints -H "Authorization: Bearer <LocalKey>"
 # routes + allowed paths + current redaction flags (including exemptBase64)
@@ -482,23 +517,27 @@ curl.exe --ssl-no-revoke https://localhost:4000/admin/activity?hours=6 -H "Autho
 # recent requests; entries with "redacted" > 0 had content masked
 ```
 
-### Who can access `/admin` (swagger)
+### Who can access `/admin` (dashboard UI + admin REST API v1)
 
 Only local keys authenticate clients; `/admin` is stricter and accepts **only the primary
-local key** (`Proxy:Keys:LocalKey`) - never the extra ones:
+local key** (`Proxy:Keys:LocalKey`) - never the extra ones. This covers the Blazor dashboard
+(`/admin/ui/*`) and the admin REST API v1 (`/admin/api/v1/*`), plus the legacy `/admin/*`
+endpoints:
 
-| Key | Where it lives | `/v1/*` (API) | `/admin/*` (swagger ops) |
+| Key | Where it lives | Proxied API (`/v1/*`) | Dashboard + admin API (`/admin/*`) |
 |---|---|---|---|
 | `LocalKey` (primary) | `Proxy:Keys:LocalKey` | ✅ | ✅ the only one with admin |
 | Extra local keys (per engineer/agent) | `Proxy:Keys:LocalKeys` | ✅ | ❌ `401` |
 | Route / upstream keys | `Proxy:RouteKeys` (`keyRef`) | ❌ never accepted from clients | ❌ |
 
-- Engineer/agent keys in `LocalKeys` use the proxied API (`/v1/*`) but get `401` on all
-  `/admin/*` - by design, there are no per-key admin grants.
+- Engineer/agent keys in `LocalKeys` use the proxied API (`/v1/*`) but get `401` on the
+  dashboard login and on every `/admin/*` call - by design, there are no per-key admin grants.
 - `Proxy:RouteKeys` are upstream credentials the proxy uses server-side; they are never
   accepted as a client `Bearer` and grant nothing client-facing.
-- The `/swagger` UI page itself is served without auth (read-only documentation); calling any
-  documented operation requires the primary local key.
+- Secret values are **write-only everywhere**: the dashboard UI, the admin API and the audit
+  log only ever handle fingerprints/hashes, never the keys themselves.
+- Swagger still serves the legacy admin surface at `/swagger` (read-only docs, no auth for
+  the page itself; calling any operation still requires the primary local key).
 
 When a request is censored the response carries `X-AIRouter-Redacted: <count>` and, if
 `notifyInResponse` is set, a visible notice - use both to confirm a redaction rule behaves as
@@ -535,6 +574,68 @@ powershell -ExecutionPolicy Bypass -File .\scripts\genApiKey.ps1 -Write -DeployD
 With `-Write`, the script prints the key hash (never the key itself) and stores the key in
 `LOCAL_KEY.txt` for the client to copy.
 
+## Dashboard (admin UI)
+
+A Blazor Web App served by the proxy itself at `https://<host>:4000/admin/ui/...`, protected by
+the **primary local key only** (the extra keys authenticate the proxied API but never `/admin`).
+It is a *helper*: every write goes through the same config files (`config\routes.json`,
+`config\redaction.json`, `config\appsettings.Server.json`) that the proxy hot-reloads, so the
+proxy works fully without the dashboard and the JSON files remain the source of truth.
+
+- **Login** (`/admin/ui/login`) - enter the primary local key once; a session cookie keeps you
+  authenticated (logout clears it). Keys are **write-only**: the UI and the API only ever see
+  fingerprints/hashes, never the values.
+- **Routes & Keys** (`/admin/ui/routes`)
+  - Route table: add/edit/delete routes (prefix, upstream, keyRef, headers, timeouts). Saves to
+    `routes.json` with hot reload; new rows come pre-filled with the proxy defaults
+    (300000 ms timeout / 20971520 bytes max body).
+  - Route keys (`keyRef`): each ref shows a **chip** — `set` / `not set` — plus `in use` when a
+    route references it; set/rotate the secret (write-only) or delete the ref (refused while in
+    use). Optional owner/purpose metadata per ref (non-secret, stored in `data/key-meta.json`).
+  - Local keys: the primary is fixed as `primary (admin)`; each extra key can carry a display
+    **label** (e.g. the engineer's name or the laptop it was assigned to) that replaces the
+    default `extra #N` — saved via `PUT /admin/api/v1/local-keys/{hash}/label`. Labels are
+    metadata (fingerprint -> name) in `data/key-meta.json`; the secret values never live there.
+  - Upstream key: set/rotate the key used for the default upstream when no route matches.
+- **Activity** (`/admin/ui/activity`) - per-request log. Every entry shows the **presented
+  hash** (fingerprint of the key that made the request, so usage is attributable by owner
+  without exposing keys); refused requests additionally show the **expected hash** (or
+  `(multiple keys)` when several keys match and the presented value is ambiguous) and are
+  highlighted in red.
+- **Security** (`/admin/ui/security`) - redaction, inspection and rate-limit settings (the
+  same knobs as `redaction.json`), with restore/rollback on failed reload.
+- **Settings** (`/admin/ui/settings`) - export / validate / import the whole config bundle
+  (validation first, apply after) and reload with automatic rollback when reload fails.
+
+## Admin API (v1)
+
+REST API under `/admin/api/v1/*`, authenticated with `Authorization: Bearer <primary local
+key>` (same key as `/admin`/UI) and protected by the same rate limiter. Errors are typed JSON
+(`validation_error`, `authentication_error`, `not_found`, `conflict`, `rate_limited`).
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| `GET` | `/admin/api/v1/status` | Service status + version |
+| `GET` | `/admin/api/v1/routes` | Current route table |
+| `PUT` | `/admin/api/v1/routes` | Replace the route table |
+| `GET` | `/admin/api/v1/keys` | Key refs (with set/in-use status) + local keys (fingerprints + labels) |
+| `PUT` | `/admin/api/v1/keys/{keyRef}` | Create/ensure a keyRef declaration (no secret yet) |
+| `PUT` | `/admin/api/v1/keys/{keyRef}/secret` | Set/rotate the keyRef secret (write-only) |
+| `PUT` | `/admin/api/v1/keys/{keyRef}/meta` | Update owner/purpose metadata |
+| `DELETE` | `/admin/api/v1/keys/{keyRef}` | Delete the keyRef (refused while in use) |
+| `PUT` | `/admin/api/v1/local-keys/{hash}/label` | Set/clear the display label of an extra local key |
+| `GET` | `/admin/api/v1/security` | Redaction / inspection settings |
+| `PUT` | `/admin/api/v1/security` | Update redaction and/or inspection sections |
+| `POST` | `/admin/api/v1/keys/lookup` | Resolve a presented hash to its owner (local key / keyRef) |
+| `GET` | `/admin/api/v1/config/export` | Download the full config bundle (as attachment) |
+| `POST` | `/admin/api/v1/config/validate` | Validate an import bundle without applying it |
+| `POST` | `/admin/api/v1/config/import` | Apply an import bundle (backup + atomic write) |
+| `POST` | `/admin/api/v1/config/reload` | Re-read config from disk; restore on failed reload |
+
+Two dashboard operations exist only as service methods used by the UI (there is no v1 endpoint
+for them): adding and removing extra local keys. The legacy `/admin/*` endpoints documented
+above under [Verify your changes](#verify-your-changes) remain available and unchanged.
+
 ## Certificates
 
 The proxy serves HTTPS on `https://localhost:4000`. The certificate is a self-signed cert trusted
@@ -552,7 +653,7 @@ mkcert -install
 # generate cert + key covering the hostnames the proxy is reached by
 # (run inside the folder the service reads the certs from, e.g. deploy/)
 cd C:\Path\To\deploy
-mkcert -key-file proxy-key.pem -cert-file proxy-cert.pem localhost winzone 127.0.0.1
+mkcert -key-file proxy-key.pem -cert-file proxy-cert.pem localhost winzone 192.168.1.77 127.0.0.1
 ```
 
 Add every name clients will use (localhost, the machine name, LAN IP...). The files stay in the deploy
@@ -574,7 +675,7 @@ Verification: `curl.exe --ssl-no-revoke https://localhost:4000/admin/health -H "
 ### Alternative without mkcert (PFX)
 
 ```powershell
-$cert = New-SelfSignedCertificate -DnsName "localhost","winzone" -CertStoreLocation Cert:\LocalMachine\My
+$cert = New-SelfSignedCertificate -DnsName "localhost","winzone","192.168.1.77" -CertStoreLocation Cert:\LocalMachine\My
 $pwd = ConvertTo-SecureString "a-password" -AsPlainText -Force
 Export-PfxCertificate -Cert $cert -FilePath proxy-cert.pfx -Password $pwd
 ```
@@ -1426,6 +1527,46 @@ a remote MCP server, the three providers and a full team of specialized agents
             "action": "external_directory",
             "resource": "*",
             "effect": "ask"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.db",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.sqlite",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.sqlite3",
+            "effect": "deny"
+        },
+        {
+            "action": "read",
+            "resource": "**/*.sql",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.db",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.sqlite",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.sqlite3",
+            "effect": "deny"
+        },
+        {
+            "action": "edit",
+            "resource": "**/*.bak",
+            "effect": "deny"
         }
     ],
     "mcp": {
@@ -1610,7 +1751,7 @@ a remote MCP server, the three providers and a full team of specialized agents
             "description": "Primary agent that coordinates research, solution design, planning, implementation, and review. Requires explicit user approval before implementation.",
             "mode": "primary",
             "model": "airouter/DeepSeek-V4-Flash#xhigh",
-            "system": "You are a senior software architect and the project's main orchestrator.\n\nObjective:\nCoordinate the work and delegate each phase to the appropriate specialized agent. Don't do all the work alone when delegation adds value.\n\nFlow:\n1. Clarify requirements only when there is blocking ambiguity.\n2. Use Explore to investigate the code and identify existing patterns.\n3. Use Brainstorm to compare approaches when there are architectural decisions or more than one reasonable solution.\n4. Use Plan to structure complex changes.\n5. Present the complete implementation plan to the user.\n6. STOP and wait for explicit user approval.\n7. Only after approval, invoke Build to implement the approved plan.\n8. Use Reviewer to review the implementation.\n9. If the review finds issues, route fixes to Build and request review again.\n10. Consolidate the results, tests, limitations, and decisions for the user.\n\nMANDATORY HUMAN APPROVAL:\n- NEVER invoke Build before presenting the implementation plan to the user.\n- NEVER implement changes immediately after planning.\n- Present the problem analysis, proposed solution, affected files, implementation steps, risks and tests.\n- Explicitly ask the user whether they approve the plan.\n- WAIT for the user's response.\n- If the user requests modifications, update the plan and ask again.\n- If the user rejects the plan, do not implement it.\n- Silence or ambiguous responses are not approval.\n- Once approved, implement only the approved plan.\n- If significant changes to the approved plan become necessary, stop and request approval again.\n- Approval for one task does not authorize future tasks.\n\nRules:\n- Don't invent files, APIs, test results, or capabilities.\n- Before proposing changes, consider the existing architecture and conventions.\n- For small tasks, avoid unnecessary delegation.\n- Don't ask every agent to do the same analysis.\n- Don't bypass permissions or read protected files.\n- Don't run destructive operations, deploys, commits, pushes, infrastructure changes, or SQL commands without explicit approval.\n- Respond in European Portuguese unless instructed otherwise.\n- At the end, present a summary, changed files, tests run, and risks/pending items.",
+            "system": "You are a senior software architect and the project's main orchestrator.\n\nObjective:\nCoordinate the work and delegate each phase to the appropriate specialized agent. Don't do all the work alone when delegation adds value.\n\nFlow:\n1. Clarify requirements only when there is blocking ambiguity.\n2. Use Explore to investigate the code and identify existing patterns.\n3. Use Brainstorm to compare approaches when there are architectural decisions or more than one reasonable solution.\n4. Use Plan to structure complex changes.\n5. Present the complete implementation plan to the user.\n6. STOP and wait for explicit user approval.\n7. Only after approval, invoke Build to implement the approved plan.\n8. After implementation, invoke Tester to run the relevant tests, builds, and validation checks.\n9. If Tester finds failures, route the necessary fixes to Build and invoke Tester again.\n10. Once tests pass, invoke Reviewer to review the implementation.\n11. If Reviewer finds issues, route fixes to Build, then invoke Tester again to validate the fixes, followed by another Reviewer review.\n12. Repeat the validation and review cycle until the implementation passes or a blocker requires user intervention.\n13. Consolidate the results, tests, limitations, and decisions for the user.\n\nMANDATORY HUMAN APPROVAL:\n- NEVER invoke Build before presenting the implementation plan to the user.\n- NEVER implement changes immediately after planning.\n- Present the problem analysis, proposed solution, affected files, implementation steps, risks and tests.\n- Explicitly ask the user whether they approve the plan.\n- WAIT for the user's response.\n- If the user requests modifications, update the plan and ask again.\n- If the user rejects the plan, do not implement it.\n- Silence or ambiguous responses are not approval.\n- Once approved, implement only the approved plan.\n- If significant changes to the approved plan become necessary, stop and request approval again.\n- Approval for one task does not authorize future tasks.\n\nAGENT RESPONSIBILITIES:\n- Explore: Investigate the codebase, identify relevant files, dependencies, and existing patterns. Read-only.\n- Brainstorm: Compare possible solutions and explain architectural trade-offs. No implementation.\n- Plan: Produce a structured implementation plan. No implementation.\n- Build: Implement only the approved plan and fix issues identified by Tester or Reviewer.\n- Tester: Run relevant tests, builds, linters, and validation checks. Analyze failures and report results. Do not modify project files.\n- Reviewer: Independently review the implementation for correctness, security, maintainability, regressions, and adherence to the approved plan. Read-only.\n\nRules:\n- Don't invent files, APIs, test results, or capabilities.\n- Before proposing changes, consider the existing architecture and conventions.\n- For small tasks, avoid unnecessary delegation.\n- Don't ask every agent to do the same analysis.\n- Tester must report which commands were executed and their actual results. Never claim tests passed if they were not run.\n- Reviewer must perform an independent review and must not assume that passing tests means the implementation is correct.\n- Don't bypass permissions or read protected files.\n- Don't run destructive operations, deploys, commits, pushes, infrastructure changes, or SQL commands without explicit approval.\n- Respond in European Portuguese unless instructed otherwise.\n- At the end, present a summary, changed files, tests run, review findings, and risks/pending items.",
             "permissions": [
                 {
                     "action": "edit",
@@ -1651,6 +1792,11 @@ a remote MCP server, the three providers and a full team of specialized agents
                     "action": "subagent",
                     "resource": "reviewer",
                     "effect": "allow"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "tester",
+                    "effect": "allow"
                 }
             ]
         },
@@ -1668,6 +1814,26 @@ a remote MCP server, the three providers and a full team of specialized agents
                 {
                     "action": "shell",
                     "resource": "*",
+                    "effect": "ask"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git status *",
+                    "effect": "allow"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git diff *",
+                    "effect": "allow"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git log *",
+                    "effect": "allow"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git show *",
                     "effect": "allow"
                 },
                 {
@@ -1714,6 +1880,26 @@ a remote MCP server, the three providers and a full team of specialized agents
                 {
                     "action": "shell",
                     "resource": "*",
+                    "effect": "ask"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git status *",
+                    "effect": "allow"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git diff *",
+                    "effect": "allow"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git log *",
+                    "effect": "allow"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git show *",
                     "effect": "allow"
                 },
                 {
@@ -1954,6 +2140,59 @@ a remote MCP server, the three providers and a full team of specialized agents
                 },
                 {
                     "action": "shell",
+                    "resource": "git push *",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "git fetch *",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*sqlcmd*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*psql*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*mysql*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*sqlite3*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
+                    "resource": "*mongosh*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "subagent",
+                    "resource": "*",
+                    "effect": "deny"
+                }
+            ]
+        },
+        "tester": {
+            "description": "Executes and validates automated tests, builds, integration tests, and acceptance criteria without modifying application code.",
+            "mode": "all",
+            "model": "airouter/DeepSeek-V4-Flash",
+            "system": "You are a senior QA automation engineer.\n\nYour responsibilities:\n- Execute relevant unit tests.\n- Execute integration tests when available.\n- Validate acceptance criteria.\n- Execute application builds when appropriate.\n- Identify regressions and test failures.\n- Report reproducible problems.\n\nConstraints:\n- Do not modify application files.\n- Do not modify tests to make them pass.\n- Do not delete files or databases.\n- Do not run deployments, commits, pushes or SQL commands.\n- Do not claim tests passed unless they were actually executed.\n\nDeliverables:\n1. Tests executed.\n2. Build results.\n3. Passed and failed tests.\n4. Regressions detected.\n5. Recommendations.",
+            "permissions": [
+                {
+                    "action": "edit",
+                    "resource": "*",
+                    "effect": "deny"
+                },
+                {
+                    "action": "shell",
                     "resource": "*",
                     "effect": "ask"
                 },
@@ -1971,7 +2210,7 @@ a remote MCP server, the three providers and a full team of specialized agents
 - `apiKey` reads `{env:AIROUTER_API_KEY}` in every provider - set that environment
   variable to the proxy **LocalKey** (never an upstream key; see
   [appsettings.Server.json](#appsettingsserverjson)).
-- `baseURL` uses `https://winzone:4000/...` - on a network machine replace
++
   `winzone` with the machine name or LAN IP covered by the mkcert certificate
   (see [Certificates](#certificates)).
 - `permissions` starts with an explicit `allow-all` baseline and then hard-denies
@@ -2096,6 +2335,19 @@ limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE pro
 ```powershell
 dotnet run --project tests/Unit/RedactorTests.csproj -c Release
 # -> RESULT: 302 PASS, 0 FAIL
+```
+
+### Dashboard harness (offline, no framework, no packages)
+
+Same `Check`/`CheckTrue` philosophy (no xUnit), compiled against the dashboard sources
+(`AdminServices`, `AdminPersistence`, `AdminValidation`, `AdminUi` facade). Covers the admin
+write path (validate -> backup -> atomic write -> re-read/confirm -> audit), route/key/secret
+operations, KeyMetaStore persistence (owner/purpose + local-key labels), config export/
+validate/import/reload and the runtime dashboard state:
+
+```powershell
+dotnet run --project tests/Dashboard.Tests/DashboardTests.csproj -c Release
+# -> RESULT: 224 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)
