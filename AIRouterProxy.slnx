@@ -1,5 +1,7 @@
 <Solution>
+  <Project Path="src/AiRouterProxy.Dashboard/AiRouterProxy.Dashboard.csproj" Id="a656f7e0-5de9-46f5-9a19-dbe59d5bb324" />
   <Project Path="src/AiRouterProxy/AIRouterProxy.csproj" />
+  <Project Path="tests/Dashboard.Tests/DashboardTests.csproj" />
   <Project Path="tests/Integration/Integration.csproj" />
   <Project Path="tests/Unit/RedactorTests.csproj" />
 </Solution>

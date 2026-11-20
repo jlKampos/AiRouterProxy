@@ -138,6 +138,10 @@ public sealed class ProxyMiddleware
             return;
         }
 
+        // The presented local key was accepted: record its fingerprint for the activity
+        // log (key attribution without ever storing the key itself).
+        presentedHash = SecurityHelpers.HashShort(SecurityHelpers.Sha256Hex(clientKey));
+
         // 2. HTTP method
         if (context.Request.Method != HttpMethods.Get && context.Request.Method != HttpMethods.Post)
         {

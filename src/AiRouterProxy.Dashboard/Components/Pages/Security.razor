@@ -1,0 +1,264 @@
+@page "/security"
+@inject IDashboardFacade Facade
+@inject IDashboardAdminService Admin
+
+<h1 class="title"><span class="grad">Security</span></h1>
+<p class="sub">Redaction and inspection behaviour (redaction.json, hot-reloaded - no admin key needed, these settings contain no secrets). Rate limiting is a startup snapshot and requires a restart.</p>
+
+<ResultBanner Result="@_result" />
+
+@if (_busy)
+{
+    <div class="note amber"><b>Working...</b> writing redaction.json.</div>
+}
+
+<div class="hero">
+    <div class="herocard c-amber">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Local keys</h2></div>
+        <div class="hc-num">@Facade.LocalKeyCount()</div>
+        <div class="hc-sub">primary + extra (values never shown)</div>
+    </div>
+    <div class="herocard @(_rateLimitEnabled ? "c-green" : "c-red")">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Rate limit</h2></div>
+        <div class="hc-num">@(_rateLimitEnabled ? "ON" : "OFF")</div>
+        <div class="hc-sub">per-client sliding window</div>
+    </div>
+    <div class="herocard @(_redEnabled ? "c-green" : "c-red")">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Redaction</h2></div>
+        <div class="hc-num">@(_redEnabled ? "ON" : "OFF")</div>
+        <div class="hc-sub">sensitive content scrubbed</div>
+    </div>
+    <div class="herocard @(_inspEnabled ? "c-green" : "c-red")">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Inspection</h2></div>
+        <div class="hc-num">@(_inspEnabled ? "ON" : "OFF")</div>
+        <div class="hc-sub">fail-closed body inspection</div>
+    </div>
+</div>
+
+<div class="row2">
+    <div class="panel">
+        <h2>Redaction</h2>
+        <div class="h2-rule"></div>
+        <p class="head-desc">What sensitive content is masked in outgoing messages before it is forwarded. Saved to redaction.json (hot reload).</p>
+
+        <div class="form-grid">
+            <label class="fcheck"><input type="checkbox" @bind="_redEnabled" /> <span>Enabled</span></label>
+            <label class="fcheck"><input type="checkbox" @bind="_notify" /> <span>Notify in response</span></label>
+            <label class="ffield"><span>Mask literal</span><input class="text-input" @bind="_mask" placeholder="••••••" /></label>
+            <label class="ffield"><span>Warn template</span><input class="text-input" @bind="_warnTemplate" placeholder="Supports {Count} and {Kinds}" /></label>
+        </div>
+
+        <h3 class="block-h">Detection layers</h3>
+        <div class="form-grid">
+            <label class="fcheck"><input type="checkbox" @bind="_byFieldName" /> <span>By field name</span></label>
+            <label class="fcheck"><input type="checkbox" @bind="_byFormats" /> <span>By known formats</span></label>
+            <label class="fcheck"><input type="checkbox" @bind="_byKeyValueContext" /> <span>Key/value context</span></label>
+            <label class="fcheck"><input type="checkbox" @bind="_byLongStrings" /> <span>Long strings</span></label>
+            <label class="fcheck"><input type="checkbox" @bind="_exemptBase64" /> <span>Exempt base64 blobs</span></label>
+            <label class="ffield"><span>Entropy threshold (0-8)</span><input class="text-input" type="number" step="0.1" min="0" max="8" @bind="_entropy" /></label>
+        </div>
+
+        <h3 class="block-h">Allow-list (one regex per line)</h3>
+        <textarea class="text-input area" rows="4" @bind="_allowText" placeholder="^ACME-[0-9]{3,5}-"></textarea>
+
+        <div class="tbl-actions">
+            <button class="btn primary" type="button" disabled="@_busy" @onclick="SaveSecurity">Save redaction + inspection</button>
+        </div>
+    </div>
+
+    <div class="panel">
+        <h2>Inspection</h2>
+        <div class="h2-rule"></div>
+        <p class="head-desc">Fail-closed request body policy. An uninspected request is never forwarded.</p>
+
+        <div class="form-grid">
+            <label class="fcheck"><input type="checkbox" @bind="_inspEnabled" /> <span>Enabled</span></label>
+            <label class="ffield">
+                <span>Default action (unknown types)</span>
+                <select class="text-input" @bind="_defaultAction">
+                    <option value="block">block</option>
+                    <option value="pass">pass</option>
+                    <option value="inspect">inspect</option>
+                </select>
+            </label>
+            <label class="ffield">
+                <span>Invalid JSON handling</span>
+                <select class="text-input" @bind="_invalidJson">
+                    <option value="block">block</option>
+                    <option value="warn">warn</option>
+                </select>
+            </label>
+        </div>
+
+        <h3 class="block-h">By content type</h3>
+        @foreach (var row in _byContentType)
+        {
+            <div class="form-line ct-row">
+                <input class="cell-input wide" @bind="row.Type" placeholder="application/json" />
+                <select class="cell-input" @bind="row.Action">
+                    <option value="inspect">inspect</option>
+                    <option value="block">block</option>
+                    <option value="pass">pass</option>
+                </select>
+                <button class="btn small" type="button" @onclick="() => RemoveCt(row)" title="Removes this content type rule. Saved when you click 'Save redaction + inspection'.">Remove</button>
+            </div>
+        }
+        <button class="btn ghost small" type="button" @onclick="AddCt" title="Adds a content type to inspect or block.">+ content type</button>
+
+        <div class="note amber" style="margin-top: 18px;">
+            <b>Rate limit</b> is a startup snapshot (<span class="mono">@(_rateLimitEnabled ? "on" : "off")</span>,
+            @(_rlMax) req / @(_rlWindow)s window, @(_rlFailures) failures / @(_rlFailureWindow)s lockout @(_rlLockout)s).
+            Changes require a service restart.
+        </div>
+    </div>
+</div>
+
+@code {
+    private bool _redEnabled = true;
+    private string _mask = string.Empty;
+    private bool _notify = true;
+    private string _warnTemplate = string.Empty;
+    private bool _byFieldName = true;
+    private bool _byFormats = true;
+    private bool _byKeyValueContext = true;
+    private bool _byLongStrings = true;
+    private bool _exemptBase64 = true;
+    private double _entropy = 3.0;
+    private string _allowText = string.Empty;
+
+    private bool _inspEnabled = true;
+    private string _defaultAction = "block";
+    private string _invalidJson = "block";
+    private List<CtRow> _byContentType = new();
+
+    private bool _rateLimitEnabled = true;
+    private int _rlMax;
+    private int _rlWindow;
+    private int _rlFailures;
+    private int _rlFailureWindow;
+    private int _rlLockout;
+
+    private AdminResult? _result;
+    private bool _busy;
+
+    protected override void OnInitialized() => Load();
+
+    private void Load()
+    {
+        var s = Facade.GetSecurityOptions();
+        ApplyView(s);
+    }
+
+    /// <summary>
+    /// Refresh from the saved file instead of the (debounced, still-stale) live snapshot:
+    /// right after SaveAtomic the IOptionsMonitor has not reloaded yet. Falls back to the
+    /// current fields (the ones just written) if the file cannot be read.
+    /// </summary>
+    private void LoadFromDisk()
+    {
+        var s = Facade.GetSecurityOptionsFromDisk();
+        if (s is null)
+        {
+            return;
+        }
+
+        ApplyView(s);
+    }
+
+    private void ApplyView(SecurityOptionsView s)
+    {
+        _redEnabled = s.Redaction.Enabled;
+        _mask = s.Redaction.Mask ?? string.Empty;
+        _notify = s.Redaction.NotifyInResponse;
+        _warnTemplate = s.Redaction.WarnTemplate ?? string.Empty;
+        _byFieldName = s.Redaction.Detect.ByFieldName;
+        _byFormats = s.Redaction.Detect.ByFormats;
+        _byKeyValueContext = s.Redaction.Detect.ByKeyValueContext;
+        _byLongStrings = s.Redaction.Detect.ByLongStrings;
+        _exemptBase64 = s.Redaction.Detect.ExemptBase64;
+        _entropy = s.Redaction.Detect.EntropyThreshold;
+        _allowText = string.Join(Environment.NewLine, s.Redaction.Allow);
+
+        _inspEnabled = s.Inspection.Enabled;
+        _defaultAction = s.Inspection.DefaultAction;
+        _invalidJson = s.Inspection.InvalidJson;
+        _byContentType = s.Inspection.ByContentType
+            .Select(kv => new CtRow(kv.Key, kv.Value))
+            .ToList();
+
+        _rateLimitEnabled = s.RateLimit.Enabled;
+        _rlMax = s.RateLimit.MaxRequestsPerWindow;
+        _rlWindow = s.RateLimit.RequestWindowSeconds;
+        _rlFailures = s.RateLimit.MaxFailuresPerWindow;
+        _rlFailureWindow = s.RateLimit.FailureWindowSeconds;
+        _rlLockout = s.RateLimit.LockoutSeconds;
+    }
+
+    private void SaveSecurity()
+    {
+        _busy = true;
+        try
+        {
+            var allowArray = new System.Text.Json.Nodes.JsonArray();
+            foreach (var pattern in _allowText.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                allowArray.Add(pattern);
+            }
+
+            var redaction = new System.Text.Json.Nodes.JsonObject
+            {
+                ["enabled"] = _redEnabled,
+                ["mask"] = _mask,
+                ["notifyInResponse"] = _notify,
+                ["warnTemplate"] = _warnTemplate,
+                ["detect"] = new System.Text.Json.Nodes.JsonObject
+                {
+                    ["byFieldName"] = _byFieldName,
+                    ["byFormats"] = _byFormats,
+                    ["byKeyValueContext"] = _byKeyValueContext,
+                    ["byLongStrings"] = _byLongStrings,
+                    ["exemptBase64"] = _exemptBase64,
+                    ["entropyThreshold"] = _entropy,
+                },
+                ["allow"] = allowArray,
+            };
+
+            var byContentType = new System.Text.Json.Nodes.JsonObject();
+            foreach (var row in _byContentType)
+            {
+                if (!string.IsNullOrWhiteSpace(row.Type))
+                {
+                    byContentType[row.Type] = row.Action;
+                }
+            }
+
+            var inspection = new System.Text.Json.Nodes.JsonObject
+            {
+                ["enabled"] = _inspEnabled,
+                ["defaultAction"] = _defaultAction,
+                ["invalidJson"] = _invalidJson,
+                ["byContentType"] = byContentType,
+            };
+
+            _result = Admin.ApplySecurity(redaction, inspection);
+            if (_result.Ok)
+            {
+                LoadFromDisk();
+            }
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private void AddCt() => _byContentType.Add(new CtRow(string.Empty, "block"));
+
+    private void RemoveCt(CtRow row) => _byContentType.Remove(row);
+
+    private sealed class CtRow(string type, string action)
+    {
+        public string Type { get; set; } = type;
+        public string Action { get; set; } = action;
+    }
+}

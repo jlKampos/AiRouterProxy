@@ -3,17 +3,32 @@ using System.Reflection;
 using System.Net;
 using System.Security.Cryptography.X509Certificates;
 using AIRouterProxy;
+using AiRouterProxy.AdminApi;
+using AiRouterProxy.AdminPersistence;
+using AiRouterProxy.AdminServices;
+using AiRouterProxy.AdminUi;
+using AiRouterProxy.Dashboard;
+using AiRouterProxy.Dashboard.Models;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi;
 
 var baseDir = AppContext.BaseDirectory;
 var configDir = ConfigPaths.ResolveConfigDir(baseDir);
+var dataDir = DashboardPaths.ResolveDataDir(configDir, baseDir);
+var dashboardPaths = new DashboardPaths(baseDir, configDir, dataDir);
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
     Args = args,
     ContentRootPath = configDir,
+    // The deploy layout redirects ContentRoot to the config subfolder so the
+    // server config JSONs resolve there. But Blazor static web assets (app.css,
+    // blazor.web.js, ...) are resolved relative to the WebRoot (default
+    // ContentRoot/wwwroot), which is an empty folder in that layout - so every
+    // dashboard asset was served with an empty body (HTTP 200, 0 bytes) and the
+    // UI rendered unstyled. Point the WebRoot at the real published wwwroot.
+    WebRootPath = Path.Combine(baseDir, "wwwroot"),
 });
 
 // Server-specific config (keys/certificates) - lives only on the target machine.
@@ -30,9 +45,21 @@ builder.Services.AddWindowsService(options => options.ServiceName = "AIRouterPro
 
 builder.Services.AddSingleton<ActivityStore>();
 
+// Admin dashboard UI - Blazor Web App served under /admin/ui in the same process.
+builder.Services.AddDashboard(DashboardExtensions.BasePath);
+builder.Services.AddSingleton<UiSessionManager>();
+builder.Services.AddSingleton(dashboardPaths);
+builder.Services.AddSingleton<ConfigBackup>();
+builder.Services.AddSingleton<ReloadConfirmer>();
+builder.Services.AddSingleton<KeyMetaStore>();
+builder.Services.AddSingleton<AuditLog>();
+builder.Services.AddSingleton<IDashboardAdminService, DashboardAdminService>();
+builder.Services.AddSingleton<HostDashboardFacade>();
+builder.Services.AddSingleton<IDashboardFacade>(sp => sp.GetRequiredService<HostDashboardFacade>());
+
 // Swagger / explorable API
 // Version comes from the assembly (same value /admin/health reports), so it never drifts from the csproj.
-var serviceVersion = typeof(Program).Assembly.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0] ?? "0.0.0";
+var serviceVersion = System.Reflection.Assembly.GetExecutingAssembly().GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0] ?? "0.0.0";
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
@@ -100,13 +127,22 @@ var app = builder.Build();
 
 EnsureEventLogExists();
 
+// Admin UI (Blazor) lives under /admin/ui: the path base is stripped here so the Blazor
+// router sees relative paths inside the subtree. UsePathBase only touches /admin/ui requests.
+app.UsePathBase(DashboardExtensions.BasePath);
+app.UseWhen(
+    ctx => ctx.Request.PathBase.HasValue && ctx.Request.PathBase.StartsWithSegments(DashboardExtensions.BasePath),
+    branch => branch.UseMiddleware<UiSessionMiddleware>());
+
 // The proxy forwards everything except /admin and /swagger. The /v1/* paths stay the same.
 app.UseWhen(
-    ctx => !ctx.Request.Path.StartsWithSegments("/admin") && !ctx.Request.Path.StartsWithSegments("/swagger"),
+    ctx => !ctx.Request.Path.StartsWithSegments("/admin") && !ctx.Request.Path.StartsWithSegments("/swagger")
+        && !ctx.Request.PathBase.StartsWithSegments("/admin"),
     branch => branch.UseMiddleware<ProxyMiddleware>());
 
-// Admin endpoints require the same local key (Bearer).
-app.UseWhen(ctx => ctx.Request.Path.StartsWithSegments("/admin"),
+// Admin endpoints require the same local key (Bearer). The UI subtree has its own cookie session.
+app.UseWhen(ctx => ctx.Request.Path.StartsWithSegments("/admin")
+        && !ctx.Request.PathBase.HasValue,
     branch => branch.UseMiddleware<AdminAuthMiddleware>());
 
 app.UseSwagger();
@@ -181,6 +217,10 @@ app.MapGet("/admin/endpoints", (IOptionsMonitor<ProxyOptions> opts) =>
             new { method = "DELETE", path = "/admin/activity", description = "Clears the activity log." },
             new { method = "DELETE", path = "/admin/logs", description = "Clears the proxy Event Log and the activity log." },
             new { method = "GET", path = "/admin/health", description = "Service status." },
+            new { method = "GET", path = "/admin/api/v1/status", description = "Write API: status (same Bearer key as /admin)." },
+            new { method = "PUT", path = "/admin/api/v1/routes", description = "Write API: replace the route table (routes.json, hot reload)." },
+            new { method = "PUT", path = "/admin/api/v1/keys/{keyRef}/secret", description = "Write API: set/rotate a route key secret (write-only)." },
+            new { method = "POST", path = "/admin/api/v1/config/import", description = "Write API: import a no-secrets config bundle." },
         },
     });
 });
@@ -288,12 +328,19 @@ app.MapGet("/admin/health", (ActivityStore store) =>
     return Results.Ok(new
     {
         status = "ok",
-        version = typeof(Program).Assembly.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0] ?? "0.0.0",
+        version = System.Reflection.Assembly.GetExecutingAssembly().GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion?.Split('+')[0] ?? "0.0.0",
         timestamp = DateTimeOffset.UtcNow,
         uptimeSec = (long)uptime.TotalSeconds,
         activity = store.Count,
     });
 });
+
+// Admin write API v1 - same Bearer + rate limit gate as the /admin endpoints above,
+// mapped to AdminResult responses (400 validation / 401 auth / 409 conflict / 500 sanitized).
+app.MapAdminApiV1();
+
+app.UseAntiforgery();
+app.MapDashboard();
 
 app.Run();
 

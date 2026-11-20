@@ -1,0 +1,130 @@
+@using AiRouterProxy.Dashboard.Models
+
+@if (Visible)
+{
+    <div class="modal-backdrop">
+        <div class="modal">
+            <h3>@Title</h3>
+            @if (!string.IsNullOrEmpty(Message))
+            {
+                <p class="modal-msg">@Message</p>
+            }
+            @if (_invalid)
+            {
+                <div class="note error">Invalid admin key - the operation was not performed. Try again.</div>
+            }
+            @if (!string.IsNullOrEmpty(_errorMessage))
+            {
+                <div class="note error">@_errorMessage</div>
+            }
+            <label for="@_inputId">Primary local key</label>
+            <input id="@_inputId" type="password" @bind="_key" @bind:event="oninput" @onkeydown="OnKeyDown"
+                   placeholder="primary local key (write-only)" autocomplete="current-password" />
+            <div class="modal-actions">
+                <button class="btn" type="button" disabled="@_busy" @onclick="Cancel">Cancel</button>
+                <button class="btn primary" type="button" disabled="@(_busy || string.IsNullOrWhiteSpace(_key))" @onclick="Submit">Confirm</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private readonly string _inputId = "admin-key-" + Guid.NewGuid().ToString("N")[..8];
+    private string _key = string.Empty;
+    private bool _invalid;
+    private string? _errorMessage;
+    private bool _busy;
+    private bool _wasVisible;
+
+    [Parameter] public bool Visible { get; set; }
+    [Parameter] public EventCallback<bool> VisibleChanged { get; set; }
+
+    /// <summary>Runs the keyed operation. Returning an authentication_error keeps the modal open with an error hint.</summary>
+    [Parameter] public Func<string, Task<AdminResult>>? OnSubmit { get; set; }
+
+    /// <summary>Raised when the operation succeeded and the modal closed.</summary>
+    [Parameter] public EventCallback<AdminResult> OnCompleted { get; set; }
+
+    [Parameter] public EventCallback OnCancel { get; set; }
+    [Parameter] public string Title { get; set; } = "Admin key required";
+    [Parameter] public string? Message { get; set; }
+
+    protected override void OnParametersSet()
+    {
+        if (Visible && !_wasVisible)
+        {
+            _invalid = false;
+            _errorMessage = null;
+            _busy = false;
+            _key = string.Empty;
+        }
+
+        _wasVisible = Visible;
+    }
+
+    private async Task Submit()
+    {
+        if (_busy || OnSubmit is null || string.IsNullOrWhiteSpace(_key))
+        {
+            return;
+        }
+
+        _busy = true;
+        _invalid = false;
+        _errorMessage = null;
+        try
+        {
+            var result = await OnSubmit(_key);
+            _key = string.Empty;
+
+            if (result.Ok)
+            {
+                // Success: close the modal and let the page refresh from disk.
+                await SetVisible(false);
+                await OnCompleted.InvokeAsync(result);
+            }
+            else if (result.ErrorType == AdminResult.TypeAuthentication)
+            {
+                // Wrong key: keep the modal open and let the user retry.
+                _invalid = true;
+            }
+            else
+            {
+                // Real failure (validation/conflict/not-found/internal): keep the modal open
+                // and show the actual message - a silent close hides the reason.
+                _errorMessage = result.Message;
+            }
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task Cancel()
+    {
+        _key = string.Empty;
+        _invalid = false;
+        _errorMessage = null;
+        await SetVisible(false);
+        await OnCancel.InvokeAsync();
+    }
+
+    private async Task OnKeyDown(Microsoft.AspNetCore.Components.Web.KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape")
+        {
+            await Cancel();
+        }
+        else if (e.Key == "Enter")
+        {
+            await Submit();
+        }
+    }
+
+    private async Task SetVisible(bool value)
+    {
+        Visible = value;
+        await VisibleChanged.InvokeAsync(value);
+    }
+}

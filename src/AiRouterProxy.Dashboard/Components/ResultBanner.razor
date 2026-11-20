@@ -1,0 +1,43 @@
+@using AiRouterProxy.Dashboard.Models
+
+@if (Result is { } r)
+{
+    @if (r.Ok)
+    {
+        <div class="note good">
+            <b>Config applied.</b> @r.Message
+            @if (r.Warnings is { Length: > 0 })
+            {
+                <ul class="banner-list">
+                    @foreach (var w in r.Warnings)
+                    {
+                        <li>@w</li>
+                    }
+                </ul>
+            }
+        </div>
+    }
+    else
+    {
+        <div class="note error">
+            <b>Operation failed.</b> @r.Message
+            @if (r.Restored)
+            {
+                <span>The previous configuration was restored.</span>
+            }
+            @if (r.Errors is { Length: > 0 })
+            {
+                <ul class="banner-list">
+                    @foreach (var e in r.Errors)
+                    {
+                        <li>@e</li>
+                    }
+                </ul>
+            }
+        </div>
+    }
+}
+
+@code {
+    [Parameter] public AdminResult? Result { get; set; }
+}

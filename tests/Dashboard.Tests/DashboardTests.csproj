@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>DashboardTests</RootNamespace>
+    <AssemblyName>DashboardTests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Tests the dashboard write-phase sources in isolation (validators, persistence,
+         services, shared contracts). No Blazor, no host, no real config files. -->
+    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\RouteValidator.cs" Link="AdminValidation\RouteValidator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\KeyValidator.cs" Link="AdminValidation\KeyValidator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\SecurityValidator.cs" Link="AdminValidation\SecurityValidator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\ImportValidator.cs" Link="AdminValidation\ImportValidator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\RouteDraftJson.cs" Link="AdminValidation\RouteDraftJson.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AdminPaths.cs" Link="AdminPersistence\AdminPaths.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AtomicJsonWriter.cs" Link="AdminPersistence\AtomicJsonWriter.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\ConfigFileReader.cs" Link="AdminPersistence\ConfigFileReader.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\ConfigBackup.cs" Link="AdminPersistence\ConfigBackup.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\ReloadConfirmer.cs" Link="AdminPersistence\ReloadConfirmer.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\KeyMetaStore.cs" Link="AdminPersistence\KeyMetaStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AuditLog.cs" Link="AdminPersistence\AuditLog.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminServices\AdminHash.cs" Link="AdminServices\AdminHash.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminServices\DashboardAdminService.cs" Link="AdminServices\DashboardAdminService.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Routing\ProxyOptions.cs" Link="Routing\ProxyOptions.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Routing\ConfigPaths.cs" Link="Routing\ConfigPaths.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Policies\AuthenticationPolicy.cs" Link="Policies\AuthenticationPolicy.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Detection\SecurityHelpers.cs" Link="Detection\SecurityHelpers.cs" />
+    <Compile Include="..\..\src\AiRouterProxy.Dashboard\Models\DashboardModels.cs" Link="Models\DashboardModels.cs" />
+    <Compile Include="..\..\src\AiRouterProxy.Dashboard\Models\IDashboardAdminService.cs" Link="Models\IDashboardAdminService.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- IOptionsMonitor<T> used by DashboardAdminService; same version family as the host. -->
+    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.14" />
+    <PackageReference Include="Microsoft.Extensions.Primitives" Version="10.0.14" />
+  </ItemGroup>
+
+</Project>
