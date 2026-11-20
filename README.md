@@ -5,8 +5,8 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.6.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases)) — the admin dashboard and admin
-API v1 described below are under development (2.6.x) and not yet part of a tagged release.
+**Current version:** 2.6.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases)) — the latest release, including the
+admin dashboard and the admin REST API v1 described below.
 
 ☕ Found this useful? [**Support the project**](https://buymeacoffee.com/jlkampos) with a coffee — every cup keeps the redaction growing.
 
