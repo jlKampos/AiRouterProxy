@@ -15,6 +15,21 @@
     unchanged set re-bakes identical hashes.
   - -DryRun: simulate detection only - print what WOULD happen, write nothing, call gh
     nowhere.
+  - Noise reduction: three mechanisms keep the alert stream usable. (a) Per-source
+    cooldown: a source may set "cooldownHours" in sources.json (hours; 0 or absent
+    means disabled). While a source is inside its window, detected changes are
+    consumed silently - the hash advances and no issue is opened, and those changes
+    are never alerted afterwards either. Only real runs are affected (-DryRun and
+    -BakeBaseline bypass it). (b) Supersede: when a new issue is opened for a source,
+    every still-open api-monitor issue of the SAME source is closed with a
+    "Superseded by #N" comment, so at most one alert per source stays open (newest
+    wins). (c) Sanitize: at the end of every real run, for each source that still has
+    more than one open issue, all but the newest (highest issue number) are closed
+    with a comment - a safety net for failed closes, manual re-runs or a state reset.
+    In (b) and (c) an issue is attributed to a source only by the official
+    "<!-- source: NAME -->" footer (falling back to the last marker occurrence), and
+    only when NAME is a known name from sources.json; untrusted upstream text quoted
+    in an issue snippet can therefore never close another source's issue.
 
 .PARAMETER BakeBaseline
   Record the current state of every source without opening issues or touching git.
@@ -88,6 +103,64 @@ function Get-NormalizedText {
         $out.RemoveAt($out.Count - 1)
     }
     return ($out -join "`n")
+}
+
+function Get-SourceNameFromIssueBody {
+    # Resolves which api-monitor source an issue body belongs to, or $null when it
+    # cannot be resolved to a KNOWN source. The body embeds untrusted upstream text
+    # (the ```text snippet and the keyword context lines), so a spoofed
+    # "<!-- source: X -->" marker must never be able to close another source's issue.
+    # Attribution therefore only looks at the TAIL of the body, never the whole text:
+    #   1) only the last two NON-EMPTY lines (after normalizing CRLF -> LF) are
+    #      candidates - both official formats end the body with the marker/footer
+    #      followed by the "_This issue was opened automatically..." sentinel, while
+    #      the untrusted snippet sits in the middle;
+    #   2) inside that tail the OFFICIAL footer written by Get-IssueBody
+    #      ("<!-- source: NAME --> <!-- hash: HASH -->" on its own line) wins; if the
+    #      tail has no footer, a plain marker ("<!-- source: NAME -->") is used - this
+    #      covers legacy issues that carry the marker but no footer;
+    #   3) the extracted name must match $script:orderedNames (sources.json), and the
+    #      canonical spelling from sources.json is returned (never the raw marker
+    #      text), so it is always validated before it reaches logs or grouping.
+    # No marker in the tail -> $null (fail-closed).
+    # The patterns avoid overlapping quantifiers (\S+ next to [ \t]*) so a hostile
+    # body full of spaces cannot trigger catastrophic backtracking (ReDoS), and they
+    # are anchored to a whole line so only a clean marker line can match.
+    param([string]$Body)
+    if ([string]::IsNullOrEmpty($Body)) { return $null }
+    if (-not $script:orderedNames -or $script:orderedNames.Count -eq 0) { return $null }
+
+    # last two non-empty lines, in body order (oldest first)
+    $tail = New-Object System.Collections.Generic.List[string]
+    $lines = @(Get-TextLines -Text $Body)
+    for ($i = $lines.Count - 1; $i -ge 0 -and $tail.Count -lt 2; $i--) {
+        $line = ([string]$lines[$i]).Trim()
+        if ($line.Length -gt 0) { $tail.Insert(0, $line) }
+    }
+    if ($tail.Count -eq 0) { return $null }
+
+    $footerRx = [regex]'^<!--[ \t]*source:[ \t]*(\S+)[ \t]*-->[ \t]*<!--[ \t]*hash:[ \t]*[0-9a-fA-F]{64}[ \t]*-->$'
+    $markerRx = [regex]'^<!--[ \t]*source:[ \t]*(\S+)[ \t]*-->$'
+
+    $candidate = $null
+    for ($i = $tail.Count - 1; $i -ge 0 -and -not $candidate; $i--) {
+        $m = $footerRx.Match($tail[$i])
+        if ($m.Success) { $candidate = $m.Groups[1].Value }
+    }
+    if (-not $candidate) {
+        for ($i = $tail.Count - 1; $i -ge 0 -and -not $candidate; $i--) {
+            $m = $markerRx.Match($tail[$i])
+            if ($m.Success) { $candidate = $m.Groups[1].Value }
+        }
+    }
+    if (-not $candidate) { return $null }
+
+    foreach ($known in $script:orderedNames) {
+        if ([string]::Equals([string]$known, [string]$candidate, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [string]$known
+        }
+    }
+    return $null
 }
 
 function Get-AtomFlattened {
@@ -602,6 +675,35 @@ function New-GhIssue {
     }
 }
 
+function Invoke-GhCloseIssue {
+    # Closes an issue with a comment. NEVER throws: closing is cleanup, so a gh hiccup
+    # (rate limit, network, permissions) must not fail the run - the new alert is
+    # already open and the state has already advanced. Returns $true on success and
+    # $false on failure (the failure detail goes to the warning).
+    param([int]$Number, [string]$Comment)
+    # A non-positive number is never a real issue: skip it (no gh call, no warning).
+    if ($Number -le 0) { return $false }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $out = @()
+    $code = 0
+    try {
+        $out = @(& gh issue close $Number -R $env:REPO --comment $Comment 2>&1)
+        $code = $LASTEXITCODE
+    }
+    catch {
+        $code = 1
+    }
+    finally {
+        $ErrorActionPreference = $prev
+    }
+    if ($code -ne 0) {
+        Write-Warning ('api-monitor: gh issue close #{0} failed (exit {1}): {2}' -f $Number, $code, (($out | Out-String).Trim()))
+        return $false
+    }
+    return $true
+}
+
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
@@ -936,6 +1038,47 @@ foreach ($src in $script:sources) {
             continue
         }
 
+        # 5d) per-source cooldown: chatty sources (e.g. openrouter-docs) must not open
+        # more than one alert per window. The change is consumed silently (like "no
+        # relevant keywords"), so a later window can still alert. DryRun/BakeBaseline
+        # already returned above, so the cooldown only applies to real runs. An absent
+        # or null cooldownHours is treated as 0 (disabled); a PRESENT but unparsable
+        # value also falls back to 0 but emits a warning, so a config typo is visible
+        # instead of silently disabling the cooldown. An unparsable lastIssueAt
+        # disables the cooldown for this run.
+        $cooldownHours = 0
+        $cdProp = $src.PSObject.Properties['cooldownHours']
+        if ($null -ne $cdProp -and $null -ne $cdProp.Value) {
+            $cdParsed = 0
+            if ([int]::TryParse([string]$cdProp.Value, [ref]$cdParsed)) { $cooldownHours = $cdParsed }
+            else {
+                Write-Warning ("api-monitor: {0}: cooldownHours '{1}' is not an integer - cooldown disabled for this source" -f $name, [string]$cdProp.Value)
+            }
+        }
+        if ($cooldownHours -gt 0 -and $st) {
+            $lastIssueAtRaw = [string]$st.lastIssueAt
+            if (-not [string]::IsNullOrWhiteSpace($lastIssueAtRaw)) {
+                $lastIssueAt = [DateTime]::MinValue
+                $cooldownActive = $false
+                try {
+                    $lastIssueAt = [datetime]::Parse($lastIssueAtRaw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+                    $elapsedHours = ([DateTime]::UtcNow - $lastIssueAt.ToUniversalTime()).TotalHours
+                    if ($elapsedHours -lt $cooldownHours) { $cooldownActive = $true }
+                }
+                catch {
+                    $cooldownActive = $false
+                }
+                if ($cooldownActive) {
+                    $script:state.sources[$name].lastHash = $hash
+                    $script:state.sources[$name].lastContent = $newContent
+                    $stateChanged = $true
+                    Write-Result ("[api-monitor] {0}: COOLDOWN (skip issue - last alert {1:0.#} h ago)" -f $name, $elapsedHours)
+                    $okCount++
+                    continue
+                }
+            }
+        }
+
         # 6) dedupe against open issues (gh; throws on failure -> state NOT advanced)
         $dupUrl = $null
         $dupNum = $null
@@ -986,7 +1129,33 @@ foreach ($src in $script:sources) {
         $script:state.sources[$name].lastIssueAt = [DateTime]::UtcNow.ToString('o')
         $stateChanged = $true
         if ($newUrl -match '/issues/(\d+)') {
-            Write-Result ("[api-monitor] {0}: CHANGED (issue #{1})" -f $name, $Matches[1])
+            $newNum = [int]$Matches[1]
+            Write-Result ("[api-monitor] {0}: CHANGED (issue #{1})" -f $name, $newNum)
+
+            # 7b) one open issue per source: the new alert supersedes any older open
+            # alert of the SAME source, so close those (newest wins). This is cleanup
+            # only - the state has already advanced above, so a close failure is just a
+            # warning (the end-of-run sanitize retries it on the next run).
+            try {
+                $sameSource = Invoke-GhListOpenIssues
+                foreach ($old in $sameSource) {
+                    $oldNum = [int]$old.number
+                    if ($oldNum -eq $newNum -or $oldNum -le 0) { continue }
+                    # Same validated extraction as the end-of-run sanitize: only an
+                    # official footer (or the last marker) naming a KNOWN source
+                    # counts, so a marker pasted from untrusted upstream text can
+                    # never close another source's issue.
+                    $oldSource = Get-SourceNameFromIssueBody -Body ([string]$old.body)
+                    if (-not $oldSource -or $oldSource -ne $name) { continue }
+                    $closed = Invoke-GhCloseIssue -Number $oldNum -Comment ("Superseded by #{0} - see the new alert." -f $newNum)
+                    if ($closed) {
+                        Write-Result ("[api-monitor] {0}: closed old issue #{1} (superseded by #{2})" -f $name, $oldNum, $newNum)
+                    }
+                }
+            }
+            catch {
+                Write-Warning ('api-monitor: {0}: superseded-issue cleanup skipped: {1}' -f $name, $_.Exception.Message)
+            }
         }
         else {
             Write-Result ("[api-monitor] {0}: CHANGED (issue created: {1})" -f $name, $newUrl)
@@ -997,6 +1166,50 @@ foreach ($src in $script:sources) {
         $err = (($_.Exception.Message) -split '\r?\n' | Select-Object -First 1)
         $script:failures.Add(("{0}: {1}" -f $name, $err))
         Write-Result ("[api-monitor] {0}: ERROR ({1})" -f $name, $err)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Self-sanitize: at most one open issue per source
+# ---------------------------------------------------------------------------
+# Safety net for the one-alert-per-source rule (supersede on open + cooldown): if
+# duplicates ever pile up (manual re-runs, a close that failed earlier, a state
+# reset), keep only the newest (highest number) open issue of each source and close
+# the rest. Never affects the run result: any failure is a warning. Attribution uses
+# Get-SourceNameFromIssueBody, so an issue is only touched when its official footer
+# (or last marker) names a known source from sources.json - untrusted text quoted in
+# the snippet can never steer the cleanup to another source.
+if (-not $DryRun -and -not $BakeBaseline) {
+    try {
+        $allOpen = Invoke-GhListOpenIssues
+        $bySource = @{}
+        foreach ($issue in $allOpen) {
+            $issueNum = [int]$issue.number
+            if ($issueNum -le 0) { continue }
+            $markerName = Get-SourceNameFromIssueBody -Body ([string]$issue.body)
+            if (-not $markerName) { continue }
+            if ($bySource.ContainsKey($markerName)) {
+                $bySource[$markerName] += $issueNum
+            }
+            else {
+                $bySource[$markerName] = @($issueNum)
+            }
+        }
+        foreach ($markerName in @($bySource.Keys)) {
+            $nums = @($bySource[$markerName] | Sort-Object -Unique)
+            if ($nums.Count -le 1) { continue }
+            $keepNum = [int]$nums[$nums.Count - 1]
+            foreach ($n in $nums) {
+                if ([int]$n -eq $keepNum) { continue }
+                $closed = Invoke-GhCloseIssue -Number ([int]$n) -Comment ("Old alert - superseded by #{0}." -f $keepNum)
+                if ($closed) {
+                    Write-Result ("[api-monitor] {0}: closed duplicate issue #{1} (keeping #{2})" -f $markerName, $n, $keepNum)
+                }
+            }
+        }
+    }
+    catch {
+        Write-Warning ('api-monitor: duplicate-issue cleanup skipped: {0}' -f $_.Exception.Message)
     }
 }
 

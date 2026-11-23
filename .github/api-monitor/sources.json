@@ -6,6 +6,7 @@
       "provider": "anthropic",
       "url": "https://docs.claude.com/en/release-notes/api.md",
       "kind": "markdown",
+      "cooldownHours": 0,
       "watch": [
         { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
         { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
@@ -20,6 +21,7 @@
       "provider": "anthropic",
       "url": "https://docs.claude.com/en/api/messages.md",
       "kind": "markdown",
+      "cooldownHours": 0,
       "watch": [
         { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
         { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
@@ -34,6 +36,7 @@
       "provider": "anthropic",
       "url": "https://docs.claude.com/en/api/rate-limits.md",
       "kind": "markdown",
+      "cooldownHours": 0,
       "watch": [
         { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
         { "pattern": "429|503|400|401|error code|slow_down|server_is_overloaded|lockout|backoff", "area": "Rate limiting / error mapping" },
@@ -45,6 +48,7 @@
       "provider": "openai",
       "url": "https://platform.openai.com/docs/changelog.md",
       "kind": "markdown",
+      "cooldownHours": 0,
       "watch": [
         { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
         { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
@@ -59,6 +63,7 @@
       "provider": "openai",
       "url": "https://platform.openai.com/docs/deprecations.md",
       "kind": "markdown",
+      "cooldownHours": 0,
       "watch": [
         { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
         { "pattern": "429|503|400|401|error code|slow_down|server_is_overloaded|lockout|backoff", "area": "Rate limiting / error mapping" },
@@ -70,6 +75,7 @@
       "provider": "openai",
       "url": "https://github.com/openai/openai-python/releases.atom",
       "kind": "atom",
+      "cooldownHours": 0,
       "watch": [
         { "pattern": "deprecat|breaking|remov|renam|migrat", "area": "Route config / auth" },
         { "pattern": "schema", "area": "Rate limiting / error mapping" }
@@ -80,6 +86,7 @@
       "provider": "anthropic",
       "url": "https://github.com/anthropics/anthropic-sdk-python/releases.atom",
       "kind": "atom",
+      "cooldownHours": 0,
       "watch": [
         { "pattern": "deprecat|breaking|remov|renam|migrat", "area": "Route config / auth" },
         { "pattern": "schema", "area": "Rate limiting / error mapping" }
@@ -90,6 +97,7 @@
       "provider": "openrouter",
       "url": "https://openrouter.ai/docs/llms-full.txt",
       "kind": "markdown",
+      "cooldownHours": 24,
       "watch": [
         { "pattern": "content_block|tool_use|thinking|reasoning|\\bstream\\b|SSE|message_start|message_delta|input_json_delta", "area": "SSE protocol adapters (SseProtocol/)" },
         { "pattern": "anthropic-version|ratelimit|rate.?limit|request-id|anthropic-organization-id|Retry-After", "area": "Response headers forwarding" },
