@@ -12,6 +12,10 @@ public sealed class ActivityEntry
     public string? Route { get; init; }
     public bool Refused { get; init; }
     public int Redacted { get; init; }
+
+    /// <summary>Category summary of the redacted content (e.g. "OpenAI key × 6"); null/empty when none.</summary>
+    public string? RedactionKinds { get; init; }
+
     public string? PresentedHash { get; init; }
     public string? ExpectedHash { get; init; }
     public string? UA { get; init; }

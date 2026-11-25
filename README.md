@@ -6,8 +6,9 @@
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
 **Current version:** 2.7.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases)) — the latest release, including the
-admin dashboard and the admin REST API v1 described below, and adds log maintenance from the dashboard — clear the
-in-memory activity buffer or the dedicated Windows Event Log, audited and re-authenticated with the primary local key.
+admin dashboard and the admin REST API v1 described below, detection forensics (metadata only),
+and log maintenance from the dashboard — clear the in-memory activity buffer or the dedicated
+Windows Event Log, audited and re-authenticated with the primary local key.
 
 ☕ Found this useful? [**Support the project**](https://buymeacoffee.com/jlkampos) with a coffee — every cup keeps the redaction growing.
 
@@ -33,6 +34,7 @@ in-memory activity buffer or the dedicated Windows Event Log, audited and re-aut
 - [Local key](#local-key--genapikeyps1)
 - [Dashboard (admin UI)](#dashboard-admin-ui)
 - [Admin API (v1)](#admin-api-v1)
+- [Triaging detection forensics](#triaging-detection-forensics)
 - [Certificates](#certificates)
 - [Using from OpenCode (opencode.json)](#using-from-opencode-opencodejson)
 - [Tests](#tests)
@@ -85,7 +87,14 @@ is never changed.
 `image_url.url`, Anthropic `source.data`) and long base64 blobs pass through untouched —
 they are binary bytes, not text where a key gets pasted, and scanning them would corrupt the
 base64. Configurable via `detect.exemptBase64` (default: on). Real keys and known formats are
-always masked, even in text next to an image.
+always masked, even in text next to an image. A value introduced by a sensitive name
+(`SECRET_KEY=<blob>`, `SECRET-KEY = <blob>`) is a credential, not payload; names are matched
+with the detector's own variants (`secret_key`, `secret-key`, `secret key =` is not covered).
+
+The exemption is **name-exact**, so *prefixed*/*suffixed* identifiers are out of scope by design
+too: `OPENAI_API_KEY=`, `MY_SECRET_KEY=` and `x-SECRET_KEY=` are not whitelisted names, and
+`OPENAI_API_KEY=<120 base64 chars with +/>` is still treated as a payload and left untouched.
+Keep secrets shorter than ~100 characters, or avoid `name=` prefixes on large blobs.
 
 ### In action
 
@@ -111,6 +120,10 @@ non-sensitive content passing through untouched:
   host has no x64 .NET runtime installed, so a framework-dependent publish fails to start)
 - Path-prefix router (`routes.json`)
 - Sensitive-content redaction on outgoing requests (`redaction.json`, hot reload)
+- **Detection forensics** (metadata only, off by default): per-detection JSON path, layer, kind,
+  mask span length, pattern shape (`name`/`sep`/`quote` - from `context`, or inherited by `format`
+  from an overlapping context at the same offset) and an ephemeral 8-char fingerprint -
+  never the value, in memory only
 - **Fail-closed request body inspection** (only inspected JSON is ever forwarded; unknown content types
   `415`, invalid JSON `400`, oversized `413`)
 - **Per-client rate limiting and brute-force lockout** (429 + `Retry-After`; failure lockout)
@@ -120,7 +133,7 @@ non-sensitive content passing through untouched:
 - Admin Blazor dashboard (`/admin/ui`) + admin REST API v1 (`/admin/api/v1/*`) - both protected by
   the primary local key only (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
-- Versioned via assembly info (SemVer, e.g. 2.0.4); reported by /admin/health
+- Versioned via assembly info (SemVer, e.g. 2.7.0); reported by /admin/health
 
 ## Structure
 
@@ -135,6 +148,7 @@ AiRouterProxy/
 |       |-- Detection/             # secret detection + redaction
 |       |   |-- SecretDetector.cs          # secret detection (4 layers)
 |       |   |-- SecretRedactor.cs          # secret redaction (preserves JSON structure)
+|       |   |-- DetectionFingerprint.cs   # ephemeral HMAC fingerprint for forensics (never reversible)
 |       |   `-- SecurityHelpers.cs         # bearer extraction, hashing
 |       |-- Policies/              # cross-cutting enforcement policies
 |       |   |-- AuthenticationPolicy.cs    # local multi-key auth
@@ -148,9 +162,11 @@ AiRouterProxy/
 |       |   |-- SseStreamProcessor.cs
 |       |   |-- SseParser.cs / SseEvent.cs # minimal SSE parse/emit
 |       |   `-- SseProtocol/                # SSE protocol adapters (OpenAI chat, OpenAI responses, Anthropic, generic) + registry
-|       |-- Observability/         # activity log + response notices
+|       |-- Observability/         # activity log + response notices + detection forensics
 |       |   |-- ActivityStore.cs           # activity log (/admin/activity)
-|       |   `-- NoticeInjector.cs          # notice at the end of the response (SSE/JSON)
+|       |   |-- DetectionStore.cs          # in-memory detection forensics (ring buffer)
+|       |   |-- NoticeInjector.cs          # notice at the end of the response (SSE/JSON)
+|       |   `-- RedactionNotice.cs         # one-line notice builder (count + categories)
 |       |-- Config/                # non-secret config (copied to config\ on deploy)
 |       |   |-- appsettings.json
 |       |   |-- appsettings.Development.json
@@ -173,10 +189,10 @@ AiRouterProxy/
 |   `-- AiRouterProxy.Dashboard/   # Blazor Web App (admin UI): Components/Pages (Login, RoutesKeys, ActivityLog, Security, Settings, Home)
 |-- tests/
 |   |-- Unit/                      # offline unit harness (compiles the app sources directly)
-|   |   |-- Program.cs             #   no framework - 302 PASS
+|   |   |-- Program.cs             #   no framework - 383 PASS
 |   |   `-- RedactorTests.csproj
 |   |-- Dashboard.Tests/           # admin dashboard harness (compiles app sources directly)
-|   |   |-- Program.cs             #   no framework - 224 PASS
+|   |   |-- Program.cs             #   no framework - 331 PASS
 |   |   `-- DashboardTests.csproj
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- scripts/
@@ -388,6 +404,10 @@ Both are watched (hot reload), so edits apply without a restart.
         "exemptBase64": true,       // image/binary payloads pass untouched (data URLs, base64 blobs)
         "entropyThreshold": 3.0     // minimum bits/char for the long-string scanner
       },
+      "forensics": {                // detection forensics: metadata only - where/which layer fired, never the value
+        "enabled": false,           //   off by default (zero cost on the hot path); nothing is written to disk
+        "capacity": 200             //   in-memory ring buffer size (10..1000)
+      },
       "allow": [                    // optional: a detected token matching one of these regexes is
         "^ACME-[0-9]{3,5}-"          //   left unmasked (e.g. project file names / internal IDs)
       ]
@@ -423,7 +443,8 @@ is **not masked** (nor counted / notified) - use it to keep legitimate file name
 IDs (e.g. ``ACME-1234-v2-WidgetApp-Module-Plan.md``) readable even though the long-string scanner
 would flag them. Exemptions **never** apply to the high-confidence format scanner (`sk-`, `ghp_`,
 `AIza`, JWT, `Bearer`, PEM...) nor to values of sensitive JSON fields (`api_key`, `password`,
-`token`...): those are always redacted. Invalid regexes are ignored.
+`token`...): those are always redacted. Invalid regexes are ignored. The pattern is tested against
+the **masked span** (the union when candidates overlap), not against each detector's raw match.
 
 ### Inspection (fail-closed body handling)
 
@@ -542,8 +563,10 @@ endpoints:
   the page itself; calling any operation still requires the primary local key).
 
 When a request is censored the response carries `X-AIRouter-Redacted: <count>` and, if
-`notifyInResponse` is set, a visible notice - use both to confirm a redaction rule behaves as
-expected.
+`notifyInResponse` is set, a visible **one-line** notice (e.g. `⚠️ **Proxy notice:** 4 sensitive
+values were redacted before reaching the AI Router (OpenAI key × 4).`). The category summary is
+the only detail: the notice has no "Detected values" list and never shows any part of the value.
+Use the header and the notice to confirm a redaction rule behaves as expected.
 
 ### Hot reload
 
@@ -584,9 +607,13 @@ It is a *helper*: every write goes through the same config files (`config\routes
 `config\redaction.json`, `config\appsettings.Server.json`) that the proxy hot-reloads, so the
 proxy works fully without the dashboard and the JSON files remain the source of truth.
 
-- **Login** (`/admin/ui/login`) - enter the primary local key once; a session cookie keeps you
-  authenticated (logout clears it). Keys are **write-only**: the UI and the API only ever see
-  fingerprints/hashes, never the values.
+- **Login** (`/admin/ui/login`) - enter the primary local key once; a signed session cookie keeps
+  you authenticated for 12 h. The cookie signing key is derived from the primary local key, so the
+  session **survives a service restart** (deploys no longer force a re-login) but is invalidated by
+  rotating the primary key; logout clears it. Keys are **write-only**: the UI and the API only ever
+  see fingerprints/hashes, never the values.
+  If the circuit drops, the UI rejoins automatically and reloads the page when the circuit is gone
+  (at most 3 reloads per minute) instead of leaving the "Rejoining the server..." dialog stuck.
 - **Routes & Keys** (`/admin/ui/routes`)
   - Route table: add/edit/delete routes (prefix, upstream, keyRef, headers, timeouts). Saves to
     `routes.json` with hot reload; new rows come pre-filled with the proxy defaults
@@ -605,7 +632,9 @@ proxy works fully without the dashboard and the JSON files remain the source of 
   `(multiple keys)` when several keys match and the presented value is ambiguous) and are
   highlighted in red.
 - **Security** (`/admin/ui/security`) - redaction, inspection and rate-limit settings (the
-  same knobs as `redaction.json`), with restore/rollback on failed reload.
+  same knobs as `redaction.json`), with restore/rollback on failed reload. Five status cards
+  (local keys, rate limit, redaction, forensics, inspection) show the **saved** state; the
+  Redaction/Inspection/Forensics cards add `· unsaved` while the form differs from the file.
 - **Settings** (`/admin/ui/settings`) - export / validate / import the whole config bundle
   (validation first, apply after) and reload with automatic rollback when reload fails.
 
@@ -635,6 +664,14 @@ key>` (same key as `/admin`/UI) and protected by the same rate limiter. Errors a
 | `POST` | `/admin/api/v1/config/reload` | Re-read config from disk; restore on failed reload |
 | `DELETE` | `/admin/api/v1/logs/activity` | Clears the in-memory activity buffer (admin key required). |
 | `DELETE` | `/admin/api/v1/logs/eventlog` | Clears the dedicated "AIRouterProxy" Windows Event Log (admin key required). |
+| `GET` | `/admin/api/v1/detections?limit=50` | Recent detection forensics (metadata only: path/layer/kind/length/`name`/`sep`/`quote`/fingerprint; limit 1..200) |
+| `DELETE` | `/admin/api/v1/detections` | Clears the in-memory detection forensics buffer (admin key required) |
+
+In a detection row, `quote` is `"` or `'` when the matched context used that quote, `""` for a
+`context` finding without quotes (and a `format` that inherits its shape from such an unquoted
+`context` also gets `""`), and `null` for a layer without shape (`field`, `entropy`, or a `format`
+that did not inherit a shape from an overlapping context at the same offset). `name` and `sep` are
+`null` wherever `quote` is `null`.
 
 Two dashboard operations exist only as service methods used by the UI (there is no v1 endpoint
 for them): adding and removing extra local keys. The legacy `/admin/*` endpoints documented
@@ -646,6 +683,109 @@ the **Activity** page carries a single **Logs & activity** panel: a toolbar with
 and the two destructive buttons (`Clear activity` / `Clear Event Log`), a collapsible paginated
 table (25/50/100 per page) and a collapsible note explaining the hashes. Each clear asks
 for confirmation and then re-authenticates with the primary local key.
+
+The **Security** page carries the redaction/inspection settings plus a **Detection forensics**
+card (off by default): the card's **Enable/Disable** button persists the change immediately (the
+form checkbox only stages it - the card keeps showing the saved state until the write is
+confirmed), sets the buffer capacity (10..1000) and lists the latest detections - timestamp,
+request id, route, **JSON path**, layer (field/format/context/entropy), kind, **pattern** (the
+`name` + `sep` + `quote` shape: `context` rows, plus `format` rows that inherited it from an
+overlapping context at the same offset), mask span length and an 8-char fingerprint. The value
+itself is never recorded, the buffer lives in memory only (nothing on disk, cleared on restart,
+on `Clear` or when forensics is disabled) and `Clear` re-authenticates with the primary local key.
+See [Triaging detection forensics](#triaging-detection-forensics) for how to read the table.
+
+## Triaging detection forensics
+
+The **Detection forensics** card on `/admin/ui/security` (and `GET /admin/api/v1/detections`)
+answers one question: *why was this request redacted, and where did the value come from?* It
+records shape, not content - use it to investigate, never to look up a secret.
+
+| Column | Meaning |
+|---|---|
+| **Time / Req / Route** | When, which request id, which route. `Req` links to `/admin/activity`. |
+| **JSON path** | Where the detection fired (`$.messages[0].content`, `$.api_key`, ...). |
+| **Layer** | Scanner that produced it: `field`, `format`, `context`, `entropy`. |
+| **Kind** | Detector family (`openai`, `github`, `api_key`, `key_in_text`, `suspicious_key`, ...). |
+| **Pattern** | `-` for `field`/`entropy` (no shape). `context` shows the identifier, separator and quote that matched (`token =`, `token : "`, `password = '`). `format` rows show the shape inherited from an overlapping context finding at the same offset. The **shape**, never the value. |
+| **Len** | Length of the masked span (the union when candidates overlap). For merged rows it is not the detector match length. |
+| **Fingerprint** | 8 hex chars of an HMAC keyed per process. |
+
+**Overlaps are unioned.** When two detectors find overlapping candidates, the surviving
+finding grows to cover the other one's tail: **overlapping candidates are merged and the
+union is masked**, so the proxy never masks less **at the span level** - the union is never
+shorter than any single detector's match. Base64 and allow-list exemptions are still
+evaluated on the merged span, but a span that covers a `format` finding is **never**
+exempted. `Len` is therefore the length of the span actually masked - for merged rows it is
+not the detector match length.
+
+**Allow-list + union trade-off (accepted).** The allow-list is evaluated against the **merged**
+span, so a `context`/`entropy` union that matches an `allow` pattern exempts the whole span -
+including the part only the entropy scanner would have flagged (an isolated entropy finding there
+might not have been exempted). The reverse direction is closed: a span that covers a `format`
+finding is never exempted. This is the accepted side of "never mask less at the span level".
+
+**Inheritance needs the same offset.** A `format` row only inherits `name`/`sep`/`quote` when the
+discarded `context` finding starts at the **same** offset. When the `context` match starts *before*
+the `format` one (e.g. `token:=<value>`), the surviving layer is `context` and it keeps its own
+shape; there is no inheritance to do. The offset difference comes from the `=`: the `context`
+separator group matches only `:`, while the value character class includes `=`, so the `=` is
+absorbed into the `value` group and the value starts on the `=` - one character before the real
+secret, which makes `Len` one longer and masks the `=` as well.
+
+**Group by fingerprint, not by row.** The same value gives the same fingerprint within one process
+run; ten rows with one fingerprint are one secret re-sent ten times, not ten secrets. The key is
+ephemeral, so compare within a session, never across restarts. Same fingerprint ⇒ (almost certainly)
+same value within the process; **the reverse is not guaranteed** - the same secret can get different
+fingerprints when the masked span differs (`field` hashes the whole value, while
+`bearer`/`url_cred`/`db_conn` hash only group 2).
+
+**Read the layer before worrying.** The confidence order applies **at the same offset** (the
+merge sorts by start first): `format` > `field` > `context` ≈ `entropy`
+(`context` and `entropy` are both Medium, and the merge prefers `context` on a tie).
+`format`/`field` are actionable (a known shape or a sensitive field name was masked - rotate it if
+real); `context`/`entropy` are heuristics and can fire on legitimate text. Length is a quick sanity
+check: OpenAI/Anthropic keys are 51/100+ chars, GitHub classic PATs 40, `github_pat_` 93, AWS access
+key id 20, Google API keys 39 - an 8–9-char `Len` in `context` is usually a false positive **when the
+pattern is not `password`/`secret`** - an 8-char password is exactly what this layer exists to catch.
+
+**Use the path to find the origin.** `$.messages[N].content` is client-supplied history (pasted in
+the prompt, or read from a file/tool result) - the common case. `reasoning`/`reasoning_details` is
+model output, and OpenRouter duplicates the reasoning text in two fields, so one echo appears
+twice. A field path (`$.api_key`, `$.headers.authorization`) means a JSON/config object carried it.
+
+**Correlate.** Take `Req` to `/admin/activity` for the client, model, status and the surrounding
+timeline. The same fingerprint in consecutive requests from one client means the same value is
+replayed every turn in the agent's history.
+
+**Going further without revealing anything.** Locate the source by *name*, with counts only:
+
+```powershell
+rg -c "token|secret|password|api_key|access_key" src\
+```
+
+The pattern must mirror the detector's name list (`token`, `secret`, `password`, `api_key`,
+`access_key`, `credential`, `authorization`, ...). A bare `key` is **not** detected - `x:Key` in
+XAML or `myKey` alone never fires. A false positive observed live: unquoted assignments in source
+code (`var token = …`, `$token = …`) fire `context` with `name=token` even though the right-hand
+side is not a credential - the `Pattern` column (`token =`) is how you spot it. If the fingerprint
+always returns at the same path, a persistent file is in the agent's context: fix it at the source.
+`format`/`field` -> rotate the credential. Benign and stable `context`/`entropy` -> add a
+`Redaction.allow` regex.
+
+**What the proxy will not do.** There is no "reveal" action and no stored value, prefix, suffix or
+snippet - by design: crash dumps and dashboard logs would become a second copy of every secret;
+XSS, a shared screen or DevTools would expose it in the UI; and the buffer would retain personal
+data the proxy has no business keeping. Never ask an agent to print a detected value to "check"
+it: the agent's context and the shell output are exactly the channels the proxy protects.
+
+**Reducing noise.** The `context` layer minimum length (8 today) is **not configurable** - changing
+it requires a code change and a rebuild, so it is not a runtime knob. `Redaction.allow` is the
+targeted option and applies only to `context`/`entropy` - the `format` and `field` layers are never
+exempted, and neither is a merged span that covers a `format` finding. The `name=` base64 exemption
+is name-exact as well: a prefixed/suffixed identifier (`OPENAI_API_KEY=`, `MY_SECRET_KEY=`,
+`x-SECRET_KEY=`) is not a whitelisted name, so a long base64-looking value after it stays a payload
+and produces no row at all - by design.
 
 ## Certificates
 
@@ -893,13 +1033,14 @@ which the fail-closed inspection rejects with **415**, and `DELETE` is refused w
 ### Unit harness (offline, no framework, no packages)
 
 Links the proxy's real sources in isolation and asserts them with the in-repo `Check`/`CheckTrue`
-helpers (no xUnit). Covers redaction (4 layers), fail-closed inspection policy, route
-resolution/allowed-path enumeration (traversal, case, `%2f`), auth edges + multi-key, rate
+helpers (no xUnit). Covers redaction (4 layers), the one-line redaction notice, detection
+forensics (JSON path/layer/kind/fingerprint, zero cost when off), fail-closed inspection policy,
+route resolution/allowed-path enumeration (traversal, case, `%2f`), auth edges + multi-key, rate
 limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE protocol adapters.
 
 ```powershell
 dotnet run --project tests/Unit/RedactorTests.csproj -c Release
-# -> RESULT: 302 PASS, 0 FAIL
+# -> RESULT: 383 PASS, 0 FAIL
 ```
 
 ### Dashboard harness (offline, no framework, no packages)
@@ -908,11 +1049,13 @@ Same `Check`/`CheckTrue` philosophy (no xUnit), compiled against the dashboard s
 (`AdminServices`, `AdminPersistence`, `AdminValidation`, `AdminUi` facade). Covers the admin
 write path (validate -> backup -> atomic write -> re-read/confirm -> audit), route/key/secret
 operations, KeyMetaStore persistence (owner/purpose + local-key labels), config export/
-validate/import/reload and the runtime dashboard state:
+validate/import/reload, the security validator + forensics round-trip, the UI session token
+rules (restart, key rotation, multi-key) and the `/admin/ui` middleware (`/_blazor` 401),
+plus the runtime dashboard state:
 
 ```powershell
 dotnet run --project tests/Dashboard.Tests/DashboardTests.csproj -c Release
-# -> RESULT: 224 PASS, 0 FAIL
+# -> RESULT: 331 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)

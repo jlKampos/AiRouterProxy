@@ -58,15 +58,46 @@ public sealed class PlaceholderDashboardFacade : IDashboardFacade
                 "sh_" + Guid.NewGuid().ToString("N")[..10],
                 "sh_" + Guid.NewGuid().ToString("N")[..10],
                 Routes[rnd.Next(Routes.Length)],
-                "dev/standalone"));
+                "dev/standalone",
+                "OpenAI key \u00d7 " + rnd.Next(1, 4)));
         }
         return rows;
     }
 
     public int LocalKeyCount() => 1;
 
+    public IReadOnlyList<DetectionView> GetDetections(int limit)
+    {
+        var rows = new List<DetectionView>();
+        var now = DateTimeOffset.UtcNow;
+        for (var i = 0; i < Math.Min(limit, 6); i++)
+        {
+            // Demo mix so the Pattern column is not always "-": context rows carry their own
+            // shape and format rows show the shape inherited from an overlapping context.
+            var isContext = i % 3 == 0;
+            var isFormat = !isContext && i % 2 == 0;
+            rows.Add(new DetectionView(
+                now.AddMinutes(-i * 3),
+                Guid.NewGuid().ToString("N"),
+                "opencode",
+                "default",
+                "POST",
+                "/v1/chat/completions",
+                "openrouter/auto",
+                isContext ? "$.messages[0].content" : "$.api_key",
+                isContext ? "context" : isFormat ? "format" : "field",
+                isContext ? "key_in_text" : isFormat ? "openai" : "api_key",
+                51,
+                Guid.NewGuid().ToString("N")[..8],
+                isContext ? "token" : isFormat ? "api_key" : null,
+                isContext ? "=" : isFormat ? ":" : null,
+                isContext ? "" : isFormat ? "\"" : null));
+        }
+        return rows;
+    }
+
     public SecurityOptionsView GetSecurityOptions() => new(
-        Redaction: new RedactionSettingsView(true, "••••••", true, "", new DetectSettingsView(true, true, true, true, true, 3.0), new[] { "^ACME-[0-9]{3,5}-" }),
+        Redaction: new RedactionSettingsView(true, "••••••", true, "", new DetectSettingsView(true, true, true, true, true, 3.0), new[] { "^ACME-[0-9]{3,5}-" }, new ForensicsSettingsView(false, 200)),
         Inspection: new InspectionSettingsView(true, "block", "block", new Dictionary<string, string> { ["application/json"] = "inspect" }),
         RateLimit: new RateLimitSettingsView(true, 120, 60, 10, 300, 300));
 

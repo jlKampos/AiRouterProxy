@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using AIRouterProxy;
 
 class Program
@@ -35,6 +36,12 @@ class Program
         TestRedactionAllow();
         TestBase64ImageExemption();
         TestPreviews();
+        TestRedactionNotice();
+        TestForensics();
+        TestForensicsZeroCostAndNames();
+        TestForensicsPatternShape();
+        TestMergeUnion();
+        TestMergeExemptionRules();
         TestDetector();
         TestAuthenticationPolicy();
         TestRateLimiter();
@@ -1438,5 +1445,731 @@ class Program
         var fallback = new RouteOptions { Name = "x", Prefix = "" };
         CheckTrue("no keyRef uses fallback", () => RouteResolver.GetRouteKey(fallback, keys, "global-key") == "global-key");
         CheckTrue("keyRef without value -> null", () => RouteResolver.GetRouteKey(openrouter, new Dictionary<string, string>()) is null);
+    }
+
+    // --------------------------------------------------------------
+    // A) Redaction notice: a single line, no redundant "Detected values" list.
+    // --------------------------------------------------------------
+    static void TestRedactionNotice()
+    {
+        var previews = new List<SecretRedactor.RedactionPreview> { new("openai") };
+
+        var plural = RedactionNotice.Build(6, "OpenAI key \u00d7 6", null, previews);
+        CheckTrue("notice single line", () => plural.Contains("Proxy notice")
+            && plural.Contains("6 sensitive values were redacted")
+            && !plural.Contains('\n'));
+        CheckTrue("notice keeps kinds", () => plural.Contains("OpenAI key \u00d7 6"));
+        CheckTrue("notice no detected-values list", () => !plural.Contains("Detected values"));
+        CheckTrue("notice kind appears once", () => CountOccurrences(plural, "OpenAI key") == 1);
+
+        var singular = RedactionNotice.Build(1, "API key \u00d7 1", null, null);
+        CheckTrue("notice singular", () => singular.Contains("1 sensitive value was redacted")
+            && singular.Contains("(API key \u00d7 1)"));
+
+        var bare = RedactionNotice.Build(2, "", null, null);
+        CheckTrue("notice without kinds has no parens", () => bare.Contains("2 sensitive values were redacted") && !bare.Contains("("));
+
+        var templated = RedactionNotice.Build(3, "GitHub token \u00d7 3", "T {Count} | {Kinds} | {Previews}", previews);
+        CheckTrue("notice template placeholders", () => templated == "T 3 | GitHub token \u00d7 3 | OpenAI key detected");
+    }
+
+    static int CountOccurrences(string haystack, string needle)
+    {
+        var count = 0;
+        var index = 0;
+        while ((index = haystack.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+        {
+            count++;
+            index += needle.Length;
+        }
+
+        return count;
+    }
+
+    static bool IsHex8(string value)
+        => value.Length == 8 && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f');
+
+    // --------------------------------------------------------------
+    // B) Detection forensics: metadata only (path/layer/kind/length/fingerprint).
+    // --------------------------------------------------------------
+    static void TestForensics()
+    {
+        var secret = "sk-" + "proj-" + "a1B2c3D4" + "e5F6g7H8" + "i9J0k1L2" + "m3N4o5P6";
+        var body = "{\"messages\":[{\"role\":\"user\",\"content\":\"please use " + secret
+                   + " now\"}],\"api_key\":\"abc123\"}";
+
+        // Off by default: no list filled, no fingerprint computed.
+        var off = SecretRedactor.RedactJson(Bytes(body));
+        CheckTrue("forensics off collects nothing", () => off.Changed && off.Stats.Detections.Count == 0);
+
+        // On: one record per detection, with the structural path and the layer.
+        var on = SecretRedactor.RedactJson(Bytes(body), collectForensics: true);
+        var content = on.Stats.Detections.FirstOrDefault(d => d.JsonPath == "$.messages[0].content");
+        var field = on.Stats.Detections.FirstOrDefault(d => d.JsonPath == "$.api_key");
+
+        CheckTrue("forensics content detection", () => content is not null
+            && content.Layer == "format" && content.Kind == "openai" && content.Length > 0);
+        CheckTrue("forensics field detection", () => field is not null
+            && field.Layer == "field" && field.Kind == "api_key" && field.Length == 6);
+        CheckTrue("forensics fingerprints 8 hex", () => content is not null && IsHex8(content.Fingerprint));
+
+        // Never the value: path/kind/fingerprint and the serialized record stay clean.
+        CheckTrue("forensics never leaks value", () => on.Stats.Detections.All(d =>
+            !d.JsonPath.Contains(secret) && !d.Kind.Contains(secret) && !d.Fingerprint.Contains(secret)
+            && !d.JsonPath.Contains("abc123") && !d.Kind.Contains("abc123")));
+
+        var serialized = JsonSerializer.Serialize(on.Stats.Detections);
+        CheckTrue("forensics serialized has no secret", () => !serialized.Contains(secret) && !serialized.Contains("abc123"));
+
+        // Fingerprint: stable per value, different across values, empty only for empty input.
+        var fp1 = DetectionFingerprint.Of("value-one");
+        var fp2 = DetectionFingerprint.Of("value-one");
+        var fp3 = DetectionFingerprint.Of("value-two");
+        CheckTrue("fingerprint stable", () => fp1 == fp2 && IsHex8(fp1));
+        CheckTrue("fingerprint differs", () => fp1 != fp3);
+        CheckTrue("fingerprint empty input", () => DetectionFingerprint.Of("") == string.Empty
+            && DetectionFingerprint.Of(null) == string.Empty);
+
+        // Multibyte (accents + CJK + emoji): the string and span overloads agree and stay stable.
+        var multibyte = "chave-\u00e7\u00e3o-\u5bc6\u94a5-\ud83d\udd11";
+        CheckTrue("fingerprint multibyte stable + 8 hex", () =>
+            DetectionFingerprint.Of(multibyte) == DetectionFingerprint.Of(multibyte)
+            && IsHex8(DetectionFingerprint.Of(multibyte)));
+        CheckTrue("fingerprint multibyte string == span", () =>
+            DetectionFingerprint.Of(multibyte) == DetectionFingerprint.Of(multibyte.AsSpan()));
+
+        // Pooled path (> 256 UTF-8 bytes): same value via string/span, and only the FULL value
+        // enters the HMAC (a 256-byte prefix must not collide with the 300-byte original).
+        var longValue = new string('a', 300);
+        CheckTrue("fingerprint pooled path stable + string == span", () =>
+            DetectionFingerprint.Of(longValue) == DetectionFingerprint.Of(longValue)
+            && DetectionFingerprint.Of(longValue) == DetectionFingerprint.Of(longValue.AsSpan())
+            && IsHex8(DetectionFingerprint.Of(longValue)));
+        CheckTrue("fingerprint pooled path hashes the whole value", () =>
+            DetectionFingerprint.Of(longValue) != DetectionFingerprint.Of(longValue[..256]));
+
+        // Regression: empty/null agree with Of(""), and non-empty values always yield 8 hex.
+        CheckTrue("fingerprint empty/null agree with Of(\"\")", () =>
+            DetectionFingerprint.Of(null) == DetectionFingerprint.Of("")
+            && DetectionFingerprint.Of("") == string.Empty);
+        CheckTrue("fingerprint non-empty is 8 hex and distinct", () =>
+            IsHex8(DetectionFingerprint.Of("a")) && IsHex8(DetectionFingerprint.Of("b"))
+            && DetectionFingerprint.Of("a") != DetectionFingerprint.Of("b"));
+
+        // Store: ring buffer, newest first, clear returns the count, capacity clamped.
+        var store = new DetectionStore();
+
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        store.AddRange(new[] { Entry(1), Entry(2), Entry(3), Entry(4), Entry(5) }, 3);
+        CheckTrue("store trims to capacity", () => store.Count == 3);
+
+        var recent = store.Recent(10);
+        CheckTrue("store keeps newest", () => recent.Count == 3
+            && recent[0].RequestId == "req5" && recent[1].RequestId == "req4" && recent[2].RequestId == "req3");
+        CheckTrue("store recent limit", () => store.Recent(1).Count == 1 && store.Recent(1)[0].RequestId == "req5");
+        CheckTrue("store recent zero returns none", () => store.Recent(0).Count == 0);
+        CheckTrue("store clear returns count", () => store.Clear() == 3 && store.Count == 0);
+
+        var clamped = new DetectionStore();
+        clamped.AddRange(Enumerable.Range(1, 25).Select(Entry).ToList(), 1);
+        CheckTrue("store honors small capacity", () => clamped.Count == 1);
+
+        var upper = new DetectionStore();
+        upper.AddRange(Enumerable.Range(1, 25).Select(Entry).ToList(), 5000);
+        CheckTrue("store clamps capacity ceiling", () => upper.Count == 25);
+
+        // Path: object/array nesting.
+        var nested = SecretRedactor.RedactJson(
+            Bytes("{\"a\":{\"b\":[0,1,{\"c\":\"" + secret + "\"}]}}"), collectForensics: true);
+        CheckTrue("path nested array/object", () => nested.Stats.Detections.Any(d => d.JsonPath == "$.a.b[2].c"));
+
+        // Path: 60-char property name is capped at 40 chars per segment.
+        var longName = new string('n', 60);
+        var segment = SecretRedactor.RedactJson(Bytes(Nest(longName, 1, secret)), collectForensics: true);
+        CheckTrue("path segment capped", () => segment.Stats.Detections.Count == 1
+            && segment.Stats.Detections[0].JsonPath == "$." + new string('n', 40));
+
+        // Path: depth stops extending at 12 levels.
+        var deepShort = SecretRedactor.RedactJson(Bytes(Nest("k", 14, secret)), collectForensics: true);
+        CheckTrue("path depth capped at 12", () => deepShort.Stats.Detections.Count == 1
+            && deepShort.Stats.Detections[0].JsonPath == "$" + string.Concat(Enumerable.Repeat(".k", 12)));
+
+        // Path: final truncation at 200 chars plus an ellipsis.
+        var deepLong = SecretRedactor.RedactJson(Bytes(Nest(longName, 6, secret)), collectForensics: true);
+        CheckTrue("path truncated with ellipsis", () => deepLong.Stats.Detections.Count == 1
+            && deepLong.Stats.Detections[0].JsonPath.Length == 201
+            && deepLong.Stats.Detections[0].JsonPath.EndsWith("\u2026"));
+
+        // Cap: at most 50 forensic records per request.
+        var many = new StringBuilder("{");
+        for (var i = 0; i < 60; i++)
+        {
+            if (i > 0) { many.Append(','); }
+            many.Append("\"password").Append(i).Append("\":\"v").Append(i).Append('"');
+        }
+
+        many.Append('}');
+        var capped = SecretRedactor.RedactJson(Bytes(many.ToString()), collectForensics: true);
+        CheckTrue("forensics capped at 50", () => capped.Stats.FieldRedactions == 60
+            && capped.Stats.Detections.Count == SecretRedactor.MaxDetections);
+    }
+
+    // --------------------------------------------------------------
+    // Forensics cost + path safety: no path work when off (B1), and a secret property
+    // NAME never reaches the JsonPath (M1).
+    // --------------------------------------------------------------
+    static void TestForensicsZeroCostAndNames()
+    {
+        // --- B1: with forensics off no path segment is built at all. ---
+        var array = new StringBuilder("{\"input\":[");
+        for (var i = 0; i <= 200; i++)
+        {
+            if (i > 0) { array.Append(','); }
+            array.Append(i);
+        }
+
+        array.Append("]}");
+
+        SecretRedactor.ResetPathInstrumentation();
+        var off = SecretRedactor.RedactJson(Bytes(array.ToString()));
+        CheckTrue("forensics off builds no path", () => SecretRedactor.PathSegmentsBuilt == 0
+            && off.Stats.Detections.Count == 0);
+
+        // m2: with forensics off the context scanner must not materialize shape strings either.
+        var shapeText = "api_key=" + "abc123" + "def456";
+        var shapeOpts = new DetectOptions();
+        var noShape = SecretDetector.Detect(shapeText, shapeOpts);
+        CheckTrue("forensics off: no shape strings built", () => noShape.Count > 0
+            && noShape.All(f => f.Name is null && f.Sep is null && f.Quote is null));
+
+        var withShape = SecretDetector.Detect(shapeText, shapeOpts, collectShape: true);
+        CheckTrue("forensics on: shape strings collected", () => withShape.Any(f => f.Name == "api_key"));
+
+        SecretRedactor.ResetPathInstrumentation();
+        var on = SecretRedactor.RedactJson(Bytes(array.ToString()), collectForensics: true);
+        CheckTrue("forensics on builds paths", () => SecretRedactor.PathSegmentsBuilt > 0
+            && on.Stats.Detections.Count == 0);
+
+        // --- M1: a secret used as a property NAME is replaced by a fixed placeholder. ---
+        var nameSecret = "sk-" + "proj-" + "n1A2b3C4" + "d5E6f7G8";
+        var valueSecret = "sk-" + "ant-" + "api03-" + "a1B2c3D4" + "e5F6g7H8";
+        var named = SecretRedactor.RedactJson(
+            Bytes("{\"seen\":{\"" + nameSecret + "\":\"" + valueSecret + "\"}}"), collectForensics: true);
+
+        CheckTrue("forensics secret name hidden", () => named.Stats.Detections.Count == 1
+            && named.Stats.Detections[0].JsonPath == "$.seen." + SecretRedactor.RedactedNamePlaceholder
+            && !named.Stats.Detections[0].JsonPath.Contains("sk-", StringComparison.Ordinal)
+            && !named.Stats.Detections[0].JsonPath.Contains("n1A2b3C4", StringComparison.Ordinal));
+
+        // Path delimiters inside a segment are escaped so the path stays unambiguous.
+        var delimited = SecretRedactor.RedactJson(
+            Bytes("{\"a.b[0]\":\"" + valueSecret + "\"}"), collectForensics: true);
+        CheckTrue("forensics path delimiters escaped", () => delimited.Stats.Detections.Count == 1
+            && delimited.Stats.Detections[0].JsonPath == "$.a_b_0_");
+
+        // N4: names are checked with the high-confidence layers only - a legitimate long
+        // camelCase name with digits stays, while a real key format used as a name is hidden.
+        var legitName = SecretRedactor.RedactJson(
+            Bytes("{\"responseFormatJsonSchema2024\":{\"password\":\"x\"}}"), collectForensics: true);
+        CheckTrue("forensics legit long name kept", () => legitName.Stats.Detections.Count == 1
+            && legitName.Stats.Detections[0].JsonPath == "$.responseFormatJsonSchema2024.password");
+
+        CheckTrue("forensics secret name still hidden", () => named.Stats.Detections.Count == 1
+            && named.Stats.Detections[0].JsonPath == "$.seen." + SecretRedactor.RedactedNamePlaceholder);
+
+        // An empty sensitive value is masked but records no length-0 detection.
+        var empty = SecretRedactor.RedactJson(Bytes("{\"password\":\"\"}"), collectForensics: true);
+        CheckTrue("forensics skips empty value", () => empty.Stats.FieldRedactions == 1
+            && empty.Stats.Detections.Count == 0);
+    }
+
+    // --------------------------------------------------------------
+    // Forensics pattern shape (Option 2b): the context layer records WHICH name/separator/quote
+    // fired - never the value.
+    // --------------------------------------------------------------
+    static void TestForensicsPatternShape()
+    {
+        // Runtime-built fixtures so no key-shaped literal lives in source.
+        var contextValue = "abc123" + "def456";
+        var quotedValue = "abcdef" + "ghij";
+
+        var eq = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"api_key = " + contextValue + "\"}"), collectForensics: true);
+        var eqFinding = eq.Stats.Detections.FirstOrDefault(d => d.Kind == SecretDetector.KindKeyValue);
+        CheckTrue("forensics pattern: name/sep/quote (=)", () => eqFinding is not null
+            && eqFinding.Name == "api_key" && eqFinding.Sep == "=" && eqFinding.Quote == "");
+
+        var colon = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"\\\"token\\\": \\\"" + quotedValue + "\\\"\"}"), collectForensics: true);
+        var colonFinding = colon.Stats.Detections.FirstOrDefault(d => d.Kind == SecretDetector.KindKeyValue);
+        CheckTrue("forensics pattern: name/sep/quote (: quoted)", () => colonFinding is not null
+            && colonFinding.Name == "token" && colonFinding.Sep == ":" && colonFinding.Quote == "\"");
+
+        // Uppercase names are normalized to the lowercase whitelist spelling.
+        var upper = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"ApiKey=" + contextValue + "\"}"), collectForensics: true);
+        var upperFinding = upper.Stats.Detections.FirstOrDefault(d => d.Kind == SecretDetector.KindKeyValue);
+        CheckTrue("forensics pattern: uppercase name normalized", () => upperFinding is not null
+            && upperFinding.Name == "apikey" && upperFinding.Sep == "=" && upperFinding.Quote == "");
+
+        // Single quotes are recorded as the quote character (not a boolean).
+        var single = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"password = '" + quotedValue + "'\"}"), collectForensics: true);
+        var singleFinding = single.Stats.Detections.FirstOrDefault(d => d.Kind == SecretDetector.KindKeyValue);
+        CheckTrue("forensics pattern: single quote", () => singleFinding is not null
+            && singleFinding.Name == "password" && singleFinding.Sep == "=" && singleFinding.Quote == "'");
+
+        // The quotes around the NAME (`"LocalKey" = abc`) must not be mistaken for value quotes.
+        var nameQuoted = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"\\\"LocalKey\\\" = " + contextValue + "\"}"), collectForensics: true);
+        var nameQuotedFinding = nameQuoted.Stats.Detections.FirstOrDefault(d => d.Kind == SecretDetector.KindKeyValue);
+        CheckTrue("forensics pattern: name quote is not a value quote", () => nameQuotedFinding is not null
+            && nameQuotedFinding.Name == "localkey" && nameQuotedFinding.Sep == "=" && nameQuotedFinding.Quote == "");
+
+        // `token:=<8>`: the separator is `:` but the value group starts at `=`, so Sep is `:`
+        // and Len is inflated by one (the `=` is part of the masked span).
+        var doubleColon = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"token:=" + contextValue + "\"}"), collectForensics: true);
+        var doubleColonFinding = doubleColon.Stats.Detections.FirstOrDefault(d => d.Kind == SecretDetector.KindKeyValue);
+        CheckTrue("forensics pattern: token:= keeps Sep=: and inflates Len", () => doubleColonFinding is not null
+            && doubleColonFinding.Name == "token" && doubleColonFinding.Sep == ":"
+            && doubleColonFinding.Length == contextValue.Length + 1);
+
+        // format without an overlapping context: no shape (the kind already identifies the family).
+        var formatSecret = "sk-" + "proj-" + "a1B2c3D4" + "e5F6g7H8";
+        var format = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"see " + formatSecret + "\"}"), collectForensics: true);
+        var formatFinding = format.Stats.Detections.FirstOrDefault(d => d.Layer == "format");
+        CheckTrue("forensics pattern: format has no shape", () => formatFinding is not null
+            && formatFinding.Name is null && formatFinding.Sep is null && formatFinding.Quote is null);
+
+        // entropy layer: no pattern shape either.
+        var entropySecret = "4v_wJ9rLsbLcFvwOGCOIA5h10EGzD6ZD43UAFNG_bq4";
+        var entropy = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"see " + entropySecret + "\"}"), collectForensics: true);
+        var entropyFinding = entropy.Stats.Detections.FirstOrDefault(d => d.Layer == "entropy");
+        CheckTrue("forensics pattern: entropy has no shape", () => entropyFinding is not null
+            && entropyFinding.Name is null && entropyFinding.Sep is null && entropyFinding.Quote is null);
+
+        // field layer: the JSON path already names the field.
+        var field = SecretRedactor.RedactJson(Bytes("{\"password\":\"x\"}"), collectForensics: true);
+        var fieldFinding = field.Stats.Detections.FirstOrDefault(d => d.Layer == "field");
+        CheckTrue("forensics pattern: field has no shape", () => fieldFinding is not null
+            && fieldFinding.Name is null && fieldFinding.Sep is null && fieldFinding.Quote is null);
+
+        // --- M1: a context finding discarded by a format finding at the SAME start keeps its
+        // shape, so `TOKEN=sk-...` and `"token": "sk-..."` still differ in the Pattern column. ---
+        var m1Eq = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"api_key=" + formatSecret + "\"}"), collectForensics: true);
+        var m1EqFinding = m1Eq.Stats.Detections.FirstOrDefault(d => d.Layer == "format");
+        CheckTrue("forensics M1: format inherits shape (name=)", () => m1EqFinding is not null
+            && m1EqFinding.Name == "api_key" && m1EqFinding.Sep == "=" && m1EqFinding.Quote == "");
+
+        var m1Colon = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"\\\"token\\\": \\\"" + formatSecret + "\\\"\"}"), collectForensics: true);
+        var m1ColonFinding = m1Colon.Stats.Detections.FirstOrDefault(d => d.Layer == "format");
+        CheckTrue("forensics M1: format inherits shape (name :)", () => m1ColonFinding is not null
+            && m1ColonFinding.Name == "token" && m1ColonFinding.Sep == ":" && m1ColonFinding.Quote == "\"");
+
+        // No leak: every Name is a full match of the scanner's real name alternatives, and
+        // nothing serialized carries a value. The regex is built from the production constant,
+        // so the whitelist cannot silently drift from the detector.
+        var nameRegex = new Regex("^(?:" + SecretDetector.ContextNamePattern + ")$",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+        var all = eq.Stats.Detections.Concat(colon.Stats.Detections)
+            .Concat(upper.Stats.Detections).Concat(single.Stats.Detections)
+            .Concat(nameQuoted.Stats.Detections).Concat(doubleColon.Stats.Detections)
+            .Concat(format.Stats.Detections).Concat(entropy.Stats.Detections)
+            .Concat(field.Stats.Detections).Concat(m1Eq.Stats.Detections)
+            .Concat(m1Colon.Stats.Detections).ToList();
+
+        CheckTrue("forensics pattern: names match the scanner alternatives", () => all
+            .Where(d => d.Name is not null)
+            .All(d => nameRegex.IsMatch(d.Name!)));
+
+        // The alternate spellings the context regex can produce must all be in the whitelist.
+        // Literal list on purpose: adding a spelling to the detector without listing it here
+        // fails the assertion below.
+        var spellings = new[]
+        {
+            "apikey", "apisecret", "awssecretaccesskey", "awsaccesskeyid", "secretaccesskey",
+            "accesskeyid", "accesskey", "localkey", "locl_key", "secretkey", "secret", "privatekey",
+            "masterkey", "encryptionkey", "clientsecret", "password", "passwd", "senha", "credential",
+            "authorization", "accesstoken", "refreshtoken", "bearertoken", "authtoken", "sessiontoken",
+            "idtoken", "jwtkey", "signingkey", "token",
+        };
+        CheckTrue("forensics pattern: whitelist covers alternate spellings", () => spellings.All(nameRegex.IsMatch));
+
+        // Anti-drift: the production pattern's top-level alternatives must be EXACTLY the
+        // literal snapshot below - a new/changed alternative has to be added here on purpose.
+        var expectedAlternatives = new[]
+        {
+            "aws[_-]?secret[_-]?(?:access[_-]?)?key",
+            "aws[_-]?access[_-]?key[_-]?(?:id)?",
+            "secret[_-]?access[_-]?key",
+            "access[_-]?key[_-]?id",
+            "access[_-]?key",
+            "api[_-]?key",
+            "api[_-]?secret",
+            "loc[a]?l[_-]?key",
+            "secret[_-]?key",
+            "secret",
+            "private[_-]?key",
+            "master[_-]?key",
+            "encryption[_-]?key",
+            "client[_-]?secret",
+            "password",
+            "passwd",
+            "senha",
+            "credential",
+            "authorization",
+            "access[_-]?token",
+            "refresh[_-]?token",
+            "bearer[_-]?token",
+            "auth[_-]?token",
+            "session[_-]?token",
+            "id[_-]?token",
+            "jwt[_-]?key",
+            "signing[_-]?key",
+            "token",
+        };
+        CheckTrue("forensics pattern: alternatives match the literal whitelist", () =>
+            SplitAlternatives(SecretDetector.ContextNamePattern).SequenceEqual(expectedAlternatives));
+
+        // The shape comes from the NAME whitelist, never from the value: no recorded Name
+        // contains any fixture used by this test.
+        var fixtures = new[] { contextValue, quotedValue, formatSecret, entropySecret };
+        CheckTrue("forensics pattern: name never derives from the value", () => all
+            .Where(d => d.Name is not null)
+            .All(d => fixtures.All(f => !d.Name!.Contains(f, StringComparison.Ordinal))));
+
+        var serialized = JsonSerializer.Serialize(all);
+        CheckTrue("forensics pattern: serialized record has no value", () =>
+            !serialized.Contains(contextValue, StringComparison.Ordinal)
+            && !serialized.Contains(quotedValue, StringComparison.Ordinal)
+            && !serialized.Contains(formatSecret, StringComparison.Ordinal)
+            && !serialized.Contains(entropySecret, StringComparison.Ordinal));
+
+        // Forensic types must never expose a `value`/`raw` property (the whole point is metadata only).
+        CheckTrue("forensics pattern: no value/raw property on forensic types", () =>
+            !HasValueOrRawProperty(typeof(DetectionRecord))
+            && !HasValueOrRawProperty(typeof(DetectionEntry)));
+    }
+
+    // --------------------------------------------------------------
+    // Merge union: overlapping candidates are merged so the masked span is the UNION - the
+    // proxy must never mask less than any single detector would.
+    // --------------------------------------------------------------
+    static void TestMergeUnion()
+    {
+        // Runtime-built fixtures so no key-shaped literal lives in source.
+        var key = "sk-" + "proj-" + "a1B2c3D4" + "e5F6g7H8";   // 24 chars, matches `openai`
+        var tail = ".T3st";                                    // outside the format class, inside the context value class
+        var contextValue = key + tail;
+
+        // 1) Tail outside the format class: `api_key=<key>.T3st`. The context value covers the
+        // whole value (dots are in its class) while the format stops at the dot. The format wins
+        // the layer (same offset) but must grow to the union - otherwise `.T3st` would travel
+        // unmasked. Shape is still inherited (same offset), length becomes the masked span.
+        var tailCase = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"api_key=" + contextValue + "\"}"), collectForensics: true);
+        var tailBody = Str(tailCase.Data);
+        var tailFinding = tailCase.Stats.Detections.FirstOrDefault(d => d.Layer == "format");
+        CheckTrue("merge union: format extends over context tail", () => tailFinding is not null
+            && tailCase.Stats.Detections.Count == 1
+            && tailFinding.Kind == "openai"
+            && tailFinding.Name == "api_key" && tailFinding.Sep == "="
+            && tailFinding.Length == contextValue.Length
+            && !tailBody.Contains(tail, StringComparison.Ordinal)
+            && !tailBody.Contains(key, StringComparison.Ordinal));
+
+        // 6) A merged span is ONE detection: Stats/ByKind never count the loser as well.
+        CheckTrue("merge union: total counts the span once", () => tailCase.Stats.Total == 1
+            && tailCase.Stats.ByKind.GetValueOrDefault("openai") == 1);
+
+        // 2) Contained overlap: `password=<28+ random>` fires `context` AND `entropy` on the SAME
+        // span. The candidate ends before the winner, so the union is that span - no growth.
+        var random = "XyZ0pQr9mN2vW7sT4uL8kK1jH6gF5dS3aBc";   // 35 chars, mixed classes
+        var contained = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"password=" + random + "\"}"), collectForensics: true);
+        var containedFinding = contained.Stats.Detections.FirstOrDefault();
+        CheckTrue("merge union: contained overlap keeps the span", () => contained.Stats.Detections.Count == 1
+            && containedFinding is not null
+            && containedFinding.Layer == "context"
+            && containedFinding.Length == random.Length
+            && !Str(contained.Data).Contains(random, StringComparison.Ordinal));
+
+        // 3) Two disjoint values in the same text: both are still masked (regression).
+        var two = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"api_key=" + contextValue + " and password=" + random + "\"}"), collectForensics: true);
+        var twoBody = Str(two.Data);
+        CheckTrue("merge union: disjoint values both masked", () => two.Stats.Detections.Count == 2
+            && two.Stats.Total == 2
+            && !twoBody.Contains(contextValue, StringComparison.Ordinal)
+            && !twoBody.Contains(random, StringComparison.Ordinal));
+
+        // 4) NOT COVERED - chained overlaps (A extended by B, then B extended by C). Every
+        // candidate that can extend past another span either starts at the same offset as the
+        // span it covers (context value vs known format) or starts before it (format vs context),
+        // and the extenders that could reach further (PEM, Azure connection string, db/url
+        // credentials) are themselves the outermost match at their offset. So the real scanners
+        // produce at most ONE extension per merged span - the two-link case asserted above. A
+        // synthetic three-link chain would only exercise a path no detector can reach.
+
+        // 5) M1 regression: `TOKEN=<key>` keeps the inherited shape on the format layer, and the
+        // contained context candidate does not inflate the span.
+        var m1 = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"TOKEN=" + key + "\"}"), collectForensics: true);
+        var m1Finding = m1.Stats.Detections.FirstOrDefault();
+        CheckTrue("merge union: M1 shape kept on format", () => m1.Stats.Detections.Count == 1
+            && m1Finding is not null
+            && m1Finding.Layer == "format"
+            && m1Finding.Name == "token" && m1Finding.Sep == "="
+            && m1Finding.Length == key.Length);
+    }
+
+    // --------------------------------------------------------------
+    // Union + exemptions: a merged span that covers a `format` finding must never be exempted
+    // (base64 / allow-list), and a `name=` prefix must not turn a value into "base64 payload".
+    // --------------------------------------------------------------
+    static void TestMergeExemptionRules()
+    {
+        // Runtime-built fixtures so no key-shaped/JWT-shaped literal lives in source.
+        var rnd = new Random(11);
+        const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        var prefix = new StringBuilder(40);
+        for (var i = 0; i < 40; i++)
+        {
+            prefix.Append(alphabet[rnd.Next(alphabet.Length)]);
+        }
+
+        var jwt = "ey" + "J" + "hbGciOiJIUzI1NiJ9"
+            + "." + "ey" + "JzdWIiOiIxMjM0NTY3ODkwIn0"
+            + "." + "c2lnbmF0dXJlLXRlc3QtdmFsdWU";
+        var text = "foo=" + prefix + jwt;
+
+        // 1) Partial overlap to the LEFT: the entropy candidate starts on the random run and the
+        // JWT starts INSIDE it, so the union grows over the whole JWT. The merged span must carry
+        // the format flag - without it the base64 region (structural '=' from "foo=") would
+        // exempt the span and neither the run nor the JWT would be masked.
+        var findings = SecretDetector.Detect(text, new DetectOptions(), collectShape: true);
+        var jwtStart = text.IndexOf(jwt, StringComparison.Ordinal);
+        CheckTrue("merge exemption: span covering a format is flagged", () => findings.Count == 1
+            && findings[0].IncludesFormat
+            && findings[0].Start <= jwtStart
+            && findings[0].Start + findings[0].Length >= jwtStart + jwt.Length);
+
+        var overlapped = SecretRedactor.RedactJson(Bytes("{\"c\":\"" + text + "\"}"), collectForensics: true);
+        var overlappedBody = Str(overlapped.Data);
+        CheckTrue("merge exemption: absorbed format span is never exempted", () => overlapped.Changed
+            && overlapped.Stats.Detections.Count == 1
+            && !overlappedBody.Contains(prefix.ToString(), StringComparison.Ordinal)
+            && !overlappedBody.Contains(jwt, StringComparison.Ordinal));
+
+        // 2) `SECRET_KEY=<128 hex>`: the identifier and the separator are base64 characters too,
+        // but they are not payload - the 128-char value must be masked.
+        var hexRnd = new Random(13);
+        const string hexAlphabet = "0123456789abcdef";
+        var secret = new StringBuilder(128);
+        for (var i = 0; i < 128; i++)
+        {
+            secret.Append(hexAlphabet[hexRnd.Next(hexAlphabet.Length)]);
+        }
+        var secretValue = secret.ToString();
+
+        var named = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"SECRET_KEY=" + secretValue + "\"}"), collectForensics: true);
+        CheckTrue("base64 exemption: name= prefix is not payload", () => named.Changed
+            && named.Stats.Detections.Count == 1
+            && named.Stats.Detections[0].Length == 128
+            && !Str(named.Data).Contains(secretValue, StringComparison.Ordinal));
+
+        // 2b) Same credential with prose around it: the identifier before the `=` is the run of
+        // letters/digits/underscore IMMEDIATELY before it (`SECRET_KEY`), not the whole prefix
+        // (`zz SECRET_KEY`). The whole-prefix check never matched the anchored whitelist, so the
+        // 128-char value stayed exempt and leaked.
+        var proseSecret = "zz SECRET_KEY=" + secretValue + " zz";
+        var prose = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"" + proseSecret + "\"}"), collectForensics: true);
+        CheckTrue("base64 exemption: prose + sensitive name= is not payload", () => prose.Changed
+            && prose.Stats.Detections.Count >= 1
+            && !Str(prose.Data).Contains(secretValue, StringComparison.Ordinal));
+
+        // ...and the rule itself decides on the identifier, not the prefix (direct proof for
+        // both directions: credential yes, legitimate `dat=` blob no).
+        CheckTrue("base64 rule: prose + sensitive name= is not payload",
+            () => !SecretDetector.IsBase64Payload(proseSecret));
+
+        // 3) Regression (A): a legitimate base64 blob made only of alphanumerics (no '+', '/'
+        // or padding) preceded by a NON-sensitive name keeps its exemption. `dat=` is then the
+        // only structural character, so a name-based rule must not consume it (the old strip
+        // did: the blob lost the exemption and got corrupted by the mask).
+        var alnumRnd = new Random(17);
+        var alnumBlob = Run(alnumRnd, 100);
+        var namedBlob = SecretRedactor.RedactJson(Bytes("{\"c\":\"dat=" + alnumBlob + "\"}"));
+        CheckTrue("base64 exemption: non-sensitive name= keeps alnum blob exempt", () => !namedBlob.Changed
+            && Str(namedBlob.Data).Contains(alnumBlob, StringComparison.Ordinal));
+
+        // ...and the identifier rule leaves the exemption intact (the run before `=` is `dat`,
+        // not a whitelisted name).
+        CheckTrue("base64 rule: dat=alnum blob is still payload",
+            () => SecretDetector.IsBase64Payload("dat=" + alnumBlob));
+
+        // 4) The same shape with a SENSITIVE name is a credential, not payload (B): the
+        // identifier and the separator are base64 characters too, so a structural '+'/'/'
+        // value used to stay exempt and was never masked.
+        var credentialRnd = new Random(19);
+        const string b64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        var credential = new StringBuilder(120);
+        for (var i = 0; i < 120; i++)
+        {
+            credential.Append(b64Alphabet[credentialRnd.Next(b64Alphabet.Length)]);
+        }
+        var credentialValue = credential.ToString();
+
+        var sensitiveBlob = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"SECRET_KEY=" + credentialValue + "\"}"), collectForensics: true);
+        CheckTrue("base64 exemption: sensitive name= is never payload", () => sensitiveBlob.Changed
+            && sensitiveBlob.Stats.Detections.Count == 1
+            && sensitiveBlob.Stats.Detections[0].Length == 120
+            && !Str(sensitiveBlob.Data).Contains(credentialValue, StringComparison.Ordinal));
+
+        // 4b) FN1: the identifier run includes '-' (`SECRET-KEY`), so a hyphenated sensitive name
+        // is a credential too. The 120-char value has structural '+'/'/' (base64 characters).
+        var hyphenValue = Run(new Random(29), 118) + "+/";
+        var hyphenBlob = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"SECRET-KEY=" + hyphenValue + "\"}"), collectForensics: true);
+        CheckTrue("base64 exemption: hyphenated sensitive name= is not payload", () => hyphenBlob.Changed
+            && !Str(hyphenBlob.Data).Contains(hyphenValue, StringComparison.Ordinal));
+
+        // 4c) FN1 + whitespace: `SECRET-KEY = <blob>` - the whitespace before '=' is skipped and
+        // the hyphen is part of the run.
+        var hyphenSpaced = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"SECRET-KEY = " + hyphenValue + "\"}"), collectForensics: true);
+        CheckTrue("base64 exemption: spaced hyphenated sensitive name= is not payload", () => hyphenSpaced.Changed
+            && !Str(hyphenSpaced.Data).Contains(hyphenValue, StringComparison.Ordinal));
+
+        // 4d) FN2: `SECRET_KEY = <blob>` (space before '=') used to leave the identifier empty.
+        var spacedName = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"SECRET_KEY = " + hyphenValue + "\"}"), collectForensics: true);
+        CheckTrue("base64 exemption: spaced sensitive name= is not payload", () => spacedName.Changed
+            && !Str(spacedName.Data).Contains(hyphenValue, StringComparison.Ordinal));
+
+        // 4e) Non-FP: a legitimate base64 blob with trailing padding, introduced by a
+        // NON-sensitive name (`dat=`), keeps its exemption - the final `==` is padding, not a
+        // `name=` separator (`token` before it is only the blob body).
+        var paddingBlob = "dat=" + Run(new Random(31), 100) + "token==";
+        var namedPadding = SecretRedactor.RedactJson(Bytes("{\"c\":\"" + paddingBlob + "\"}"));
+        CheckTrue("base64 exemption: non-sensitive name + padding blob stays exempt", () => !namedPadding.Changed
+            && Str(namedPadding.Data).Contains(paddingBlob.Substring(0, 40), StringComparison.Ordinal));
+
+        // 5) Regression: a real base64 payload (PNG magic, '+', '/' and '=' padding, no name=) is
+        // still exempt - as a standalone value and inline among prose.
+        var b64 = "iVBORw0KGgo" + Run(rnd, 40) + "/" + Run(rnd, 40) + "+" + Run(rnd, 30) + "==";
+
+        var standalone = SecretRedactor.RedactJson(Bytes("{\"c\":\"" + b64 + "\"}"));
+        CheckTrue("base64 exemption: standalone payload still exempt", () => !standalone.Changed
+            && Str(standalone.Data).Contains(b64.Substring(0, 40), StringComparison.Ordinal));
+
+        var inline = SecretRedactor.RedactJson(Bytes("{\"prompt\":\"img " + b64 + " end\"}"));
+        CheckTrue("base64 exemption: inline payload still exempt", () => !inline.Changed
+            && Str(inline.Data).Contains(b64.Substring(0, 40), StringComparison.Ordinal));
+
+        // 6) Non-vacuous IncludesFormat proof (C). The `context` span starts at the value - the
+        // ": " separator is not a base64 character, so the walk-back stops there - and its
+        // base64-looking region is 183 chars (4 + 30 + 69 + 80) holding the structural '=' of
+        // the inner `foo=`. On its own that region would be exempt, so the union with the JWT
+        // `format` finding is the only reason the span is masked (dropping the flag fails here).
+        var cRnd = new Random(23);
+        var cA = Run(cRnd, 30);                                  // high-entropy run before the JWT
+        var cB = Run(cRnd, 80);                                  // tail run absorbed by the union
+        var cJwt = "ey" + "J" + "hbGciOiJIUzI1NiJ9"
+            + "." + "ey" + "JzdWIiOiIxMjM0NTY3ODkwIn0"
+            + "." + cB.Substring(0, 20);                          // 20 + 1 + 27 + 1 + 20 = 69
+        var cText = "password: foo=" + cA + cJwt + cB;           // 10 + 4 + 30 + 69 + 80 = 193
+
+        var cFindings = SecretDetector.Detect(cText, new DetectOptions(), collectShape: true);
+        CheckTrue("merge exemption: absorbed format beats base64 (flag)", () => cFindings.Count == 1
+            && cFindings[0].Detector == SecretDetector.DetectorContext
+            && cFindings[0].IncludesFormat
+            && cFindings[0].Start + cFindings[0].Length == cText.Length);
+
+        var cRedacted = SecretRedactor.RedactJson(
+            Bytes("{\"c\":\"" + cText + "\"}"), collectForensics: true);
+        var cFinding = cRedacted.Stats.Detections.FirstOrDefault();
+        CheckTrue("merge exemption: absorbed format beats base64 (masked)", () => cRedacted.Changed
+            && cRedacted.Stats.Detections.Count == 1
+            && cFinding is not null
+            && cFinding.Layer == "context"
+            && !Str(cRedacted.Data).Contains(cB, StringComparison.Ordinal));
+
+        static string Run(Random r, int n)
+        {
+            const string a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+            var sb = new StringBuilder(n);
+            for (var i = 0; i < n; i++) sb.Append(a[r.Next(a.Length)]);
+            return sb.ToString();
+        }
+    }
+
+    /// <summary>Splits a regex alternation on top-level <c>|</c> only (ignores nested groups).</summary>
+    static List<string> SplitAlternatives(string pattern)
+    {
+        var parts = new List<string>();
+        var depth = 0;
+        var start = 0;
+        for (var i = 0; i < pattern.Length; i++)
+        {
+            var c = pattern[i];
+            if (c == '\\')
+            {
+                i++;
+                continue;
+            }
+
+            if (c == '(')
+            {
+                depth++;
+            }
+            else if (c == ')')
+            {
+                depth--;
+            }
+            else if (c == '|' && depth == 0)
+            {
+                parts.Add(pattern[start..i]);
+                start = i + 1;
+            }
+        }
+
+        parts.Add(pattern[start..]);
+        return parts;
+    }
+
+    static bool HasValueOrRawProperty(Type type) => type.GetProperties().Any(p =>
+        p.Name.Equals("value", StringComparison.OrdinalIgnoreCase)
+        || p.Name.Equals("raw", StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Builds {"name":{"name":... "value" ...}} with <paramref name="levels"/> nested objects.</summary>
+    static string Nest(string name, int levels, string value)
+    {
+        var sb = new StringBuilder();
+        for (var i = 0; i < levels; i++)
+        {
+            sb.Append("{\"").Append(name).Append("\":");
+        }
+
+        sb.Append('"').Append(value).Append('"');
+
+        for (var i = 0; i < levels; i++)
+        {
+            sb.Append('}');
+        }
+
+        return sb.ToString();
     }
 }

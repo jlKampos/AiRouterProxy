@@ -12,6 +12,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The host gets Microsoft.AspNetCore.Http from the Web SDK's implicit usings; this
+         console harness links the middleware source, so add the same global using. -->
+    <Using Include="Microsoft.AspNetCore.Http" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Tests the dashboard write-phase sources in isolation (validators, persistence,
          services, shared contracts). No Blazor, no host, no real config files. -->
     <Compile Include="..\..\src\AiRouterProxy\AdminValidation\RouteValidator.cs" Link="AdminValidation\RouteValidator.cs" />
@@ -27,26 +33,32 @@
     <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\KeyMetaStore.cs" Link="AdminPersistence\KeyMetaStore.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AuditLog.cs" Link="AdminPersistence\AuditLog.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\ActivityStore.cs" Link="Observability\ActivityStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\DetectionStore.cs" Link="Observability\DetectionStore.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\IEventLogStore.cs" Link="Observability\IEventLogStore.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminServices\AdminHash.cs" Link="AdminServices\AdminHash.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminServices\DashboardAdminService.cs" Link="AdminServices\DashboardAdminService.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\ProxyOptions.cs" Link="Routing\ProxyOptions.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\ConfigPaths.cs" Link="Routing\ConfigPaths.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Routing\RouteResolver.cs" Link="Routing\RouteResolver.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Policies\AuthenticationPolicy.cs" Link="Policies\AuthenticationPolicy.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Policies\RateLimiter.cs" Link="Policies\RateLimiter.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminUi\UiSessionMiddleware.cs" Link="AdminUi\UiSessionMiddleware.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Detection\SecurityHelpers.cs" Link="Detection\SecurityHelpers.cs" />
+    <!-- Detection forensics round-trip: DetectionRecord -> DetectionEntry -> DetectionView. -->
+    <Compile Include="..\..\src\AiRouterProxy\Detection\SecretDetector.cs" Link="Detection\SecretDetector.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Detection\SecretRedactor.cs" Link="Detection\SecretRedactor.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Detection\DetectionFingerprint.cs" Link="Detection\DetectionFingerprint.cs" />
     <Compile Include="..\..\src\AiRouterProxy.Dashboard\Models\DashboardModels.cs" Link="Models\DashboardModels.cs" />
     <Compile Include="..\..\src\AiRouterProxy.Dashboard\Models\IDashboardAdminService.cs" Link="Models\IDashboardAdminService.cs" />
+    <!-- Real host facade: the security round-trip test asserts the view the UI reads. -->
+    <Compile Include="..\..\src\AiRouterProxy\AdminUi\HostDashboardFacade.cs" Link="AdminUi\HostDashboardFacade.cs" />
   </ItemGroup>
 
   <ItemGroup>
-    <!-- IOptionsMonitor<T> used by DashboardAdminService; same version family as the host. -->
-    <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.14" />
-    <PackageReference Include="Microsoft.Extensions.Primitives" Version="10.0.14" />
-    <!-- ILogger<T> injected by DashboardAdminService (audit failures are logged, not swallowed). -->
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.14" />
-    <!-- DashboardAdminService.ClearEventLog uses EventLog; the host gets it from the
-         Microsoft.NET.Sdk.Web shared framework, this console harness needs the package. -->
-    <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.14" />
+    <!-- UiSessionMiddleware.cs (linked above) uses HttpContext/CookieOptions/StatusCodes and
+         the harness uses IOptionsMonitor/ILogger/EventLog: the ASP.NET Core shared framework
+         already provides all of them (the explicit PackageReferences would only raise NU1510). -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
 </Project>

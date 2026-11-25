@@ -169,6 +169,11 @@ public static class MapAdminApiV1Extensions
                         entropyThreshold = s.Redaction.Detect.EntropyThreshold,
                     },
                     allow = s.Redaction.Allow,
+                    forensics = new
+                    {
+                        enabled = s.Redaction.Forensics.Enabled,
+                        capacity = s.Redaction.Forensics.Capacity,
+                    },
                 },
                 inspection = new
                 {
@@ -197,6 +202,38 @@ public static class MapAdminApiV1Extensions
             // ones, so a single-section body never blanks the other section.
             return Respond(svc.ApplySecurity(body.redaction, body.inspection, Bearer(ctx)), ctx);
         });
+
+        // Detection forensics (in memory, metadata only): where/which layer fired - never the value.
+        app.MapGet("/admin/api/v1/detections", (IDashboardFacade facade, int limit = 50) =>
+        {
+            limit = Math.Clamp(limit, 1, 200);
+            var rows = facade.GetDetections(limit);
+            return Results.Ok(new
+            {
+                count = rows.Count,
+                detections = rows.Select(d => new
+                {
+                    timestamp = d.Timestamp,
+                    requestId = d.RequestId,
+                    client = d.Client,
+                    route = d.Route,
+                    method = d.Method,
+                    path = d.Path,
+                    model = d.Model,
+                    jsonPath = d.JsonPath,
+                    layer = d.Layer,
+                    kind = d.Kind,
+                    length = d.Length,
+                    fingerprint = d.Fingerprint,
+                    name = d.Name,
+                    sep = d.Sep,
+                    quote = d.Quote,
+                }),
+            });
+        });
+
+        app.MapDelete("/admin/api/v1/detections", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearDetections(Bearer(ctx)), ctx));
 
         app.MapPost("/admin/api/v1/keys/lookup", async (HttpContext ctx, IOptionsMonitor<ProxyOptions> optsMonitor, KeyMetaStore metaStore) =>
         {

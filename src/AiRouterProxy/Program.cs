@@ -44,6 +44,8 @@ builder.Services.AddHttpClient();
 builder.Services.AddWindowsService(options => options.ServiceName = "AIRouterProxy");
 
 builder.Services.AddSingleton<ActivityStore>();
+builder.Services.AddSingleton<DetectionStore>();
+builder.Services.AddSingleton<IDetectionStore>(sp => sp.GetRequiredService<DetectionStore>());
 builder.Services.AddSingleton<IEventLogStore, WindowsEventLogStore>();
 
 // Admin dashboard UI - Blazor Web App served under /admin/ui in the same process.
@@ -224,6 +226,8 @@ app.MapGet("/admin/endpoints", (IOptionsMonitor<ProxyOptions> opts) =>
             new { method = "POST", path = "/admin/api/v1/config/import", description = "Write API: import a no-secrets config bundle." },
             new { method = "DELETE", path = "/admin/api/v1/logs/activity", description = "Write API: clear the in-memory activity buffer." },
             new { method = "DELETE", path = "/admin/api/v1/logs/eventlog", description = "Write API: clear the dedicated AIRouterProxy Event Log." },
+            new { method = "GET", path = "/admin/api/v1/detections?limit=50", description = "Read API: recent detection forensics (metadata only, never the value)." },
+            new { method = "DELETE", path = "/admin/api/v1/detections", description = "Write API: clear the in-memory detection forensics buffer (admin key required)." },
         },
     });
 });

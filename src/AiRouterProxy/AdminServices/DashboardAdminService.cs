@@ -42,6 +42,7 @@ public sealed class DashboardAdminService : IDashboardAdminService
     private readonly AuditLog _audit;
     private readonly ActivityStore _activity;
     private readonly IEventLogStore _eventLogs;
+    private readonly IDetectionStore _detections;
     private readonly ILogger<DashboardAdminService> _logger;
 
     // Serializes every config write (backup -> write -> confirm -> audit) because the
@@ -60,6 +61,7 @@ public sealed class DashboardAdminService : IDashboardAdminService
         AuditLog audit,
         ActivityStore activity,
         IEventLogStore eventLogs,
+        IDetectionStore detections,
         ILogger<DashboardAdminService> logger)
     {
         _options = options;
@@ -70,6 +72,7 @@ public sealed class DashboardAdminService : IDashboardAdminService
         _audit = audit;
         _activity = activity;
         _eventLogs = eventLogs;
+        _detections = detections;
         _logger = logger;
     }
 
@@ -612,6 +615,25 @@ public sealed class DashboardAdminService : IDashboardAdminService
         return AdminResult.Success(message);
     }
 
+    public AdminResult ClearDetections(string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        var cleared = _detections.Clear();
+        var message = $"Detection buffer cleared ({cleared} {(cleared == 1 ? "entry" : "entries")}).";
+        if (!TryAudit("logs.clear.detections", "detection buffer", "ok", authKey))
+        {
+            // The destructive action already happened: never report it as a failure.
+            message += " The audit entry could not be written.";
+        }
+
+        return AdminResult.Success(message);
+    }
+
     public AdminResult ClearEventLog(string? authKey = null)
     {
         var auth = Authorize(authKey);
@@ -755,7 +777,23 @@ public sealed class DashboardAdminService : IDashboardAdminService
             }
 
             _audit.Append("security.apply", RedactionFile, "ok", Actor(authKey));
-            return AdminResult.Success("Security settings applied and the engine reloaded.");
+
+            var message = "Security settings applied and the engine reloaded.";
+
+            // Turning forensics OFF purges the in-memory detection buffer: metadata must not
+            // linger after the operator disabled collection. Only when there is actually
+            // something to drop - a plain Save while already off must not emit an empty audit
+            // line or an "0 entries cleared" banner. Best effort only: the config write is
+            // already committed, so neither the purge nor its audit entry may fail (or roll
+            // back) the operation.
+            if (IsForensicsDisabled(redactionSection) && _detections.Count > 0)
+            {
+                var purged = _detections.Clear();
+                TryAudit("logs.clear.detections", "detection buffer", "ok", authKey);
+                message += $" Forensics disabled: {purged} buffered {(purged == 1 ? "entry" : "entries")} cleared.";
+            }
+
+            return AdminResult.Success(message);
         }
         catch (Exception)
         {
@@ -1146,6 +1184,37 @@ public sealed class DashboardAdminService : IDashboardAdminService
         var created = new JsonObject();
         parent[property] = created;
         return created;
+    }
+
+    /// <summary>
+    /// True when the submitted Redaction section explicitly disables forensics
+    /// (<c>forensics.enabled == false</c>). Case-insensitive, mirroring SecurityValidator.
+    /// </summary>
+    private static bool IsForensicsDisabled(JsonNode? redactionSection)
+    {
+        if (redactionSection is not JsonObject section
+            || SectionProp(section, "forensics") is not JsonObject forensics)
+        {
+            return false;
+        }
+
+        return SectionProp(forensics, "enabled") is JsonValue enabled
+               && enabled.TryGetValue<bool>(out var on)
+               && !on;
+    }
+
+    /// <summary>Case-insensitive property lookup (the option binder is case-insensitive too).</summary>
+    private static JsonNode? SectionProp(JsonObject obj, string name)
+    {
+        foreach (var (key, value) in obj)
+        {
+            if (string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return value;
+            }
+        }
+
+        return null;
     }
 
     private void RecoverAfterFailedConfirm(string fileName)

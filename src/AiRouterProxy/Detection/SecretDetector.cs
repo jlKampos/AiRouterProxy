@@ -21,7 +21,24 @@ public sealed record SecretFinding(
     string Detector,
     int Start,
     int Length,
-    Confidence Confidence);
+    Confidence Confidence)
+{
+    /// <summary>Context scanner (also inherited by `format` when it overlaps a context at the same offset): the identifier before the separator (fixed whitelist - never the value).</summary>
+    public string? Name { get; init; }
+
+    /// <summary>Context scanner (also inherited by `format` on the same offset): separator normalized to "=" or ":".</summary>
+    public string? Sep { get; init; }
+
+    /// <summary>
+    /// Context scanner (also inherited by `format` on the same offset): quote character wrapping
+    /// the value (`"`, `'` or "" when unquoted). Null for `field`/`entropy` and for a `format`
+    /// that did not inherit a shape, where the shape does not apply.
+    /// </summary>
+    public string? Quote { get; init; }
+
+    /// <summary>true when an overlapping `format` finding was absorbed; such a span is never exempted</summary>
+    public bool IncludesFormat { get; init; }
+}
 
 /// <summary>
 /// Unified secret-detection engine (pure, testable in isolation; the test harness links
@@ -148,6 +165,23 @@ public static class SecretDetector
     // ------------------------------------------------------------------
 
     /// <summary>
+    /// Name alternatives of the "key: value" scanner. Exposed to the test harness so the
+    /// whitelist assertion can be derived from the real regex alternatives instead of a
+    /// hand-copied list that could silently drift.
+    /// </summary>
+    internal const string ContextNamePattern =
+        @"aws[_-]?secret[_-]?(?:access[_-]?)?key|aws[_-]?access[_-]?key[_-]?(?:id)?|secret[_-]?access[_-]?key|access[_-]?key[_-]?id|access[_-]?key|api[_-]?key|api[_-]?secret|loc[a]?l[_-]?key|secret[_-]?key|secret|private[_-]?key|master[_-]?key|encryption[_-]?key|client[_-]?secret|password|passwd|senha|credential|authorization|access[_-]?token|refresh[_-]?token|bearer[_-]?token|auth[_-]?token|session[_-]?token|id[_-]?token|jwt[_-]?key|signing[_-]?key|token";
+
+    /// <summary>
+    /// Matches a complete whitelisted context name (the same alternatives as
+    /// <see cref="ContextNamePattern"/>). Used to keep a credential value such as
+    /// `SECRET_KEY=&lt;blob&gt;` from being mistaken for a base64 payload.
+    /// </summary>
+    private static readonly Regex SensitiveContextNameOnly = new(
+        "^(?:" + ContextNamePattern + ")$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    /// <summary>
     /// Catches config excerpts pasted into messages: `"LocalKey": "abc..."`, `LOCAL_KEY=abc...`,
     /// `password: abc...`, AWS `aws_secret_access_key=...` (base64 with / + =). Only the value
     /// is masked (the name + separator stay). Values may contain common password symbols
@@ -156,7 +190,7 @@ public static class SecretDetector
     /// </summary>
     private static readonly Regex KeyValueContextRegex = new(
         @"(?i)(?<![A-Za-z0-9_])"
-        + @"(?<name>aws[_-]?secret[_-]?(?:access[_-]?)?key|aws[_-]?access[_-]?key[_-]?(?:id)?|secret[_-]?access[_-]?key|access[_-]?key[_-]?id|access[_-]?key|api[_-]?key|api[_-]?secret|loc[a]?l[_-]?key|secret[_-]?key|secret|private[_-]?key|master[_-]?key|encryption[_-]?key|client[_-]?secret|password|passwd|senha|credential|authorization|access[_-]?token|refresh[_-]?token|bearer[_-]?token|auth[_-]?token|session[_-]?token|id[_-]?token|jwt[_-]?key|signing[_-]?key|token)"
+        + @"(?<name>" + ContextNamePattern + @")"
         + @"(?<sep>[\""']?\s*[:=]\s*[\""']?)"
         + @"(?<value>[A-Za-z0-9_~+/=!@#$%^&*().\-]{8,})",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -202,9 +236,15 @@ public static class SecretDetector
     /// <summary>
     /// Runs every enabled scanner over <paramref name="text"/> and returns the merged,
     /// non-overlapping findings. Overlaps are resolved by detector priority
-    /// (format &gt; context &gt; entropy), then by longest match.
+    /// (format &gt; context &gt; entropy), then by longest match; the surviving finding grows
+    /// to cover the union, so the returned spans are never shorter than a single detector's.
     /// </summary>
-    public static IReadOnlyList<SecretFinding> Detect(string? text, DetectOptions? options)
+    /// <param name="collectShape">
+    /// When true the context scanner also records the pattern SHAPE (whitelisted name,
+    /// normalized separator and quote). False by default so the hot redaction path never
+    /// allocates those strings - forensics opt in explicitly.
+    /// </param>
+    public static IReadOnlyList<SecretFinding> Detect(string? text, DetectOptions? options, bool collectShape = false)
     {
         if (string.IsNullOrEmpty(text))
         {
@@ -221,7 +261,7 @@ public static class SecretDetector
 
         if (options.ByKeyValueContext)
         {
-            ScanContext(text, findings);
+            ScanContext(text, findings, collectShape);
         }
 
         if (options.ByLongStrings)
@@ -265,7 +305,7 @@ public static class SecretDetector
         }
     }
 
-    private static void ScanContext(string text, List<SecretFinding> findings)
+    private static void ScanContext(string text, List<SecretFinding> findings, bool collectShape)
     {
         var matches = KeyValueContextRegex.Matches(text);
 
@@ -277,7 +317,29 @@ public static class SecretDetector
                 continue;
             }
 
-            findings.Add(new SecretFinding(KindKeyValue, DetectorContext, value.Index, value.Length, Confidence.Medium));
+            // Zero-cost path: no shape strings (name/sep/quote) are materialized unless the
+            // caller asked for forensics metadata.
+            if (!collectShape)
+            {
+                findings.Add(new SecretFinding(KindKeyValue, DetectorContext, value.Index, value.Length, Confidence.Medium));
+                continue;
+            }
+
+            var sepRaw = m.Groups["sep"].Value;
+
+            // Quote is derived ONLY from the last non-space character of the separator group,
+            // so a closing quote that belongs to the NAME (`"LocalKey" = abc`) does not count.
+            var sepTrimmed = sepRaw.TrimEnd();
+            var quote = sepTrimmed.EndsWith("\"") ? "\""
+                : sepTrimmed.EndsWith("'") ? "'"
+                : "";
+
+            findings.Add(new SecretFinding(KindKeyValue, DetectorContext, value.Index, value.Length, Confidence.Medium)
+            {
+                Name = m.Groups["name"].Value.ToLowerInvariant(),
+                Sep = sepRaw.Contains('=') ? "=" : ":",
+                Quote = quote,
+            });
         }
     }
 
@@ -344,14 +406,6 @@ public static class SecretDetector
         return distinct.Count >= 12 && classes >= 3;
     }
 
-    /// <summary>
-    /// Base64 payload detection (image/binary data). Those payloads are never scanned as text:
-    /// scanning them neither finds keys (they are bytes, not pasted text) nor fixes anything -
-    /// it only corrupts the base64 with the mask (litellm "only ASCII" errors). Detection is
-    /// deliberately narrow: structural characters (/ + =) are required so real random-looking
-    /// text, hashes, slugs and filenames are still caught by the entropy layer.
-    /// </summary>
-
     /// <summary>Below this length a "base64-looking" run is not treated as payload yet.</summary>
     private const int Base64PayloadMinLength = 100;
 
@@ -363,6 +417,18 @@ public static class SecretDetector
     /// True when a whole string value is a binary payload and must bypass text scanning:
     /// a data URL ("data:...;base64,&lt;payload&gt;", e.g. OpenAI image_url.url) or a long
     /// standalone base64 blob (e.g. Anthropic source.data).
+    /// <para>
+    /// Those payloads are never scanned as text: scanning them neither finds keys (they are
+    /// bytes, not pasted text) nor fixes anything - it only corrupts the base64 with the mask
+    /// (litellm "only ASCII" errors). Detection is deliberately narrow: structural characters
+    /// (/ + =) are required so real random-looking text, hashes, slugs and filenames are still
+    /// caught by the entropy layer.
+    /// </para>
+    /// <para>
+    /// A region introduced by a sensitive context name is never treated as payload: the
+    /// identifier and the separator are base64 characters too, but `SECRET_KEY=&lt;blob&gt;` is a
+    /// credential value that must be masked, not an image.
+    /// </para>
     /// </summary>
     public static bool IsBase64Payload(string? text)
     {
@@ -378,13 +444,22 @@ public static class SecretDetector
             return true;
         }
 
+        // A region introduced by a sensitive context name is a credential, not payload: the
+        // identifier and the separator are base64 characters too, so only the name tells a
+        // `SECRET_KEY=<blob>` value apart from a real blob.
+        if (IntroducedBySensitiveName(trimmed))
+        {
+            return false;
+        }
+
         if (trimmed.Length < Base64PayloadMinLength)
         {
             return false;
         }
 
+        var payload = trimmed.AsSpan();
         var structural = false;
-        foreach (var c in trimmed)
+        foreach (var c in payload)
         {
             if (c is '/' or '+' or '=')
             {
@@ -407,7 +482,9 @@ public static class SecretDetector
     /// <summary>
     /// True when an entropy/context finding lies inside a base64 payload region of a longer
     /// text (a data URL or base64 blob pasted inline among prose). "format" findings are never
-    /// exempted, even here, so pasted keys next to an image are still masked.
+    /// exempted, even here, so pasted keys next to an image are still masked. A region
+    /// introduced by a sensitive context name is never treated as payload, so
+    /// `SECRET_KEY=&lt;blob&gt;` is masked like any other credential value.
     /// </summary>
     public static bool IsInsideBase64Payload(string text, SecretFinding finding)
     {
@@ -422,6 +499,22 @@ public static class SecretDetector
         while (end < text.Length && IsBase64Char(text[end]))
         {
             end++;
+        }
+
+        // A region introduced by a sensitive context name is a credential, not payload: the
+        // identifier and the separator are base64 characters too, so only the name tells them
+        // apart (`=` padding lives at the END of a blob, never right after the name).
+        // `NAME = <value>` is written with whitespace around the separator, which is not a
+        // base64 character - look left across it so the name still reaches the shared rule.
+        var namedStart = ExtendLeftOverSeparator(text, start);
+        if (namedStart < start && IntroducedBySensitiveName(text.AsSpan(namedStart, end - namedStart)))
+        {
+            return false;
+        }
+
+        if (IntroducedBySensitiveName(text.AsSpan(start, end - start)))
+        {
+            return false;
         }
 
         if (end - start < Base64PayloadMinLength)
@@ -442,7 +535,83 @@ public static class SecretDetector
         return text.AsSpan(0, start).EndsWith("base64,", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>Sorts by start, then detector priority, then longest match; drops overlaps.</summary>
+    /// <summary>
+    /// True when the first `=` of the region is introduced by a whitelisted context name
+    /// (`SECRET_KEY=&lt;blob&gt;`): such a region is a credential value, not a base64 payload.
+    /// The identifier is the run of letters/digits/underscore/hyphen IMMEDIATELY before the `=`
+    /// (whitespace between the name and `=` is skipped, so `SECRET_KEY = &lt;blob&gt;` counts),
+    /// never the whole prefix - prose such as `zz SECRET_KEY=&lt;blob&gt;` is still a credential,
+    /// while the run before the padding of a real blob is the blob itself (longer than 40, so
+    /// the length bound keeps the legitimate exemption).
+    /// </summary>
+    private static bool IntroducedBySensitiveName(ReadOnlySpan<char> span)
+    {
+        var nameEnd = span.IndexOf('=');
+
+        // `=` padding lives at the END of a blob, never right after the name.
+        if (nameEnd <= 0 || nameEnd >= span.Length - 1)
+        {
+            return false;
+        }
+
+        // `NAME = value` is still a credential: skip the whitespace between the name and '='.
+        while (nameEnd > 0 && (span[nameEnd - 1] == ' ' || span[nameEnd - 1] == '\t'))
+        {
+            nameEnd--;
+        }
+
+        var idStart = nameEnd;
+        while (idStart > 0 && (char.IsLetterOrDigit(span[idStart - 1]) || span[idStart - 1] == '_' || span[idStart - 1] == '-'))
+        {
+            idStart--;
+        }
+
+        var id = span[idStart..nameEnd];
+        return id.Length >= 2 && id.Length <= 40 && SensitiveContextNameOnly.IsMatch(id);
+    }
+
+    /// <summary>
+    /// Extends <paramref name="start"/> left over an optional `NAME [ws] = [ws]` separator so a
+    /// credential written as `SECRET_KEY = &lt;blob&gt;` keeps its identifier inside the region.
+    /// Returns <paramref name="start"/> unchanged when no separator is found. Only the position
+    /// is computed here - the caller decides whether the identifier is a sensitive name, so a
+    /// non-sensitive `dat = &lt;blob&gt;` keeps exactly the previous behaviour.
+    /// </summary>
+    private static int ExtendLeftOverSeparator(string text, int start)
+    {
+        var probe = start;
+        while (probe > 0 && (text[probe - 1] == ' ' || text[probe - 1] == '\t'))
+        {
+            probe--;
+        }
+
+        if (probe == 0 || text[probe - 1] != '=')
+        {
+            return start;
+        }
+
+        probe--; // the '=' itself
+
+        // Whitespace between the name and '=' is part of `NAME = value`.
+        while (probe > 0 && (text[probe - 1] == ' ' || text[probe - 1] == '\t'))
+        {
+            probe--;
+        }
+
+        while (probe > 0 && IsBase64Char(text[probe - 1]))
+        {
+            probe--;
+        }
+
+        return probe;
+    }
+
+    /// <summary>
+    /// Sorts by start, then detector priority, then longest match; overlapping candidates are
+    /// merged (the union is masked) so the proxy never masks less than any single detector would
+    /// at the span level. The base64 and allow-list exemptions are still decided on the merged
+    /// span, and a span that covers a `format` finding is never exempted.
+    /// </summary>
     private static IReadOnlyList<SecretFinding> Merge(List<SecretFinding> findings)
     {
         if (findings.Count <= 1)
@@ -467,9 +636,40 @@ public static class SecretDetector
 
         foreach (var finding in findings)
         {
-            if (finding.Start < lastEnd)
+            if (merged.Count > 0 && finding.Start < lastEnd)
             {
-                continue; // overlaps an accepted finding
+                var winner = merged[^1];
+
+                // Shape metadata (name/separator/quote) only applies when both findings describe
+                // the same value (same offset) - format wins the layer, context supplies the shape.
+                if (finding.Name is not null && winner.Name is null && finding.Start == winner.Start)
+                {
+                    winner = winner with { Name = finding.Name, Sep = finding.Sep, Quote = finding.Quote };
+                }
+
+                // Never mask less than a single detector would: the winner grows to cover the
+                // overlapping candidate's tail (a contained candidate leaves the span unchanged).
+                var winnerEnd = winner.Start + winner.Length;
+                var findingEnd = finding.Start + finding.Length;
+                if (findingEnd > winnerEnd)
+                {
+                    winner = winner with { Length = findingEnd - winner.Start };
+                }
+
+                // A span that absorbed a `format` finding must never be exempted (base64 /
+                // allow-list): otherwise a context/entropy winner could mask LESS than the
+                // format detector alone would have.
+                winner = winner with
+                {
+                    IncludesFormat = winner.IncludesFormat
+                        || finding.Detector == DetectorFormat
+                        || finding.IncludesFormat,
+                };
+
+                merged[^1] = winner;
+                // The winner only grows, so its end is the merged span's end by invariant.
+                lastEnd = winner.Start + winner.Length;
+                continue;
             }
 
             merged.Add(finding);

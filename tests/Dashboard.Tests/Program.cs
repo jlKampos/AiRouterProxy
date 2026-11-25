@@ -5,6 +5,7 @@ using System.Text.Json.Nodes;
 using AIRouterProxy;
 using AiRouterProxy.AdminPersistence;
 using AiRouterProxy.AdminServices;
+using AiRouterProxy.AdminUi;
 using AiRouterProxy.AdminValidation;
 using AiRouterProxy.Dashboard.Models;
 using Microsoft.Extensions.Logging;
@@ -62,6 +63,7 @@ class Program
             new AuditLog(paths),
             activity,
             eventLogs,
+            new DetectionStore(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
         return (service, root, root, activity, eventLogs);
     }
@@ -71,6 +73,7 @@ class Program
         TestRouteValidator();
         TestKeyValidator();
         TestSecurityValidator();
+        TestSecurityValidatorForensics();
         TestImportValidator();
         TestAdminHash();
         TestAtomicWriter();
@@ -95,9 +98,17 @@ class Program
         TestReloadConfirmRestoreFailedSignaling();
         TestConfigFileReader();
         TestLogClearing();
+        TestClearDetections();
+        TestForensicsRoundTrip();
+        TestForensicsPersistence();
+        TestForensicsPurgeScope();
+        TestDetectionViewRoundTrip();
+        TestDetectionPattern();
         TestLogClearingResilience();
         TestLogClearingSafety();
         TestLogClearingLoggingFailure();
+        TestUiSessionManager();
+        TestUiSessionMiddleware();
 
         foreach (var dir in _tmpRoots)
         {
@@ -211,6 +222,49 @@ class Program
         CheckTrue("security: non-boolean enabled", () => !SecurityValidator.Validate(JsonNode.Parse("{\"enabled\":\"yes\"}"), null, out _));
         CheckTrue("security: entropy in range ok", () => SecurityValidator.Validate(JsonNode.Parse("{\"detect\":{\"entropyThreshold\":0}}"), null, out _));
         CheckTrue("security: null sections pass", () => SecurityValidator.Validate(null, null, out _));
+    }
+
+    // --------------------------------------------------------------
+    // Detection forensics: Redaction.forensics validation + sanitize projection.
+    // --------------------------------------------------------------
+    static void TestSecurityValidatorForensics()
+    {
+        CheckTrue("forensics: capacity 9 rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":9}}"), null, out _));
+        CheckTrue("forensics: capacity 10 accepted", () =>
+            SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":10}}"), null, out _));
+        CheckTrue("forensics: capacity 1000 accepted", () =>
+            SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":1000}}"), null, out _));
+        CheckTrue("forensics: capacity 1001 rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":1001}}"), null, out _));
+        CheckTrue("forensics: capacity 10.5 rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":10.5}}"), null, out _));
+        CheckTrue("forensics: capacity non-number rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":\"abc\"}}"), null, out _));
+        CheckTrue("forensics: enabled non-boolean rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"enabled\":\"yes\"}}"), null, out _));
+        CheckTrue("forensics: non-object rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":true}"), null, out _));
+        CheckTrue("forensics: enabled+capacity accepted", () =>
+            SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"enabled\":true,\"capacity\":500}}"), null, out _));
+
+        // SanitizeRedaction keeps enabled+capacity and drops unknown properties (nested and top-level).
+        var sanitized = SecurityValidator.SanitizeRedaction(JsonNode.Parse(
+            "{\"enabled\":true,\"forensics\":{\"enabled\":true,\"capacity\":300,\"smuggled\":\"x\"},\"unknown\":1}"));
+        CheckTrue("forensics: sanitize keeps enabled+capacity", () => sanitized is not null
+            && sanitized["forensics"] is JsonObject forensics
+            && forensics["enabled"] is JsonValue enabledValue && enabledValue.TryGetValue<bool>(out var enabled) && enabled
+            && forensics["capacity"] is JsonValue capacityValue && capacityValue.TryGetValue<int>(out var capacity) && capacity == 300);
+        CheckTrue("forensics: sanitize drops unknown nested property", () => sanitized?["forensics"] is JsonObject forensics
+            && forensics.Count == 2
+            && forensics["smuggled"] is null);
+        CheckTrue("forensics: sanitize drops unknown top-level property", () => sanitized?["unknown"] is null);
+
+        // Regression: a Redaction section without forensics stays valid (defaults off/200 apply).
+        CheckTrue("forensics: absent section still valid", () => SecurityValidator.Validate(
+            JsonNode.Parse("{\"enabled\":true,\"detect\":{\"byFieldName\":true}}"), null, out _));
+        CheckTrue("forensics: absent section not invented by sanitize", () =>
+            SecurityValidator.SanitizeRedaction(JsonNode.Parse("{\"enabled\":true}"))?["forensics"] is null);
     }
 
     // --------------------------------------------------------------
@@ -727,6 +781,7 @@ class Program
             new AuditLog(paths),
             new ActivityStore(),
             new FakeEventLogStore(),
+            new DetectionStore(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
@@ -845,6 +900,7 @@ class Program
             new AuditLog(paths),
             new ActivityStore(),
             new FakeEventLogStore(),
+            new DetectionStore(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var redPath = Path.Combine(root, "redaction.json");
@@ -1086,6 +1142,7 @@ class Program
             new AuditLog(paths),
             new ActivityStore(),
             new FakeEventLogStore(),
+            new DetectionStore(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
@@ -1131,6 +1188,7 @@ class Program
             new AuditLog(paths),
             new ActivityStore(),
             new FakeEventLogStore(),
+            new DetectionStore(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
@@ -1175,6 +1233,7 @@ class Program
             new AuditLog(paths),
             new ActivityStore(),
             new FakeEventLogStore(),
+            new DetectionStore(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var redPath = Path.Combine(root, "redaction.json");
@@ -1414,6 +1473,440 @@ class Program
     }
 
     // --------------------------------------------------------------
+    // Detection forensics clearing: same protected path as the activity buffer
+    // (admin key re-check before the destructive in-memory clear, audited).
+    // --------------------------------------------------------------
+    static void TestClearDetections()
+    {
+        var adminKey = "admin-primary-key";
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var detections = new DetectionStore();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            detections,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        detections.AddRange(new[] { Entry(1), Entry(2) }, 100);
+
+        var noAuth = svc.ClearDetections(null);
+        CheckTrue("detections: clear requires admin key", () => !noAuth.Ok && noAuth.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("detections: unauthorized clear keeps the entries", () => detections.Count == 2);
+
+        var wrongKey = svc.ClearDetections("wrong");
+        CheckTrue("detections: clear wrong key rejected", () => !wrongKey.Ok && wrongKey.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("detections: wrong key keeps the entries", () => detections.Count == 2);
+
+        var cleared = svc.ClearDetections(adminKey);
+        CheckTrue("detections: clear ok", () => cleared.Ok);
+        CheckTrue("detections: buffer emptied", () => detections.Count == 0);
+        CheckTrue("detections: clear audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("logs.clear.detections", StringComparison.Ordinal));
+    }
+
+    // --------------------------------------------------------------
+    // Detection forensics: redaction.json round-trip (enabled/capacity), purge on disable,
+    // and the empty Recent(0) contract.
+    // --------------------------------------------------------------
+    static void TestForensicsPersistence()
+    {
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var detections = new DetectionStore();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            detections,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        var redaction = new JsonObject
+        {
+            ["enabled"] = true,
+            ["detect"] = new JsonObject { ["byFieldName"] = true },
+            ["allow"] = new JsonArray(),
+            ["forensics"] = new JsonObject { ["enabled"] = true, ["capacity"] = 350 },
+        };
+
+        var applied = svc.ApplySecurity(redaction, null);
+        CheckTrue("forensics: apply ok", () => applied.Ok);
+
+        var disk = ConfigFileReader.ReadSecurity(paths.ConfigDir);
+        CheckTrue("forensics: round-trip enabled+capacity", () => disk?.Redaction is { } section
+            && section.Forensics.Enabled
+            && section.Forensics.Capacity == 350);
+
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        // Recent(0) means "no entries" - the caller asked for none.
+        detections.AddRange(new[] { Entry(1) }, 100);
+        CheckTrue("forensics: Recent(0) is empty", () => detections.Recent(0).Count == 0);
+        CheckTrue("forensics: Recent(1) keeps the entry", () => detections.Recent(1).Count == 1);
+
+        // Disabling forensics purges the in-memory buffer after the confirmed write.
+        var disabled = svc.ApplySecurity(new JsonObject
+        {
+            ["enabled"] = true,
+            ["forensics"] = new JsonObject { ["enabled"] = false, ["capacity"] = 200 },
+        }, null);
+
+        CheckTrue("forensics: disabling purges the buffer", () => disabled.Ok && detections.Count == 0);
+        CheckTrue("forensics: disabling is persisted", () => ConfigFileReader.ReadSecurity(paths.ConfigDir)?.Redaction is { } section
+            && !section.Forensics.Enabled);
+
+        // Enabling them again keeps the buffer empty (nothing is replayed).
+        var reEnabled = svc.ApplySecurity(new JsonObject
+        {
+            ["enabled"] = true,
+            ["forensics"] = new JsonObject { ["enabled"] = true, ["capacity"] = 200 },
+        }, null);
+        CheckTrue("forensics: re-enabling keeps the buffer empty", () => reEnabled.Ok && detections.Count == 0);
+    }
+
+    // --------------------------------------------------------------
+    // N2/N7: a save that does not disable forensics (section without "forensics", or the
+    // feature already off with an empty buffer) must not purge, audit or add a banner.
+    // --------------------------------------------------------------
+    static void TestForensicsPurgeScope()
+    {
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var detections = new DetectionStore();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            detections,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        detections.AddRange(new[] { Entry(1), Entry(2) }, 100);
+
+        // Redaction section WITHOUT "forensics": the setting is untouched, so is the buffer.
+        var noForensics = svc.ApplySecurity(new JsonObject
+        {
+            ["enabled"] = true,
+            ["detect"] = new JsonObject { ["byFieldName"] = true },
+        }, null);
+
+        var auditPath = Path.Combine(root, "data", "audit.log");
+        CheckTrue("forensics: save without section keeps the buffer", () => noForensics.Ok && detections.Count == 2);
+        CheckTrue("forensics: save without section does not audit a clear", () =>
+            !File.Exists(auditPath) || !File.ReadAllText(auditPath).Contains("logs.clear.detections", StringComparison.Ordinal));
+        CheckTrue("forensics: save without section adds no banner", () =>
+            noForensics.Message == "Security settings applied and the engine reloaded.");
+
+        // Explicitly disabling with an EMPTY buffer: also silent (no empty audit line/banner).
+        detections.Clear();
+        var disabledEmpty = svc.ApplySecurity(new JsonObject
+        {
+            ["enabled"] = true,
+            ["forensics"] = new JsonObject { ["enabled"] = false, ["capacity"] = 200 },
+        }, null);
+
+        CheckTrue("forensics: disabling with an empty buffer stays silent", () => disabledEmpty.Ok
+            && detections.Count == 0
+            && disabledEmpty.Message == "Security settings applied and the engine reloaded.");
+        CheckTrue("forensics: empty-buffer disable does not audit a clear", () =>
+            !File.ReadAllText(auditPath).Contains("logs.clear.detections", StringComparison.Ordinal));
+    }
+
+    // --------------------------------------------------------------
+    // Detection forensics round-trip through the WRITE path: ApplySecurity writes
+    // redaction.json, ConfigFileReader re-reads it (the UI reads the file, not the
+    // debounced live snapshot) and the security view exposes the saved values.
+    // Turning forensics off also purges the in-memory buffer (m1).
+    // --------------------------------------------------------------
+    static void TestForensicsRoundTrip()
+    {
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var detections = new DetectionStore();
+        var options = NewOptions();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(options),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            detections,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        var on = JsonNode.Parse("{\"enabled\":true,\"forensics\":{\"enabled\":true,\"capacity\":500}}")!;
+        var applied = svc.ApplySecurity(on, null);
+        CheckTrue("forensics-roundtrip: apply ok", () => applied.Ok);
+
+        var disk = ConfigFileReader.ReadSecurity(paths.ConfigDir);
+        CheckTrue("forensics-roundtrip: disk keeps enabled/capacity", () =>
+            disk?.Redaction?.Forensics is { Enabled: true, Capacity: 500 });
+
+        var facade = new HostDashboardFacade(
+            new TestOptionsMonitor<ProxyOptions>(options),
+            new ActivityStore(),
+            paths,
+            new KeyMetaStore(paths),
+            detections);
+
+        var view = facade.GetSecurityOptionsFromDisk();
+        CheckTrue("forensics-roundtrip: security view exposes saved values", () => view is not null
+            && view.Redaction.Forensics.Enabled
+            && view.Redaction.Forensics.Capacity == 500);
+
+        // m1: turning forensics off (write confirmed) purges the in-memory buffer and audits it.
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        detections.AddRange(new[] { Entry(1), Entry(2) }, 100);
+        CheckTrue("forensics-roundtrip: buffer seeded", () => detections.Count == 2);
+
+        var off = JsonNode.Parse("{\"enabled\":true,\"forensics\":{\"enabled\":false,\"capacity\":500}}")!;
+        var disabled = svc.ApplySecurity(off, null);
+        CheckTrue("forensics-roundtrip: disable applied", () => disabled.Ok);
+        CheckTrue("forensics-roundtrip: disable purges buffer", () => detections.Count == 0);
+        CheckTrue("forensics-roundtrip: purge audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("logs.clear.detections", StringComparison.Ordinal));
+
+        var viewOff = facade.GetSecurityOptionsFromDisk();
+        CheckTrue("forensics-roundtrip: view shows disabled", () => viewOff is not null
+            && !viewOff.Redaction.Forensics.Enabled);
+    }
+
+    // --------------------------------------------------------------
+    // DetectionRecord -> DetectionEntry -> DetectionView round-trip. Both records carry
+    // 15 positional parameters and Name/Sep are adjacent strings (a swap compiles today),
+    // so the mapping is pinned with distinct marker values.
+    // --------------------------------------------------------------
+    static void TestDetectionViewRoundTrip()
+    {
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var detections = new DetectionStore();
+        var options = NewOptions();
+
+        var record = new DetectionRecord("$.c", "context", "key_in_text", 12, "deadbeef", "token", ":", "\"");
+        CheckTrue("detections round-trip: DetectionRecord positional shape", () =>
+            record.Name == "token" && record.Sep == ":" && record.Quote == "\"");
+
+        // Production mapping order (ProxyMiddleware): Name, Sep, Quote - all positional.
+        var entry = new DetectionEntry(
+            DateTimeOffset.UtcNow, "req-rt", "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", record.JsonPath, record.Layer, record.Kind, record.Length, record.Fingerprint,
+            record.Name, record.Sep, record.Quote);
+        CheckTrue("detections round-trip: DetectionEntry positional shape", () =>
+            entry.Name == "token" && entry.Sep == ":" && entry.Quote == "\"");
+
+        detections.AddRange(new[] { entry }, 100);
+
+        var facade = new HostDashboardFacade(
+            new TestOptionsMonitor<ProxyOptions>(options),
+            new ActivityStore(),
+            paths,
+            new KeyMetaStore(paths),
+            detections);
+
+        var view = facade.GetDetections(10).SingleOrDefault();
+        CheckTrue("detections round-trip: name/sep/quote order preserved", () => view is not null
+            && view.Name == "token" && view.Sep == ":" && view.Quote == "\"");
+
+        // None of the forensic types may expose a value/raw property.
+        CheckTrue("detections round-trip: no value/raw property", () =>
+            !HasValueOrRawProperty(typeof(DetectionRecord))
+            && !HasValueOrRawProperty(typeof(DetectionEntry))
+            && !HasValueOrRawProperty(typeof(DetectionView)));
+    }
+
+    static bool HasValueOrRawProperty(Type type) => type.GetProperties().Any(p =>
+        p.Name.Equals("value", StringComparison.OrdinalIgnoreCase)
+        || p.Name.Equals("raw", StringComparison.OrdinalIgnoreCase));
+
+    // --------------------------------------------------------------
+    // Pattern column formatting (shared by the Security page): "-" when the row has no
+    // shape, otherwise `name sep` plus a quoted ellipsis for quoted values.
+    // --------------------------------------------------------------
+    static void TestDetectionPattern()
+    {
+        Check("pattern cell: no shape -> dash", DetectionPattern.Format(null, null, null) == "-");
+        Check("pattern cell: unquoted context", DetectionPattern.Format("token", "=", "") == "token =");
+        Check("pattern cell: double-quoted context", DetectionPattern.Format("token", ":", "\"") == "token : \"\u2026\"");
+        Check("pattern cell: single-quoted context", DetectionPattern.Format("password", "=", "'") == "password = '\u2026'");
+    }
+
+    // --------------------------------------------------------------
+    // UI session cookie: the signing key derives from the primary local key, so a service
+    // restart keeps the session and a key rotation kills it.
+    // --------------------------------------------------------------
+    static void TestUiSessionManager()
+    {
+        var options = NewOptions();
+        var sessions = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(options));
+        var token = sessions.CreateToken();
+
+        CheckTrue("ui-session: token validates on the same instance", () => sessions.Validate(token));
+
+        // New instance + same local key = a service restart (this used to invalidate everything).
+        var afterRestart = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(NewOptions()));
+        CheckTrue("ui-session: survives a restart", () => afterRestart.Validate(token));
+
+        // Rotating the primary local key must invalidate every existing session.
+        var rotated = NewOptions();
+        rotated.Keys.LocalKey = options.Keys.LocalKey + "-rotated";
+        var afterRotation = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(rotated));
+        CheckTrue("ui-session: key rotation invalidates", () => !afterRotation.Validate(token));
+
+        // Tampered signature: flip the first signature char (a full base64 group, so the decoded
+        // MAC always changes - the last char carries padding bits and may decode identically).
+        var dot = token.IndexOf('.');
+        var signature = token[(dot + 1)..];
+        var tamperedSignature = (signature[0] == 'A' ? 'B' : 'A') + signature[1..];
+        var tampered = token[..(dot + 1)] + tamperedSignature;
+        CheckTrue("ui-session: tampered token rejected", () => !sessions.Validate(tampered));
+
+        CheckTrue("ui-session: null/empty rejected", () => !sessions.Validate(null) && !sessions.Validate(string.Empty));
+
+        // Multi-key-only config (no primary LocalKey): the signing key comes from the
+        // multi-keys - stable across restarts, order-insensitive, but never predictable.
+        static ProxyOptions MultiConfig(params string[] keys)
+        {
+            var o = NewOptions();
+            o.Keys.LocalKey = string.Empty;
+            o.Keys.LocalKeys = keys.ToList();
+            return o;
+        }
+
+        var multiSessions = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(MultiConfig("alpha", "beta")));
+        var multiToken = multiSessions.CreateToken();
+        CheckTrue("ui-session: multi-key survives a restart (order-insensitive)", () =>
+            new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(MultiConfig("beta", "alpha"))).Validate(multiToken));
+
+        CheckTrue("ui-session: multi-key rotation invalidates", () =>
+            !new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(MultiConfig("alpha", "gamma"))).Validate(multiToken));
+
+        // No key at all: ephemeral signing key - a restart must invalidate, otherwise the
+        // shared constant would allow cookie forgery without knowing any key.
+        static ProxyOptions Keyless()
+        {
+            var o = NewOptions();
+            o.Keys.LocalKey = string.Empty;
+            o.Keys.LocalKeys = new List<string>();
+            return o;
+        }
+
+        var keylessSessions = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(Keyless()));
+        var keylessToken = keylessSessions.CreateToken();
+        CheckTrue("ui-session: no keys validates on the same instance", () => keylessSessions.Validate(keylessToken));
+        CheckTrue("ui-session: no keys does not survive a restart", () =>
+            !new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(Keyless())).Validate(keylessToken));
+    }
+
+    // --------------------------------------------------------------
+    // UI session middleware: Blazor circuit endpoints fail fast with 401 (a 302 to the HTML
+    // login page hangs the reconnect loop), while the login page/static assets stay reachable
+    // and normal pages still redirect to the login form.
+    // --------------------------------------------------------------
+    static void TestUiSessionMiddleware()
+    {
+        var options = NewOptions();
+        var sessions = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(options));
+        var validCookie = sessions.CreateToken();
+
+        static (UiSessionMiddleware Middleware, Func<bool> NextCalled) Build(ProxyOptions options, UiSessionManager sessions)
+        {
+            var called = false;
+            var middleware = new UiSessionMiddleware(
+                _ => { called = true; return Task.CompletedTask; },
+                sessions,
+                new TestOptionsMonitor<ProxyOptions>(options),
+                new RateLimiter(new RateLimitOptions()));
+            return (middleware, () => called);
+        }
+
+        static DefaultHttpContext Request(string path, string? cookie)
+        {
+            var ctx = new DefaultHttpContext();
+            ctx.Request.Method = HttpMethods.Get;
+            ctx.Request.Path = path; // no path base: UsePathBase strips it before this middleware
+            if (cookie is not null)
+            {
+                ctx.Request.Headers.Cookie = UiSessionManager.CookieName + "=" + cookie;
+            }
+            return ctx;
+        }
+
+        static int Invoke(UiSessionMiddleware middleware, DefaultHttpContext ctx)
+        {
+            middleware.InvokeAsync(ctx).GetAwaiter().GetResult();
+            return ctx.Response.StatusCode;
+        }
+
+        // 1. Valid session: /_blazor is gated but the request goes through.
+        var (withSession, withSessionNext) = Build(options, sessions);
+        var allowed = Request("/_blazor", validCookie);
+        CheckTrue("ui-mw: valid session reaches /_blazor", () => Invoke(withSession, allowed) == 200 && withSessionNext());
+
+        // 2-4. No session: every circuit endpoint must be 401 (never a 302 to HTML).
+        var (circuit, circuitNext) = Build(options, sessions);
+        var plain = Request("/_blazor", null);
+        var negotiate = Request("/_blazor/negotiate", null);
+        var upper = Request("/_BLAZOR/NEGOTIATE", null);
+        CheckTrue("ui-mw: /_blazor without session -> 401", () => Invoke(circuit, plain) == 401 && !circuitNext());
+        CheckTrue("ui-mw: /_blazor/negotiate without session -> 401", () => Invoke(circuit, negotiate) == 401 && !circuitNext());
+        CheckTrue("ui-mw: circuit matcher is case-insensitive", () => Invoke(circuit, upper) == 401 && !circuitNext());
+
+        // 5 + 7. The login page and static assets stay reachable without a session.
+        var (publics, publicsNext) = Build(options, sessions);
+        CheckTrue("ui-mw: /login stays public", () => Invoke(publics, Request("/login", null)) == 200 && publicsNext());
+
+        var (assets, assetsNext) = Build(options, sessions);
+        CheckTrue("ui-mw: static assets stay public", () => Invoke(assets, Request("/app.css", null)) == 200 && assetsNext());
+
+        // 6. A normal page without a session redirects to the login form.
+        var (pages, pagesNext) = Build(options, sessions);
+        var page = Request("/security", null);
+        CheckTrue("ui-mw: page without session -> 302 login", () => Invoke(pages, page) == StatusCodes.Status302Found
+            && page.Response.Headers.Location == "/admin/ui/login"
+            && !pagesNext());
+
+        // 8. The matcher is precise: "/_blazorx" is NOT a circuit endpoint (falls to the redirect).
+        var (near, nearNext) = Build(options, sessions);
+        CheckTrue("ui-mw: /_blazorx is not a circuit endpoint", () =>
+            Invoke(near, Request("/_blazorx", null)) == StatusCodes.Status302Found && !nearNext());
+    }
+
+    // --------------------------------------------------------------
     // Log clearing resilience (review fixes):
     //  R3 - a failing audit write must NOT fail (or undo) the destructive clear;
     //  R2 - concurrent audit appends must all land as parseable JSONL lines;
@@ -1440,6 +1933,7 @@ class Program
             new AuditLog(paths),
             activity,
             new FakeEventLogStore(),
+            new DetectionStore(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         activity.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "GET", Path = "/one", Status = 200 });
@@ -1495,6 +1989,7 @@ class Program
             new AuditLog(genericPaths),
             new ActivityStore(),
             throwingLogs,
+            new DetectionStore(),
             Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var denied = genericSvc.ClearEventLog(adminKey);
@@ -1592,6 +2087,7 @@ class Program
             new AuditLog(paths),
             new ActivityStore(),
             new FakeEventLogStore { ExistsResult = true, ThrowOnClear = true },
+            new DetectionStore(),
             new ThrowingLogger());
 
         AdminResult? result = null;

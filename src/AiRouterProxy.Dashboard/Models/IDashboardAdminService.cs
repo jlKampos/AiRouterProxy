@@ -71,6 +71,9 @@ public interface IDashboardAdminService
     /// <summary>Clears the dedicated "AIRouterProxy" Windows Event Log. Admin key REQUIRED (destructive).</summary>
     AdminResult ClearEventLog(string? authKey = null);
 
+    /// <summary>Clears the in-memory detection forensics buffer. Admin key REQUIRED (destructive).</summary>
+    AdminResult ClearDetections(string? authKey = null);
+
     /// <summary>Re-reads the config files from disk and confirms they reload; restores from backup when broken.</summary>
     AdminResult ReloadConfirm();
 }

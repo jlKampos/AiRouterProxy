@@ -13,6 +13,7 @@ public sealed class ProxyMiddleware
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ActivityStore _activity;
     private readonly RateLimiter _rateLimiter;
+    private readonly IDetectionStore _detections;
 
     private static readonly string[] HeadersToForward =
         { "content-type", "cache-control", "retry-after", "x-request-id",
@@ -32,18 +33,31 @@ public sealed class ProxyMiddleware
         IOptionsMonitor<ProxyOptions> options,
         IHttpClientFactory httpClientFactory,
         ActivityStore activity,
-        RateLimiter rateLimiter)
+        RateLimiter rateLimiter,
+        IDetectionStore detections)
     {
         _logger = logger;
         _options = options;
         _httpClientFactory = httpClientFactory;
         _activity = activity;
         _rateLimiter = rateLimiter;
+        _detections = detections;
     }
 
     public async Task InvokeAsync(HttpContext context)
     {
         var options = _options.CurrentValue;
+
+        // Forensics reconciliation (once per request): collection can be turned off through
+        // paths that never reach ApplySecurityCore - config import (SanitizeRedaction), a manual
+        // redaction.json edit picked up by the hot reload, or any future writer. Purging here is
+        // the safety net so stale metadata never outlives the setting. ApplySecurityCore still
+        // purges on Save so the dashboard reflects it immediately. Cost: one Count (lock + int).
+        if (!(options.Redaction.Forensics?.Enabled ?? false) && _detections.Count > 0)
+        {
+            _detections.Clear();
+        }
+
         var requestId = Guid.NewGuid().ToString("N");
         var startedAt = Stopwatch.StartNew();
 
@@ -327,6 +341,9 @@ public sealed class ProxyMiddleware
             && options.Redaction.Enabled
             && InspectionPolicy.IsJson(context.Request.ContentType))
         {
+            // Detection forensics is opt-in and metadata-only (never the value).
+            var forensics = options.Redaction.Forensics is { Enabled: true };
+
             var redacted = SecretRedactor.RedactJson(
                 bodyBytes,
                 mask: options.Redaction.Mask,
@@ -336,13 +353,46 @@ public sealed class ProxyMiddleware
                 detectByLongStrings: options.Redaction.Detect?.ByLongStrings ?? true,
                 detectEntropyThreshold: options.Redaction.Detect?.EntropyThreshold ?? 3.0,
                 exemptBase64: options.Redaction.Detect?.ExemptBase64 ?? true,
-                allow: options.Redaction.Allow);
+                allow: options.Redaction.Allow,
+                collectForensics: forensics);
             if (redacted.Changed)
             {
                 forwardedBody = redacted.Data;
                 redactionCount = redacted.Stats.Total;
                 redactionKinds = SecretRedactor.Summarize(redacted.Stats);
                 redactionPreviews = redacted.Stats.Previews;
+
+                if (forensics && redacted.Stats.Detections.Count > 0)
+                {
+                    // Request context is added here; the redactor only knows the JSON shape.
+                    // Request.Path never includes the query string.
+                    var now = DateTimeOffset.UtcNow;
+                    var entries = new List<DetectionEntry>(redacted.Stats.Detections.Count);
+                    foreach (var detection in redacted.Stats.Detections)
+                    {
+                        entries.Add(new DetectionEntry(
+                            Timestamp: now,
+                            RequestId: requestId,
+                            Client: clientIp,
+                            Route: routeName ?? string.Empty,
+                            Method: context.Request.Method,
+                            // Metadata only, and bounded: the ring buffer caps entries, not bytes.
+                            RequestPath: Truncate(context.Request.Path.Value ?? "/", 200),
+                            Model: modelName is null ? null : Truncate(modelName, 120),
+                            JsonPath: detection.JsonPath,
+                            Layer: detection.Layer,
+                            Kind: detection.Kind,
+                            Length: detection.Length,
+                            Fingerprint: detection.Fingerprint,
+                            Name: detection.Name,
+                            Sep: detection.Sep,
+                            Quote: detection.Quote));
+                    }
+
+                    // Configured range is 10..1000; a hand-edited config (e.g. capacity 5)
+                    // must not silently shrink the buffer below the supported minimum.
+                    _detections.AddRange(entries, Math.Clamp(options.Redaction.Forensics?.Capacity ?? 200, 10, 1000));
+                }
 
                 if (options.Verbose)
                 {
@@ -430,14 +480,14 @@ public sealed class ProxyMiddleware
                 {
                     // Incremental SSE: the notice is streamed in just before "[DONE]" without
                     // buffering the response body (only the current event is held back).
-                    var notice = BuildRedactionNotice(redactionCount, redactionKinds, options.Redaction, redactionPreviews);
+                    var notice = RedactionNotice.Build(redactionCount, redactionKinds, options.Redaction.WarnTemplate, redactionPreviews);
                     await using var sseStream = await upstreamResponse.Content.ReadAsStreamAsync(context.RequestAborted);
                     await SseStreamProcessor.ProcessAsync(sseStream, context.Response.Body, notice, context.RequestAborted);
                 }
                 else if (mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
                 {
                     var fullBody = await upstreamResponse.Content.ReadAsByteArrayAsync(context.RequestAborted);
-                    var notice = BuildRedactionNotice(redactionCount, redactionKinds, options.Redaction, redactionPreviews);
+                    var notice = RedactionNotice.Build(redactionCount, redactionKinds, options.Redaction.WarnTemplate, redactionPreviews);
                     var injected = NoticeInjector.Inject(fullBody, mediaType, notice);
                     await context.Response.Body.WriteAsync(injected ?? fullBody, context.RequestAborted);
                 }
@@ -508,10 +558,12 @@ public sealed class ProxyMiddleware
                 Path = context.Request.Path.Value ?? "/",
                 Status = finalStatus,
                 DurationMs = startedAt.ElapsedMilliseconds,
-                Model = modelName,
+                Model = modelName is null ? null : Truncate(modelName, 120),
                 Route = routeName,
                 Refused = authRefused,
                 Redacted = redactionCount,
+                // Only set when something was actually redacted (no empty field on every request).
+                RedactionKinds = redactionCount == 0 ? null : redactionKinds,
                 PresentedHash = presentedHash,
                 ExpectedHash = expectedHash,
                 UA = authRefused ? Truncate(context.Request.Headers.UserAgent.ToString(), 120) : null,
@@ -555,35 +607,6 @@ public sealed class ProxyMiddleware
         }
 
         return buffer.ToArray();
-    }
-
-    private static string BuildRedactionNotice(int count, string kinds, RedactionOptions opts,
-        IReadOnlyList<SecretRedactor.RedactionPreview>? previews)
-    {
-        if (!string.IsNullOrWhiteSpace(opts.WarnTemplate))
-        {
-            return opts.WarnTemplate
-                .Replace("{Count}", count.ToString(), StringComparison.Ordinal)
-                .Replace("{Kinds}", kinds, StringComparison.Ordinal)
-                .Replace("{Previews}", SecretRedactor.FormatPreviews(previews), StringComparison.Ordinal);
-        }
-
-        var what = count == 1
-            ? "1 occurrence of sensitive content"
-            : $"{count} occurrences of sensitive content";
-
-        if (!string.IsNullOrWhiteSpace(kinds))
-        {
-            what += $" ({kinds})";
-        }
-
-        var previewText = SecretRedactor.FormatPreviews(previews);
-        if (!string.IsNullOrWhiteSpace(previewText))
-        {
-            what += $". Detected values: {previewText}";
-        }
-
-        return $"⚠️ **Proxy notice:** the request contained sensitive content which was redacted before being sent to the AI Router ({what}).";
     }
 
     private static void ForwardResponseHeaders(HttpResponseMessage upstream, HttpResponse destination)

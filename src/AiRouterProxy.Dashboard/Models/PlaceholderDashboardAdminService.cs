@@ -60,5 +60,8 @@ public sealed class PlaceholderDashboardAdminService : IDashboardAdminService
     public AdminResult ClearEventLog(string? authKey = null)
         => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
 
+    public AdminResult ClearDetections(string? authKey = null)
+        => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
+
     public AdminResult ReloadConfirm() => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
 }

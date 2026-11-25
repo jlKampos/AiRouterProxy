@@ -26,6 +26,8 @@ public static class SecurityValidator
         "warn",
     };
 
+    private const string ForensicsCapacityError = "Redaction 'forensics.capacity' must be an integer between 10 and 1000.";
+
     public static bool Validate(JsonNode? redactionSection, JsonNode? inspectionSection, out List<string> errors)
     {
         errors = new List<string>();
@@ -93,6 +95,41 @@ public static class SecurityValidator
         else if (Prop(obj, "detect") is not null)
         {
             errors.Add("Redaction 'detect' must be an object.");
+            ok = false;
+        }
+
+        // Detection forensics: metadata only, off by default. Capacity is bounded by the
+        // in-memory ring buffer (the store also clamps its own capacity).
+        if (Prop(obj, "forensics") is JsonObject forensics)
+        {
+            var enabledNode = Prop(forensics, "enabled");
+            if (enabledNode is JsonValue enabledValue && enabledValue.TryGetValue<bool>(out _))
+            {
+                // ok
+            }
+            else if (enabledNode is not null)
+            {
+                errors.Add("Redaction 'forensics.enabled' must be a boolean.");
+                ok = false;
+            }
+
+            var capacityNode = Prop(forensics, "capacity");
+            if (capacityNode is not null)
+            {
+                // Single validation path: wrong type and out-of-range share one message.
+                var valid = capacityNode is JsonValue capacityValue
+                            && capacityValue.TryGetValue<int>(out var capacity)
+                            && capacity is >= 10 and <= 1000;
+                if (!valid)
+                {
+                    errors.Add(ForensicsCapacityError);
+                    ok = false;
+                }
+            }
+        }
+        else if (Prop(obj, "forensics") is not null)
+        {
+            errors.Add("Redaction 'forensics' must be an object.");
             ok = false;
         }
 
@@ -279,6 +316,13 @@ public static class SecurityValidator
             CopyKnown(detectSrc, detectDst, "byFieldName", "byFormats", "byKeyValueContext",
                 "byLongStrings", "exemptBase64", "entropyThreshold");
             dst["detect"] = detectDst;
+        }
+
+        if (Prop(src, "forensics") is JsonObject forensicsSrc)
+        {
+            var forensicsDst = new JsonObject();
+            CopyKnown(forensicsSrc, forensicsDst, "enabled", "capacity");
+            dst["forensics"] = forensicsDst;
         }
 
         if (Prop(src, "allow") is JsonArray allowSrc)
