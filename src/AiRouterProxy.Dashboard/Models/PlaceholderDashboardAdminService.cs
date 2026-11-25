@@ -54,5 +54,11 @@ public sealed class PlaceholderDashboardAdminService : IDashboardAdminService
     public AdminResult Import(JsonNode bundle, string? authKey = null)
         => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
 
+    public AdminResult ClearActivityLog(string? authKey = null)
+        => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
+
+    public AdminResult ClearEventLog(string? authKey = null)
+        => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
+
     public AdminResult ReloadConfirm() => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
 }

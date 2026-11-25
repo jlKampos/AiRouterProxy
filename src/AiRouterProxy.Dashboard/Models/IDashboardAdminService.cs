@@ -65,6 +65,12 @@ public interface IDashboardAdminService
     /// <summary>Validates and applies an import bundle (routes + redaction/inspection). authKey REQUIRED.</summary>
     AdminResult Import(JsonNode bundle, string? authKey = null);
 
+    /// <summary>Clears the in-memory activity buffer. Admin key REQUIRED (destructive).</summary>
+    AdminResult ClearActivityLog(string? authKey = null);
+
+    /// <summary>Clears the dedicated "AIRouterProxy" Windows Event Log. Admin key REQUIRED (destructive).</summary>
+    AdminResult ClearEventLog(string? authKey = null);
+
     /// <summary>Re-reads the config files from disk and confirms they reload; restores from backup when broken.</summary>
     AdminResult ReloadConfirm();
 }

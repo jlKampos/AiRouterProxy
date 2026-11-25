@@ -5,8 +5,9 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.6.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases)) — the latest release, including the
-admin dashboard and the admin REST API v1 described below.
+**Current version:** 2.7.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases)) — the latest release, including the
+admin dashboard and the admin REST API v1 described below, and adds log maintenance from the dashboard — clear the
+in-memory activity buffer or the dedicated Windows Event Log, audited and re-authenticated with the primary local key.
 
 ☕ Found this useful? [**Support the project**](https://buymeacoffee.com/jlkampos) with a coffee — every cup keeps the redaction growing.
 
@@ -499,7 +500,7 @@ v1 is the current interface; the legacy endpoints below still work unchanged:
 ```powershell
 # admin API v1 (current)
 curl.exe --ssl-no-revoke https://localhost:4000/admin/api/v1/status -H "Authorization: Bearer <LocalKey>"
-# {"status":"ok","version":"2.6.x","routes":N,"redactionEnabled":true,...}
+# {"status":"ok","version":"2.7.x","routes":N,"redactionEnabled":true,...}
 
 curl.exe --ssl-no-revoke https://localhost:4000/admin/api/v1/routes -H "Authorization: Bearer <LocalKey>"
 # the current route table (key refs, never key values)
@@ -509,7 +510,7 @@ curl.exe --ssl-no-revoke https://localhost:4000/admin/api/v1/keys -H "Authorizat
 
 # legacy endpoints (still available, same answers)
 curl.exe --ssl-no-revoke https://localhost:4000/admin/health -H "Authorization: Bearer <LocalKey>"
-# {"status":"ok","version":"2.6.x",...}
+# {"status":"ok","version":"2.7.x",...}
 
 curl.exe --ssl-no-revoke https://localhost:4000/admin/endpoints -H "Authorization: Bearer <LocalKey>"
 # routes + allowed paths + current redaction flags (including exemptBase64)
@@ -632,10 +633,19 @@ key>` (same key as `/admin`/UI) and protected by the same rate limiter. Errors a
 | `POST` | `/admin/api/v1/config/validate` | Validate an import bundle without applying it |
 | `POST` | `/admin/api/v1/config/import` | Apply an import bundle (backup + atomic write) |
 | `POST` | `/admin/api/v1/config/reload` | Re-read config from disk; restore on failed reload |
+| `DELETE` | `/admin/api/v1/logs/activity` | Clears the in-memory activity buffer (admin key required). |
+| `DELETE` | `/admin/api/v1/logs/eventlog` | Clears the dedicated "AIRouterProxy" Windows Event Log (admin key required). |
 
 Two dashboard operations exist only as service methods used by the UI (there is no v1 endpoint
 for them): adding and removing extra local keys. The legacy `/admin/*` endpoints documented
-above under [Verify your changes](#verify-your-changes) remain available and unchanged.
+above under [Verify your changes](#verify-your-changes) remain available and unchanged. The
+legacy aliases `DELETE /admin/activity` and `DELETE /admin/logs` now go through the same audited
+service path as the v1 log endpoints (audit actions `logs.clear.activity` / `logs.clear.eventlog`),
+so every clear - from the API or the dashboard - leaves the same audit trail. In the dashboard,
+the **Activity** page carries a single **Logs & activity** panel: a toolbar with the entry counter
+and the two destructive buttons (`Clear activity` / `Clear Event Log`), a collapsible paginated
+table (25/50/100 per page) and a collapsible note explaining the hashes. Each clear asks
+for confirmation and then re-authenticates with the primary local key.
 
 ## Certificates
 

@@ -44,6 +44,7 @@ builder.Services.AddHttpClient();
 builder.Services.AddWindowsService(options => options.ServiceName = "AIRouterProxy");
 
 builder.Services.AddSingleton<ActivityStore>();
+builder.Services.AddSingleton<IEventLogStore, WindowsEventLogStore>();
 
 // Admin dashboard UI - Blazor Web App served under /admin/ui in the same process.
 builder.Services.AddDashboard(DashboardExtensions.BasePath);
@@ -221,6 +222,8 @@ app.MapGet("/admin/endpoints", (IOptionsMonitor<ProxyOptions> opts) =>
             new { method = "PUT", path = "/admin/api/v1/routes", description = "Write API: replace the route table (routes.json, hot reload)." },
             new { method = "PUT", path = "/admin/api/v1/keys/{keyRef}/secret", description = "Write API: set/rotate a route key secret (write-only)." },
             new { method = "POST", path = "/admin/api/v1/config/import", description = "Write API: import a no-secrets config bundle." },
+            new { method = "DELETE", path = "/admin/api/v1/logs/activity", description = "Write API: clear the in-memory activity buffer." },
+            new { method = "DELETE", path = "/admin/api/v1/logs/eventlog", description = "Write API: clear the dedicated AIRouterProxy Event Log." },
         },
     });
 });
@@ -254,7 +257,7 @@ app.MapGet("/admin/refusals", (ActivityStore store, int hours = 6, int limit = 5
     return Results.Ok(new { count = entries.Count, entries });
 });
 
-app.MapGet("/admin/logs", (int hours = 6, int limit = 50) =>
+app.MapGet("/admin/logs", (ILoggerFactory loggerFactory, int hours = 6, int limit = 50) =>
 {
     limit = Math.Clamp(limit, 1, 200);
     hours = Math.Clamp(hours, 1, 24 * 30);
@@ -286,38 +289,11 @@ app.MapGet("/admin/logs", (int hours = 6, int limit = 50) =>
     }
     catch (Exception ex)
     {
-        return Results.Problem($"Could not read the AIRouterProxy Event Log: {ex.Message}", statusCode: 500);
+        loggerFactory.CreateLogger("Admin").LogError(ex, "Failed to read the dedicated Event Log.");
+        return Results.Problem("Could not read the AIRouterProxy Event Log.", statusCode: 500);
     }
 
     return Results.Ok(new { count = matches.Count, entries = matches });
-});
-
-app.MapDelete("/admin/activity", (ActivityStore store) =>
-{
-    var cleared = store.Clear();
-    return Results.Ok(new { cleared = true, activity = cleared });
-});
-
-app.MapDelete("/admin/logs", (ActivityStore store, ILoggerFactory loggerFactory) =>
-{
-    var clearedActivity = store.Clear();
-    var logger = loggerFactory.CreateLogger("Admin");
-
-    try
-    {
-        if (EventLog.Exists("AIRouterProxy"))
-        {
-            using var log = new EventLog("AIRouterProxy");
-            log.Clear();
-        }
-
-        return Results.Ok(new { cleared = true, activity = clearedActivity, eventLog = true });
-    }
-    catch (Exception ex)
-    {
-        logger.LogError(ex, "Failed to clear the dedicated Event Log.");
-        return Results.Problem($"Could not clear the Event Log: {ex.Message}", statusCode: 500);
-    }
 });
 
 app.MapGet("/admin/health", (ActivityStore store) =>

@@ -4,6 +4,7 @@ using AIRouterProxy;
 using AiRouterProxy.AdminPersistence;
 using AiRouterProxy.AdminValidation;
 using AiRouterProxy.Dashboard.Models;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RouteOptions = AIRouterProxy.RouteOptions;
 
@@ -21,6 +22,7 @@ public sealed class DashboardAdminService : IDashboardAdminService
     private const string ServerFile = "appsettings.Server.json";
     private const string RoutesFile = "routes.json";
     private const string RedactionFile = "redaction.json";
+    private const string EventLogName = "AIRouterProxy";
 
     private static readonly JsonSerializerOptions JsonRead = new() { PropertyNameCaseInsensitive = true };
 
@@ -38,6 +40,9 @@ public sealed class DashboardAdminService : IDashboardAdminService
     private readonly ReloadConfirmer _confirmer;
     private readonly KeyMetaStore _keyMeta;
     private readonly AuditLog _audit;
+    private readonly ActivityStore _activity;
+    private readonly IEventLogStore _eventLogs;
+    private readonly ILogger<DashboardAdminService> _logger;
 
     // Serializes every config write (backup -> write -> confirm -> audit) because the
     // service is a singleton: AtomicJsonWriter reuses a fixed "{name}.tmp" per file and
@@ -52,7 +57,10 @@ public sealed class DashboardAdminService : IDashboardAdminService
         ConfigBackup backups,
         ReloadConfirmer confirmer,
         KeyMetaStore keyMeta,
-        AuditLog audit)
+        AuditLog audit,
+        ActivityStore activity,
+        IEventLogStore eventLogs,
+        ILogger<DashboardAdminService> logger)
     {
         _options = options;
         _paths = paths;
@@ -60,6 +68,9 @@ public sealed class DashboardAdminService : IDashboardAdminService
         _confirmer = confirmer;
         _keyMeta = keyMeta;
         _audit = audit;
+        _activity = activity;
+        _eventLogs = eventLogs;
+        _logger = logger;
     }
 
     public bool VerifyAdminKey(string key) => AuthenticationPolicy.IsValidAdminKey(key, _options.CurrentValue.Keys);
@@ -575,6 +586,120 @@ public sealed class DashboardAdminService : IDashboardAdminService
         {
             _audit.Append("key.upstream.set", ServerFile, "error", Actor(authKey));
             return AdminResult.Failure("Could not write the server config - the previous version was kept.", AdminResult.TypeInternal);
+        }
+    }
+
+    // ----------------------------------------------------------
+    // Log clearing (destructive; never touches config files, so no write lock)
+    // ----------------------------------------------------------
+
+    public AdminResult ClearActivityLog(string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        var cleared = _activity.Clear();
+        var message = $"Activity buffer cleared ({cleared} {(cleared == 1 ? "entry" : "entries")}).";
+        if (!TryAudit("logs.clear.activity", "activity buffer", "ok", authKey))
+        {
+            // The destructive action already happened: never report it as a failure.
+            message += " The audit entry could not be written.";
+        }
+
+        return AdminResult.Success(message);
+    }
+
+    public AdminResult ClearEventLog(string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        try
+        {
+            if (!_eventLogs.Exists(EventLogName))
+            {
+                var missing = "The dedicated Event Log does not exist on this machine - nothing to clear.";
+                if (!TryAudit("logs.clear.eventlog", EventLogName, "unavailable", authKey))
+                {
+                    missing += " The audit entry could not be written.";
+                }
+
+                return AdminResult.Success(missing);
+            }
+
+            // The count only feeds the message: it must never abort the clear.
+            int? count = null;
+            try
+            {
+                count = _eventLogs.Count(EventLogName);
+            }
+            catch
+            {
+                // Stat only - never fail the clear for a count.
+            }
+
+            _eventLogs.Clear(EventLogName);
+            var message = count is int entries
+                ? $"Windows Event Log '{EventLogName}' cleared ({entries} entries)."
+                : $"Windows Event Log '{EventLogName}' cleared.";
+            if (!TryAudit("logs.clear.eventlog", EventLogName, "ok", authKey))
+            {
+                // The log was already cleared: never report it as a failure.
+                message += " The audit entry could not be written.";
+            }
+
+            return AdminResult.Success(message);
+        }
+        catch (Exception ex)
+        {
+            // Cause stays server-side only; the caller gets the generic message below.
+            // In production the only logging provider is the Event Log being cleared: if
+            // it is full/removed/unregistered WriteEntry throws, and that must never mask
+            // the original failure (or escape as a 500 / circuit crash).
+            try
+            {
+                _logger.LogWarning(ex, "Failed to clear the Event Log {LogName}.", EventLogName);
+            }
+            catch
+            {
+                // Logging must never mask the original failure (the provider IS the log being cleared).
+            }
+
+            // Never surface the raw exception: it can carry machine paths or log internals.
+            TryAudit("logs.clear.eventlog", EventLogName, "error", authKey);
+            return AdminResult.Failure("Could not clear the Windows Event Log - it may require elevated rights or be in use.", AdminResult.TypeInternal);
+        }
+    }
+
+    /// <summary>Best-effort audit append: a failed audit entry must not undo a completed destructive action.</summary>
+    private bool TryAudit(string action, string target, string result, string? authKey)
+    {
+        try
+        {
+            _audit.Append(action, target, result, Actor(authKey));
+            return true;
+        }
+        catch
+        {
+            // Never include the target's content or any secret: only the action/target names.
+            // Same guard as the clear failure: a broken logging provider (the Event Log we
+            // are clearing) must not turn a best-effort audit miss into an exception.
+            try
+            {
+                _logger.LogWarning("Audit entry could not be written for {Action} ({Target}).", action, target);
+            }
+            catch
+            {
+                // Logging must never mask the original failure (the provider IS the log being cleared).
+            }
+
+            return false;
         }
     }
 

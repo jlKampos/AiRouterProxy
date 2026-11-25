@@ -310,6 +310,28 @@ public static class MapAdminApiV1Extensions
             });
         });
 
+        app.MapDelete("/admin/api/v1/logs/activity", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearActivityLog(Bearer(ctx)), ctx));
+
+        app.MapDelete("/admin/api/v1/logs/eventlog", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearEventLog(Bearer(ctx)), ctx));
+
+        // Legacy aliases kept for compatibility - they now go through the audited service path.
+        app.MapDelete("/admin/activity", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearActivityLog(Bearer(ctx)), ctx));
+
+        app.MapDelete("/admin/logs", (IDashboardAdminService svc, HttpContext ctx) =>
+        {
+            var key = Bearer(ctx);
+            // Preserve the historical semantics: clear BOTH the Event Log and the in-memory
+            // activity buffer (both attempted, like the previous hand-written handler).
+            var eventLog = svc.ClearEventLog(key);
+            var activity = svc.ClearActivityLog(key);
+            if (!eventLog.Ok) return Respond(eventLog, ctx);
+            if (!activity.Ok) return Respond(activity, ctx);
+            return Respond(AdminResult.Success($"{eventLog.Message} {activity.Message}"), ctx);
+        });
+
         return app;
     }
 

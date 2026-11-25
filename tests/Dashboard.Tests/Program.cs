@@ -7,6 +7,7 @@ using AiRouterProxy.AdminPersistence;
 using AiRouterProxy.AdminServices;
 using AiRouterProxy.AdminValidation;
 using AiRouterProxy.Dashboard.Models;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RouteOptions = AIRouterProxy.RouteOptions;
 
@@ -40,17 +41,29 @@ class Program
     /// <summary>Builds a real DashboardAdminService against a throwaway temp layout (dev layout: config next to base).</summary>
     static (DashboardAdminService Service, string Root, string ConfigDir) MakeService(ProxyOptions options, ReloadConfirmer? confirmer = null)
     {
+        var (service, root, configDir, _, _) = MakeServiceWithStore(options, confirmer);
+        return (service, root, configDir);
+    }
+
+    /// <summary>Same as MakeService but also exposes the ActivityStore and the fake Event Log seam (log-clearing tests).</summary>
+    static (DashboardAdminService Service, string Root, string ConfigDir, ActivityStore Store, FakeEventLogStore EventLogs) MakeServiceWithStore(ProxyOptions options, ReloadConfirmer? confirmer = null)
+    {
         var root = TempRoot();
         var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
         var backups = new ConfigBackup(paths);
+        var activity = new ActivityStore();
+        var eventLogs = new FakeEventLogStore();
         var service = new DashboardAdminService(
             new TestOptionsMonitor<ProxyOptions>(options),
             paths,
             backups,
             confirmer ?? new ReloadConfirmer(backups),
             new KeyMetaStore(paths),
-            new AuditLog(paths));
-        return (service, root, root);
+            new AuditLog(paths),
+            activity,
+            eventLogs,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+        return (service, root, root, activity, eventLogs);
     }
 
     static void Main()
@@ -81,6 +94,10 @@ class Program
         TestImportSaveAtomicFailureRollsBack();
         TestReloadConfirmRestoreFailedSignaling();
         TestConfigFileReader();
+        TestLogClearing();
+        TestLogClearingResilience();
+        TestLogClearingSafety();
+        TestLogClearingLoggingFailure();
 
         foreach (var dir in _tmpRoots)
         {
@@ -707,7 +724,10 @@ class Program
             backups,
             failing,
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
         const string originalRoutes = "{\"Proxy\":{\"Routes\":[{\"name\":\"keep-me\",\"prefix\":\"/keep\",\"upstream\":\"https://api.example.com\",\"keyRef\":\"\"}]}}";
@@ -822,7 +842,10 @@ class Program
             backups,
             new ReloadConfirmer(backups),
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var redPath = Path.Combine(root, "redaction.json");
         const string good = "{\"Proxy\":{\"Redaction\":{\"enabled\":true},\"Inspection\":{\"defaultAction\":\"block\"}}}";
@@ -1060,7 +1083,10 @@ class Program
             backups,
             failing,
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
         const string originalRoutes = "{\"Proxy\":{\"Routes\":[{\"name\":\"a\",\"prefix\":\"/a\",\"upstream\":\"https://api.example.com\",\"keyRef\":\"\"}]}}";
@@ -1102,7 +1128,10 @@ class Program
             backups,
             new ReloadConfirmer(backups),
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
         const string originalRoutes = "{\"Proxy\":{\"Routes\":[{\"name\":\"a\",\"prefix\":\"/a\",\"upstream\":\"https://api.example.com\",\"keyRef\":\"\"}]}}";
@@ -1143,7 +1172,10 @@ class Program
             restorer,
             confirmer,
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var redPath = Path.Combine(root, "redaction.json");
         const string good = "{\"Proxy\":{\"Redaction\":{\"enabled\":true}}}";
@@ -1302,6 +1334,286 @@ class Program
             && nullLiveKeys.LocalKey is null && nullLiveKeys.LocalKeys.Count == 0);
     }
 
+    // --------------------------------------------------------------
+    // Log clearing: destructive operations require the admin key, the
+    // activity buffer is emptied only after auth, and the audit log records
+    // the clear. Event Log behaviour is exercised through the IEventLogStore
+    // fake - these checks NEVER touch the machine's real Windows Event Log.
+    // --------------------------------------------------------------
+    static void TestLogClearing()
+    {
+        var adminKey = "admin-primary-key";
+        var (svc, root, cfg, store, eventLogs) = MakeServiceWithStore(NewOptions());
+
+        store.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "GET", Path = "/one", Status = 200 });
+        store.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "POST", Path = "/two", Status = 401 });
+
+        var noAuth = svc.ClearActivityLog(null);
+        CheckTrue("logs: clear activity requires admin key", () => !noAuth.Ok && noAuth.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("logs: unauthorized clear keeps the entries", () => store.Count == 2);
+
+        var wrongKey = svc.ClearActivityLog("wrong");
+        CheckTrue("logs: clear activity wrong key rejected", () => !wrongKey.Ok && wrongKey.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("logs: wrong key keeps the entries", () => store.Count == 2);
+
+        var cleared = svc.ClearActivityLog(adminKey);
+        CheckTrue("logs: clear activity ok", () => cleared.Ok);
+        CheckTrue("logs: activity buffer emptied", () => store.Count == 0);
+        CheckTrue("logs: activity clear audited", () =>
+            File.ReadAllText(Path.Combine(cfg, "data", "audit.log")).Contains("logs.clear.activity", StringComparison.Ordinal));
+
+        // Unauthorized Event Log clear must not reach the log at all.
+        var noAuthEvent = svc.ClearEventLog(null);
+        CheckTrue("logs: clear event log requires admin key", () => !noAuthEvent.Ok && noAuthEvent.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("logs: unauthorized event log clear never calls the log", () => eventLogs.ClearCalls == 0);
+
+        // Log does not exist -> success ("nothing to clear"), no Clear call, audited unavailable.
+        eventLogs.ExistsResult = false;
+        var missing = svc.ClearEventLog(adminKey);
+        CheckTrue("logs: missing event log -> ok", () => missing.Ok);
+        CheckTrue("logs: missing event log -> nothing to clear", () => missing.Message.Contains("nothing to clear", StringComparison.OrdinalIgnoreCase));
+        CheckTrue("logs: missing event log -> no clear call", () => eventLogs.ClearCalls == 0);
+        CheckTrue("logs: missing event log audited unavailable", () =>
+        {
+            var audit = File.ReadAllText(Path.Combine(cfg, "data", "audit.log"));
+            return audit.Contains("\"logs.clear.eventlog\"", StringComparison.Ordinal)
+                && audit.Contains("\"unavailable\"", StringComparison.Ordinal);
+        });
+
+        // Existing log -> success with the entry count, exactly one Clear call.
+        eventLogs.ExistsResult = true;
+        eventLogs.CountResult = 3;
+        var clearedEvent = svc.ClearEventLog(adminKey);
+        CheckTrue("logs: event log cleared ok", () => clearedEvent.Ok);
+        CheckTrue("logs: event log message carries the count", () => clearedEvent.Message.Contains("3", StringComparison.Ordinal));
+        CheckTrue("logs: event log cleared exactly once", () => eventLogs.ClearCalls == 1);
+
+        // Clear throws -> clean internal failure, generic message, never rethrown.
+        eventLogs.ThrowOnClear = true;
+        AdminResult? throwing = null;
+        CheckTrue("logs: event log clear failure never throws", () =>
+        {
+            try
+            {
+                throwing = svc.ClearEventLog(adminKey);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        });
+        CheckTrue("logs: event log clear failure is internal", () =>
+            throwing is not null && !throwing.Ok && throwing.ErrorType == AdminResult.TypeInternal);
+        CheckTrue("logs: event log failure message is generic", () =>
+            throwing is not null
+            && !SafeText(throwing).Contains("UnauthorizedAccess", StringComparison.OrdinalIgnoreCase)
+            && !SafeText(throwing).Contains("InvalidOperationException", StringComparison.OrdinalIgnoreCase)
+            && !SafeText(throwing).Contains("boom", StringComparison.OrdinalIgnoreCase));
+        _ = root;
+    }
+
+    // --------------------------------------------------------------
+    // Log clearing resilience (review fixes):
+    //  R3 - a failing audit write must NOT fail (or undo) the destructive clear;
+    //  R2 - concurrent audit appends must all land as parseable JSONL lines;
+    //  generic message - the Event Log failure must not leak the exception text,
+    //  machine paths or the exception type.
+    // --------------------------------------------------------------
+    static void TestLogClearingResilience()
+    {
+        var adminKey = "admin-primary-key";
+
+        // R3: DataDir is a FILE, so AuditLog's Directory.CreateDirectory fails and
+        // every audit append throws. The clear must still succeed and say so.
+        var root = TempRoot();
+        File.WriteAllText(Path.Combine(root, "blocked"), "x");
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "blocked"));
+        var backups = new ConfigBackup(paths);
+        var activity = new ActivityStore();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            activity,
+            new FakeEventLogStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        activity.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "GET", Path = "/one", Status = 200 });
+        activity.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "POST", Path = "/two", Status = 401 });
+
+        var auditFailed = svc.ClearActivityLog(adminKey);
+        CheckTrue("logs-audit: failing audit does not fail the clear", () => auditFailed.Ok);
+        CheckTrue("logs-audit: failing audit still empties the buffer", () => activity.Count == 0);
+        CheckTrue("logs-audit: failing audit is disclosed to the caller", () =>
+            auditFailed.Message.Contains("audit entry could not be written", StringComparison.OrdinalIgnoreCase));
+
+        // R2: 50 concurrent appends -> 50 non-empty, individually parseable JSON lines.
+        var auditRoot = TempRoot();
+        var auditPaths = new DashboardPaths(auditRoot, auditRoot, Path.Combine(auditRoot, "data"));
+        var audit = new AuditLog(auditPaths);
+        Parallel.For(0, 50, i => audit.Append("test", "t", "ok", "-"));
+
+        var lines = File.ReadAllLines(auditPaths.AuditLogPath).Where(l => l.Length > 0).ToList();
+        CheckTrue("audit: 50 concurrent appends produce 50 lines", () => lines.Count == 50);
+        CheckTrue("audit: every concurrent line is valid JSON", () =>
+        {
+            foreach (var line in lines)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                }
+                catch (JsonException)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        // Generic message: the exception carries "Access denied" + a machine path, none
+        // of which may reach the caller.
+        var genericRoot = TempRoot();
+        var genericPaths = new DashboardPaths(genericRoot, genericRoot, Path.Combine(genericRoot, "data"));
+        var genericBackups = new ConfigBackup(genericPaths);
+        var throwingLogs = new FakeEventLogStore
+        {
+            ExistsResult = true,
+            ClearException = new UnauthorizedAccessException(@"Access denied for C:\Services\AIRouterProxy"),
+        };
+        var genericSvc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            genericPaths,
+            genericBackups,
+            new ReloadConfirmer(genericBackups),
+            new KeyMetaStore(genericPaths),
+            new AuditLog(genericPaths),
+            new ActivityStore(),
+            throwingLogs,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        var denied = genericSvc.ClearEventLog(adminKey);
+        const string expected = "Could not clear the Windows Event Log - it may require elevated rights or be in use.";
+        CheckTrue("logs-eventlog: failure message is exactly the generic one", () => denied.Message == expected);
+        CheckTrue("logs-eventlog: failure leaks no exception detail", () =>
+            !SafeText(denied).Contains("Access denied", StringComparison.OrdinalIgnoreCase)
+            && !SafeText(denied).Contains(@"C:\Services", StringComparison.OrdinalIgnoreCase)
+            && !SafeText(denied).Contains("UnauthorizedAccess", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // --------------------------------------------------------------
+    // Log clearing safety (review fix M6): the destructive clears touch ONLY
+    // the in-memory activity buffer and the (fake) Event Log. The audit trail
+    // and the config files/backups are never deleted or modified - they are
+    // not clearable through this surface.
+    // --------------------------------------------------------------
+    static void TestLogClearingSafety()
+    {
+        var adminKey = "admin-primary-key";
+        var (svc, root, cfg, store, eventLogs) = MakeServiceWithStore(NewOptions());
+
+        // Pre-existing audit trail (sentinel line) + a config file with a backup.
+        var dataDir = Path.Combine(root, "data");
+        Directory.CreateDirectory(dataDir);
+        var auditPath = Path.Combine(dataDir, "audit.log");
+        const string sentinel = "{\"ts\":\"sentinel\",\"action\":\"pre-existing\"}";
+        File.WriteAllText(auditPath, sentinel + Environment.NewLine);
+
+        var routesPath = Path.Combine(cfg, "routes.json");
+        const string routesContent = "{\"Proxy\":{\"Routes\":[]}}";
+        File.WriteAllText(routesPath, routesContent);
+
+        var backups = new ConfigBackup(new DashboardPaths(root, root, dataDir));
+        var created = backups.Backup(cfg, "routes.json");
+        CheckTrue("logs-safety: routes.json backup created", () => created.Count == 1 && File.Exists(created[0]));
+
+        store.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "GET", Path = "/one", Status = 200 });
+        eventLogs.ExistsResult = true;
+        eventLogs.CountResult = 5;
+
+        var activity = svc.ClearActivityLog(adminKey);
+        var eventLog = svc.ClearEventLog(adminKey);
+        CheckTrue("logs-safety: both clears succeed", () => activity.Ok && eventLog.Ok);
+        CheckTrue("logs-safety: activity buffer emptied", () => store.Count == 0);
+        CheckTrue("logs-safety: event log cleared", () => eventLogs.ClearCalls == 1);
+
+        // Nothing besides the logs: audit trail keeps its pre-existing line, routes.json
+        // keeps its exact content and the backup survives.
+        CheckTrue("logs-safety: audit trail keeps the pre-existing line", () =>
+            File.Exists(auditPath) && File.ReadAllText(auditPath).Contains(sentinel, StringComparison.Ordinal));
+        CheckTrue("logs-safety: routes.json is untouched", () =>
+            File.Exists(routesPath) && File.ReadAllText(routesPath) == routesContent);
+        CheckTrue("logs-safety: routes.json backup survives the clears", () => File.Exists(created[0]));
+
+        // Wrong key on the Event Log: rejected before any destructive call.
+        var (svc2, _, _, _, eventLogs2) = MakeServiceWithStore(NewOptions());
+        eventLogs2.ExistsResult = true;
+        eventLogs2.CountResult = 5;
+        var wrong = svc2.ClearEventLog("wrong-key");
+        CheckTrue("logs-safety: wrong key rejected for the event log", () =>
+            !wrong.Ok && wrong.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("logs-safety: wrong key never calls the event log", () => eventLogs2.ClearCalls == 0);
+        CheckTrue("logs-safety: wrong key never touches the log at all", () => eventLogs2.ExistsCalls == 0);
+
+        // A failing Count is stat-only: the clear must still happen, message without a count.
+        var (svc3, _, _, _, eventLogs3) = MakeServiceWithStore(NewOptions());
+        eventLogs3.ExistsResult = true;
+        eventLogs3.ThrowOnCount = true;
+        var countFailed = svc3.ClearEventLog(adminKey);
+        CheckTrue("logs-safety: failing count does not abort the clear", () =>
+            countFailed.Ok && eventLogs3.ClearCalls == 1);
+        CheckTrue("logs-safety: message omits the count when it is unknown", () =>
+            !countFailed.Message.Contains("entries", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // --------------------------------------------------------------
+    // Log clearing with a broken logging provider (review N-A/N-B): in
+    // production the only logging provider is the Event Log being cleared,
+    // so a LogWarning can itself throw (log full/removed/source
+    // unregistered). That warning must never escape and mask the failure.
+    // --------------------------------------------------------------
+    static void TestLogClearingLoggingFailure()
+    {
+        var adminKey = "admin-primary-key";
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore { ExistsResult = true, ThrowOnClear = true },
+            new ThrowingLogger());
+
+        AdminResult? result = null;
+        CheckTrue("logs-logger: a throwing LogWarning never escapes", () =>
+        {
+            try
+            {
+                result = svc.ClearEventLog(adminKey);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        });
+        CheckTrue("logs-logger: failure is still internal", () =>
+            result is not null && !result.Ok && result.ErrorType == AdminResult.TypeInternal);
+        CheckTrue("logs-logger: generic message is preserved", () =>
+            result is not null
+            && result.Message == "Could not clear the Windows Event Log - it may require elevated rights or be in use.");
+    }
+
     private static ProxyOptions NewOptions()
         => new()
         {
@@ -1401,5 +1713,82 @@ sealed class FailingRestorer : ConfigBackup
     {
         Attempted.Add(fileName);
         throw new IOException("simulated locked config file");
+    }
+}
+
+/// <summary>
+/// In-memory IEventLogStore fake: never touches the machine's real Windows Event Log.
+/// Lets the log-clearing tests drive exists/count/clear outcomes deterministically.
+/// </summary>
+sealed class FakeEventLogStore : IEventLogStore
+{
+    public bool ExistsResult { get; set; }
+    public int CountResult { get; set; }
+    public bool ThrowOnCount { get; set; }
+    public bool ThrowOnClear { get; set; }
+
+    /// <summary>When set, Clear throws this instance instead of the generic simulated failure.</summary>
+    public Exception? ClearException { get; set; }
+    public int ExistsCalls { get; private set; }
+    public int ClearCalls { get; private set; }
+    public string? LastClearedLog { get; private set; }
+
+    public bool Exists(string logName)
+    {
+        ExistsCalls++;
+        return ExistsResult;
+    }
+
+    public int Count(string logName)
+        => ThrowOnCount ? throw new InvalidOperationException("simulated count failure") : CountResult;
+
+    public void Clear(string logName)
+    {
+        ClearCalls++;
+        LastClearedLog = logName;
+        if (ClearException is not null)
+        {
+            throw ClearException;
+        }
+
+        if (ThrowOnClear)
+        {
+            throw new InvalidOperationException("simulated event log failure");
+        }
+    }
+}
+
+/// <summary>
+/// ILogger fake whose LogWarning throws, mirroring the production hazard: the only
+/// logging provider is the Event Log being cleared, and EventLog.WriteEntry throws
+/// when the log is full, removed or its source unregistered. All other levels no-op.
+/// </summary>
+sealed class ThrowingLogger : ILogger<DashboardAdminService>
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (logLevel == LogLevel.Warning)
+        {
+            throw new InvalidOperationException("logger down");
+        }
+    }
+}
+
+/// <summary>No-op scope returned by <see cref="ThrowingLogger"/>.</summary>
+sealed class NullScope : IDisposable
+{
+    public static readonly NullScope Instance = new();
+
+    public void Dispose()
+    {
     }
 }

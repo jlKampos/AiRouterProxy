@@ -7,6 +7,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>DashboardTests</RootNamespace>
     <AssemblyName>DashboardTests</AssemblyName>
+    <!-- DashboardAdminService uses EventLog (Windows-only); same suppression as the host. -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -24,6 +26,8 @@
     <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\ReloadConfirmer.cs" Link="AdminPersistence\ReloadConfirmer.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\KeyMetaStore.cs" Link="AdminPersistence\KeyMetaStore.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AuditLog.cs" Link="AdminPersistence\AuditLog.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\ActivityStore.cs" Link="Observability\ActivityStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\IEventLogStore.cs" Link="Observability\IEventLogStore.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminServices\AdminHash.cs" Link="AdminServices\AdminHash.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminServices\DashboardAdminService.cs" Link="AdminServices\DashboardAdminService.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\ProxyOptions.cs" Link="Routing\ProxyOptions.cs" />
@@ -38,6 +42,11 @@
     <!-- IOptionsMonitor<T> used by DashboardAdminService; same version family as the host. -->
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.14" />
     <PackageReference Include="Microsoft.Extensions.Primitives" Version="10.0.14" />
+    <!-- ILogger<T> injected by DashboardAdminService (audit failures are logged, not swallowed). -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.14" />
+    <!-- DashboardAdminService.ClearEventLog uses EventLog; the host gets it from the
+         Microsoft.NET.Sdk.Web shared framework, this console harness needs the package. -->
+    <PackageReference Include="System.Diagnostics.EventLog" Version="10.0.14" />
   </ItemGroup>
 
 </Project>
