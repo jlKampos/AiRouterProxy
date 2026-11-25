@@ -20,6 +20,7 @@ public sealed class HostDashboardFacade : IDashboardFacade
     private readonly ActivityStore _activity;
     private readonly DashboardPaths _paths;
     private readonly KeyMetaStore _keyMeta;
+    private readonly IDetectionStore _detections;
     private readonly DateTimeOffset _started;
     private readonly string _version;
 
@@ -27,12 +28,14 @@ public sealed class HostDashboardFacade : IDashboardFacade
         IOptionsMonitor<ProxyOptions> options,
         ActivityStore activity,
         DashboardPaths paths,
-        KeyMetaStore keyMeta)
+        KeyMetaStore keyMeta,
+        IDetectionStore detections)
     {
         _options = options;
         _activity = activity;
         _paths = paths;
         _keyMeta = keyMeta;
+        _detections = detections;
 
         try
         {
@@ -171,10 +174,33 @@ public sealed class HostDashboardFacade : IDashboardFacade
             e.PresentedHash ?? "-",
             e.ExpectedHash ?? "-",
             e.Route ?? "-",
-            e.UA ?? "-")).ToList();
+            e.UA ?? "-",
+            e.RedactionKinds ?? "-")).ToList();
     }
 
     public int LocalKeyCount() => AuthenticationPolicy.LocalKeyCount(_options.CurrentValue.Keys);
+
+    // ----------------------------------------------------------
+    // Detection forensics (in memory, metadata only - never the value).
+    // ----------------------------------------------------------
+
+    public IReadOnlyList<DetectionView> GetDetections(int limit)
+        => _detections.Recent(Math.Clamp(limit, 1, 200)).Select(d => new DetectionView(
+            d.Timestamp,
+            d.RequestId,
+            d.Client,
+            d.Route,
+            d.Method,
+            d.RequestPath,
+            d.Model,
+            d.JsonPath,
+            d.Layer,
+            d.Kind,
+            d.Length,
+            d.Fingerprint,
+            d.Name,
+            d.Sep,
+            d.Quote)).ToList();
 
     // ----------------------------------------------------------
     // Admin write phase (2.6.0): read-only views for the editable screens.
@@ -205,7 +231,10 @@ public sealed class HostDashboardFacade : IDashboardFacade
                     o.Redaction.Detect.ByLongStrings,
                     o.Redaction.Detect.ExemptBase64,
                     o.Redaction.Detect.EntropyThreshold),
-                Allow: o.Redaction.Allow ?? new List<string>()),
+                Allow: o.Redaction.Allow ?? new List<string>(),
+                Forensics: new ForensicsSettingsView(
+                    Enabled: o.Redaction.Forensics?.Enabled ?? false,
+                    Capacity: o.Redaction.Forensics?.Capacity ?? 200)),
             Inspection: new InspectionSettingsView(
                 Enabled: o.Inspection.Enabled,
                 DefaultAction: o.Inspection.DefaultAction,

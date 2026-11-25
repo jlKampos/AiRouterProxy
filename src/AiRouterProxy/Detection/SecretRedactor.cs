@@ -38,6 +38,13 @@ public static class SecretRedactor
 
         /// <summary>Category-only previews of detected values (never content). Capped.</summary>
         public List<RedactionPreview> Previews { get; } = new();
+
+        /// <summary>
+        /// Forensic metadata of each detection (where/which layer/kind/length/fingerprint).
+        /// Only populated when <c>collectForensics</c> is true; capped per request. Never
+        /// carries the detected value.
+        /// </summary>
+        public List<DetectionRecord> Detections { get; } = new();
     }
 
     public sealed class Result
@@ -52,6 +59,12 @@ public static class SecretRedactor
     /// Walks the JSON body and returns a redacted version. The document is only re-serialized
     /// if there were changes; otherwise the original bytes are returned (zero cost).
     /// </summary>
+    /// <param name="collectForensics">
+    /// When false (default) no forensic metadata is produced: the structural JSON path is not
+    /// built and no fingerprint is computed, so the hot path pays nothing for the feature.
+    /// When true, each detection records path/layer/kind/length/fingerprint in
+    /// <see cref="RedactionStats.Detections"/> (never the value), capped per pass.
+    /// </param>
     public static Result RedactJson(
         byte[] body,
         bool enabled = true,
@@ -62,7 +75,8 @@ public static class SecretRedactor
         bool detectByLongStrings = true,
         double detectEntropyThreshold = 3.0,
         bool exemptBase64 = true,
-        IReadOnlyList<string>? allow = null)
+        IReadOnlyList<string>? allow = null,
+        bool collectForensics = false)
     {
         var result = new Result { Data = body, Changed = false };
 
@@ -96,7 +110,7 @@ public static class SecretRedactor
             {
                 WriteElement(writer, doc.RootElement, null, maskValue, result.Stats,
                     detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                    detectEntropyThreshold, exemptBase64, allowRegexes);
+                    detectEntropyThreshold, exemptBase64, allowRegexes, "$", 0, collectForensics);
             }
 
             if (result.Stats.Total > 0)
@@ -398,7 +412,10 @@ public static class SecretRedactor
         bool detectByLongStrings,
         double detectEntropyThreshold,
         bool exemptBase64,
-        IReadOnlyList<Regex>? allowRegexes)
+        IReadOnlyList<Regex>? allowRegexes,
+        string path,
+        int depth,
+        bool collectForensics)
     {
         switch (element.ValueKind)
         {
@@ -407,20 +424,27 @@ public static class SecretRedactor
                 foreach (var property in element.EnumerateObject())
                 {
                     writer.WritePropertyName(property.Name);
+                    // The path is only built when forensics are on (zero cost otherwise).
+                    var childPath = collectForensics ? AppendProperty(path, property.Name, depth + 1) : string.Empty;
                     WriteElement(writer, property.Value, property.Name, mask, stats,
                         detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                        detectEntropyThreshold, exemptBase64, allowRegexes);
+                        detectEntropyThreshold, exemptBase64, allowRegexes,
+                        childPath, depth + 1, collectForensics);
                 }
                 writer.WriteEndObject();
                 break;
 
             case JsonValueKind.Array:
                 writer.WriteStartArray();
+                var index = 0;
                 foreach (var item in element.EnumerateArray())
                 {
+                    var childPath = collectForensics ? AppendIndex(path, index, depth + 1) : string.Empty;
                     WriteElement(writer, item, null, mask, stats,
                         detectByFieldName, detectByFormats, detectByKeyValueContext, detectByLongStrings,
-                        detectEntropyThreshold, exemptBase64, allowRegexes);
+                        detectEntropyThreshold, exemptBase64, allowRegexes,
+                        childPath, depth + 1, collectForensics);
+                    index++;
                 }
                 writer.WriteEndArray();
                 break;
@@ -434,12 +458,18 @@ public static class SecretRedactor
                     stats.FieldRedactions++;
                     stats.ByKind[kind] = stats.ByKind.TryGetValue(kind, out var count) ? count + 1 : 1;
                     AddPreview(stats, kind);
+
+                    if (collectForensics && !string.IsNullOrEmpty(text))
+                    {
+                        // An empty value carries no information: no length-0 record.
+                        AddDetection(stats, path, "field", kind, text.Length, text.AsSpan());
+                    }
                 }
                 else
                 {
                     writer.WriteStringValue(ApplyScans(text, mask, stats,
                         detectByFormats, detectByKeyValueContext, detectByLongStrings, detectEntropyThreshold,
-                        exemptBase64, allowRegexes));
+                        exemptBase64, allowRegexes, path, collectForensics));
                 }
                 break;
 
@@ -448,6 +478,154 @@ public static class SecretRedactor
                 break;
         }
     }
+
+    // ------------------------------------------------------------------
+    // Detection forensics (opt-in): structural path + category + length + fingerprint
+    // ------------------------------------------------------------------
+
+    /// <summary>Hard cap of forensic records per redaction pass (a pathological body cannot grow it).</summary>
+    public const int MaxDetections = 50;
+
+    /// <summary>Fixed placeholder used when a property NAME itself looks like a secret.</summary>
+    public const string RedactedNamePlaceholder = "<redacted-name>";
+
+    private const int MaxPathDepth = 12;
+    private const int MaxPathLength = 200;
+    private const int MaxSegmentLength = 40;
+
+    /// <summary>
+    /// Test instrumentation: number of path segments built since the last reset. Always 0 when
+    /// <c>collectForensics</c> is false - used to prove the zero-cost path without timers.
+    /// </summary>
+    internal static long PathSegmentsBuilt;
+
+    internal static void ResetPathInstrumentation() => PathSegmentsBuilt = 0;
+
+    /// <summary>
+    /// Property NAMES are checked with the high-confidence scanners only: a name is not a value,
+    /// so the entropy/long-string heuristic must not apply - it would flag legitimate long
+    /// camelCase names with digits (e.g. "responseFormatJsonSchema2024"). Known formats and
+    /// "key: value" context still catch a pasted credential used as a property name.
+    /// </summary>
+    private static readonly DetectOptions SegmentDetectOptions = new()
+    {
+        ByFormats = true,
+        ByKeyValueContext = true,
+        ByLongStrings = false,
+        ExemptBase64 = true,
+    };
+
+    /// <summary>
+    /// Registers one forensic record. The value itself is never stored: only its length, a
+    /// process-local, non-reversible fingerprint and - for the context layer - the SHAPE of the
+    /// pattern (whitelisted name + separator + quote). No-op unless forensics were requested.
+    /// The value is accepted as a span so no string is materialized just for the fingerprint.
+    /// </summary>
+    private static void AddDetection(RedactionStats stats, string path, string layer, string kind, int length,
+        ReadOnlySpan<char> value, string? name = null, string? sep = null, string? quote = null)
+    {
+        if (stats.Detections.Count >= MaxDetections)
+        {
+            return;
+        }
+
+        stats.Detections.Add(new DetectionRecord(
+            JsonPath: TruncatePath(path),
+            Layer: layer,
+            Kind: kind,
+            Length: length,
+            Fingerprint: DetectionFingerprint.Of(value),
+            Name: name,
+            Sep: sep,
+            Quote: quote));
+    }
+
+    /// <summary>Maps a <see cref="SecretFinding"/> detector family to the forensic layer name.</summary>
+    private static string LayerOf(SecretFinding finding) => finding.Detector switch
+    {
+        SecretDetector.DetectorFormat => "format",
+        SecretDetector.DetectorContext => "context",
+        _ => "entropy",
+    };
+
+    /// <summary>
+    /// Property segment for the forensic path: control characters removed, capped at 40 chars,
+    /// path delimiters escaped ("." / "[" / "]" become "_") so the path stays unambiguous, and
+    /// a name whose text looks like a secret replaced by a fixed placeholder (a property NAME
+    /// can be a pasted secret too). Never carries a value.
+    /// </summary>
+    private static string SanitizeSegment(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+        {
+            return string.Empty;
+        }
+
+        Span<char> buffer = stackalloc char[Math.Min(name.Length, MaxSegmentLength)];
+        var written = 0;
+        foreach (var ch in name)
+        {
+            if (char.IsControl(ch))
+            {
+                continue;
+            }
+
+            if (written == buffer.Length)
+            {
+                break;
+            }
+
+            buffer[written++] = ch;
+        }
+
+        var segment = new string(buffer[..written]);
+        if (segment.Length == 0)
+        {
+            return string.Empty;
+        }
+
+        // A secret-shaped NAME must never reach the path. Only the high-confidence scanners run
+        // on names (see SegmentDetectOptions): the entropy heuristic would flag legitimate long
+        // camelCase names, so it is deliberately excluded here.
+        if (SecretDetector.Detect(segment, SegmentDetectOptions).Count > 0)
+        {
+            return RedactedNamePlaceholder;
+        }
+
+        return segment
+            .Replace('.', '_')
+            .Replace('[', '_')
+            .Replace(']', '_');
+    }
+
+    /// <summary>Appends ".name" while the path is shallower than <see cref="MaxPathDepth"/>.</summary>
+    private static string AppendProperty(string path, string name, int depth)
+    {
+        if (depth > MaxPathDepth)
+        {
+            return path;
+        }
+
+        Interlocked.Increment(ref PathSegmentsBuilt);
+        return path + "." + SanitizeSegment(name);
+    }
+
+    /// <summary>Appends "[i]" while the path is shallower than <see cref="MaxPathDepth"/>.</summary>
+    private static string AppendIndex(string path, int index, int depth)
+    {
+        if (depth > MaxPathDepth)
+        {
+            return path;
+        }
+
+        Interlocked.Increment(ref PathSegmentsBuilt);
+        return path + "[" + index + "]";
+    }
+
+    /// <summary>Final path cap: 200 chars plus an ellipsis when it had to be shortened.</summary>
+    private static string TruncatePath(string path)
+        => path.Length <= MaxPathLength ? path : path[..MaxPathLength] + "\u2026";
+
 
     // ------------------------------------------------------------------
     // Unified text scanning (formats + context + entropy => SecretDetector)
@@ -462,7 +640,9 @@ public static class SecretRedactor
         bool detectByLongStrings,
         double detectEntropyThreshold,
         bool exemptBase64,
-        IReadOnlyList<Regex>? allowRegexes)
+        IReadOnlyList<Regex>? allowRegexes,
+        string path,
+        bool collectForensics)
     {
         if (string.IsNullOrEmpty(text))
         {
@@ -484,7 +664,7 @@ public static class SecretRedactor
             ExemptBase64 = exemptBase64,
         };
 
-        return ApplyFindings(text, mask, stats, opts, allowRegexes);
+        return ApplyFindings(text, mask, stats, opts, allowRegexes, path, collectForensics);
     }
 
     /// <summary>
@@ -492,9 +672,9 @@ public static class SecretRedactor
     /// rebuilding the string around the detected spans. Stats are tallied per detector family.
     /// </summary>
     private static string ApplyFindings(string current, string mask, RedactionStats stats, DetectOptions opts,
-        IReadOnlyList<Regex>? allowRegexes)
+        IReadOnlyList<Regex>? allowRegexes, string path, bool collectForensics)
     {
-        var findings = SecretDetector.Detect(current, opts);
+        var findings = SecretDetector.Detect(current, opts, collectShape: collectForensics);
         if (findings.Count == 0)
         {
             return current;
@@ -511,9 +691,11 @@ public static class SecretRedactor
         {
             // Rule B: entropy/context findings inside a base64 payload region (image data
             // URL or blob pasted inline) are binary bytes, not text - left untouched.
-            // "format" findings are never exempted here (pasted keys still masked).
+            // "format" findings are never exempted here (pasted keys still masked), and neither
+            // is a merged span that absorbed one: the union must never mask less.
+            var neverExempt = finding.Detector == SecretDetector.DetectorFormat || finding.IncludesFormat;
             var inBase64 = opts.ExemptBase64
-                && finding.Detector != SecretDetector.DetectorFormat
+                && !neverExempt
                 && SecretDetector.IsInsideBase64Payload(current, finding);
 
             if (inBase64 || IsExemptedByAllow(finding, current, allowRegexes))
@@ -540,6 +722,16 @@ public static class SecretRedactor
 
             byKindCounts[finding.Category] = byKindCounts.TryGetValue(finding.Category, out var n) ? n + 1 : 1;
             AddPreview(stats, finding.Category);
+
+            if (collectForensics)
+            {
+                // The value is only passed as a span (never stored): the record keeps length +
+                // fingerprint. Context findings also carry the pattern SHAPE (whitelisted name +
+                // separator + quote).
+                AddDetection(stats, path, LayerOf(finding), finding.Category, finding.Length,
+                    current.AsSpan(finding.Start, finding.Length),
+                    finding.Name, finding.Sep, finding.Quote);
+            }
 
             cursor = finding.Start + finding.Length;
         }
@@ -572,8 +764,9 @@ public static class SecretRedactor
     /// <summary>
     /// True when a detection is exempted by the configured allow-list (Redaction.allow).
     /// Only the medium-confidence scanners (context / entropy) may be exempted; the
-    /// high-confidence format scanner is never exempted (sk-, ghp_, AIza, JWT, Bearer, PEM...)
-    /// and sensitive JSON field values are masked before text scanning.
+    /// high-confidence format scanner is never exempted (sk-, ghp_, AIza, JWT, Bearer, PEM...),
+    /// neither is a merged span that absorbed a format finding, and sensitive JSON field values
+    /// are masked before text scanning.
     /// </summary>
     private static bool IsExemptedByAllow(SecretFinding finding, string current, IReadOnlyList<Regex>? allowRegexes)
     {
@@ -582,7 +775,7 @@ public static class SecretRedactor
             return false;
         }
 
-        if (finding.Detector == SecretDetector.DetectorFormat)
+        if (finding.Detector == SecretDetector.DetectorFormat || finding.IncludesFormat)
         {
             return false;
         }
@@ -628,3 +821,19 @@ public static class SecretRedactor
         return list.Count == 0 ? null : list;
     }
 }
+
+/// <summary>
+/// One forensic record of a detection: the structural JSON path where it fired, the layer
+/// (field/format/context/entropy), the category, the value length and a non-reversible
+/// fingerprint. Never carries the detected value (see <see cref="DetectionFingerprint"/>).
+/// </summary>
+public sealed record DetectionRecord(
+    string JsonPath,
+    string Layer,
+    string Kind,
+    int Length,
+    string Fingerprint,
+    string? Name = null,
+    string? Sep = null,
+    string? Quote = null);
+

@@ -3,7 +3,7 @@
 @inject IDashboardAdminService Admin
 
 <h1 class="title"><span class="grad">Security</span></h1>
-<p class="sub">Redaction and inspection behaviour (redaction.json, hot-reloaded - no admin key needed, these settings contain no secrets). Rate limiting is a startup snapshot and requires a restart.</p>
+<p class="sub">Redaction and inspection behaviour (redaction.json, hot-reloaded - no admin key needed to save, these settings contain no secrets; clearing the detection buffer is destructive and does ask for the primary local key). Rate limiting is a startup snapshot and requires a restart.</p>
 
 <ResultBanner Result="@_result" />
 
@@ -23,15 +23,24 @@
         <div class="hc-num">@(_rateLimitEnabled ? "ON" : "OFF")</div>
         <div class="hc-sub">per-client sliding window</div>
     </div>
-    <div class="herocard @(_redEnabled ? "c-green" : "c-red")">
+    <div class="herocard @(_savedRedEnabled ? "c-green" : "c-red")">
         <div class="hc-top"><i class="hc-ico"></i><h2>Redaction</h2></div>
-        <div class="hc-num">@(_redEnabled ? "ON" : "OFF")</div>
-        <div class="hc-sub">sensitive content scrubbed</div>
+        <div class="hc-num">@(_savedRedEnabled ? "ON" : "OFF")</div>
+        <div class="hc-sub">sensitive content scrubbed@(_redEnabled != _savedRedEnabled ? " · unsaved" : "")</div>
     </div>
-    <div class="herocard @(_inspEnabled ? "c-green" : "c-red")">
+    <div class="herocard @(_savedForensicsEnabled ? "c-green" : "c-red")">
+        <div class="hc-top"><i class="hc-ico"></i><h2>Forensics</h2></div>
+        <div class="hc-num">@(_savedForensicsEnabled ? "ON" : "OFF")</div>
+        <div class="hc-sub">@(_savedForensicsEnabled ? $"metadata only · cap {_savedForensicsCapacity}" : "off — nothing recorded")@(_forensicsEnabled != _savedForensicsEnabled || _forensicsCapacity != _savedForensicsCapacity ? " · unsaved" : "")</div>
+        <button class="btn small" type="button" style="margin-top: 10px;" disabled="@_busy"
+                @onclick="ToggleForensicsFromCard">
+            @(_savedForensicsEnabled ? "Disable" : "Enable")
+        </button>
+    </div>
+    <div class="herocard @(_savedInspEnabled ? "c-green" : "c-red")">
         <div class="hc-top"><i class="hc-ico"></i><h2>Inspection</h2></div>
-        <div class="hc-num">@(_inspEnabled ? "ON" : "OFF")</div>
-        <div class="hc-sub">fail-closed body inspection</div>
+        <div class="hc-num">@(_savedInspEnabled ? "ON" : "OFF")</div>
+        <div class="hc-sub">fail-closed body inspection@(_inspEnabled != _savedInspEnabled ? " · unsaved" : "")</div>
     </div>
 </div>
 
@@ -113,6 +122,87 @@
     </div>
 </div>
 
+<div class="panel" style="margin-top: 18px;">
+    <h2>Detection forensics</h2>
+    <div class="h2-rule"></div>
+    <p class="head-desc">
+        Records WHERE and WHICH layer fired - never the value. Metadata only, kept in memory
+        (nothing is written to disk) and cleared on restart. Off by default.
+    </p>
+
+    <div class="form-grid">
+        <label class="fcheck"><input type="checkbox" @bind="_forensicsEnabled" /> <span>Enable forensics (metadata only)</span></label>
+        <label class="ffield"><span>Capacity (10-1000)</span><input class="text-input" type="number" min="10" max="1000" step="1" @bind="_forensicsCapacity" /></label>
+    </div>
+
+    <div class="note">
+        <b>Detection forensics:</b> each row shows the structural JSON path, the layer
+        (field / format / context / entropy), the kind, the pattern (context, and <code>format</code>
+        when it inherits from an overlapping context), the value length and an 8-char fingerprint.
+        The fingerprint is an HMAC with an ephemeral per-process key: it can only tell
+        "same value / different value" until the next restart - it is never reversible.
+    </div>
+
+    <div class="log-head" style="margin-top: 14px;">
+        <div>
+            <h3 class="block-h">Latest detections</h3>
+            <p class="head-desc">Newest first (snapshot; refreshed on load, save and clear).</p>
+        </div>
+        <button class="btn ghost" type="button" disabled="@_busy" @onclick="AskClearDetections">Clear</button>
+    </div>
+
+    <div class="tbl-wrap tall">
+        <table>
+            <thead>
+                <tr>
+                    <th scope="col">Time</th>
+                    <th scope="col">Req</th>
+                    <th scope="col">Route</th>
+                    <th scope="col">JSON path</th>
+                    <th scope="col">Layer</th>
+                    <th scope="col">Kind</th>
+                    <th scope="col">Pattern</th>
+                    <th scope="col">Len</th>
+                    <th scope="col">Fingerprint</th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (_detections.Count == 0)
+                {
+                    <tr><td colspan="9"><span class="empty" style="padding: 14px;">No detections recorded (forensics off, or nothing redacted yet).</span></td></tr>
+                }
+                @foreach (var d in _detections)
+                {
+                    <tr>
+                        <td><span class="mono">@d.Timestamp.ToLocalTime().ToString("MM-dd HH:mm:ss")</span></td>
+                        <td><span class="mono" title="@d.RequestId">@Short(d.RequestId)</span></td>
+                        <td><code>@(string.IsNullOrEmpty(d.Route) ? "-" : d.Route)</code></td>
+                        <td><span class="mono">@d.JsonPath</span></td>
+                        <td><span class="chip">@d.Layer</span></td>
+                        <td><span class="mono">@d.Kind</span></td>
+                        <td><span class="mono">@DetectionPattern.Format(d.Name, d.Sep, d.Quote)</span></td>
+                        <td><span class="mono">@d.Length</span></td>
+                        <td><span class="hash">@d.Fingerprint</span></td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<ConfirmDialog @bind-Visible="_confirmVisible"
+               Title="@_confirmTitle"
+               Message="@_confirmMessage"
+               OnConfirm="OpenKeyPrompt"
+               OnCancel="CancelConfirm" />
+
+<AdminKeyPrompt @bind-Visible="_promptVisible"
+                Title="Admin key required"
+                Message="Clearing detections is destructive. The primary local key re-authenticates this operation."
+                OnSubmit="_pendingPrompt"
+                OnCompleted="OnPromptCompleted"
+                OnCancel="CancelPrompt" />
+
 @code {
     private bool _redEnabled = true;
     private string _mask = string.Empty;
@@ -125,6 +215,17 @@
     private bool _exemptBase64 = true;
     private double _entropy = 3.0;
     private string _allowText = string.Empty;
+    private bool _forensicsEnabled;
+    private int _forensicsCapacity = 200;
+
+    // Last SAVED state (filled by ApplyView on load and after a successful save). The hero
+    // cards read these, so they only change once the write is confirmed - not while editing.
+    private bool _savedRedEnabled;
+    private bool _savedInspEnabled;
+    private bool _savedForensicsEnabled;
+    private int _savedForensicsCapacity = 200;
+
+    private List<DetectionView> _detections = new();
 
     private bool _inspEnabled = true;
     private string _defaultAction = "block";
@@ -140,6 +241,11 @@
 
     private AdminResult? _result;
     private bool _busy;
+    private bool _confirmVisible;
+    private bool _promptVisible;
+    private string _confirmTitle = string.Empty;
+    private string _confirmMessage = string.Empty;
+    private Func<string, Task<AdminResult>>? _pendingPrompt;
 
     protected override void OnInitialized() => Load();
 
@@ -147,6 +253,7 @@
     {
         var s = Facade.GetSecurityOptions();
         ApplyView(s);
+        RefreshDetections();
     }
 
     /// <summary>
@@ -178,6 +285,14 @@
         _exemptBase64 = s.Redaction.Detect.ExemptBase64;
         _entropy = s.Redaction.Detect.EntropyThreshold;
         _allowText = string.Join(Environment.NewLine, s.Redaction.Allow);
+        _forensicsEnabled = s.Redaction.Forensics.Enabled;
+        _forensicsCapacity = s.Redaction.Forensics.Capacity;
+
+        // Saved truth for the hero cards (only these make a card switch state).
+        _savedRedEnabled = s.Redaction.Enabled;
+        _savedInspEnabled = s.Inspection.Enabled;
+        _savedForensicsEnabled = s.Redaction.Forensics.Enabled;
+        _savedForensicsCapacity = s.Redaction.Forensics.Capacity;
 
         _inspEnabled = s.Inspection.Enabled;
         _defaultAction = s.Inspection.DefaultAction;
@@ -221,6 +336,11 @@
                     ["entropyThreshold"] = _entropy,
                 },
                 ["allow"] = allowArray,
+                ["forensics"] = new System.Text.Json.Nodes.JsonObject
+                {
+                    ["enabled"] = _forensicsEnabled,
+                    ["capacity"] = _forensicsCapacity,
+                },
             };
 
             var byContentType = new System.Text.Json.Nodes.JsonObject();
@@ -244,6 +364,7 @@
             if (_result.Ok)
             {
                 LoadFromDisk();
+                RefreshDetections();
             }
         }
         finally
@@ -252,9 +373,81 @@
         }
     }
 
+    private void RefreshDetections() => _detections = Facade.GetDetections(50).ToList();
+
+    /// <summary>
+    /// Dedicated card action: flips the checkbox to the opposite of the SAVED state and
+    /// persists immediately (same path as the Save button - the whole Redaction section is
+    /// written, so any other pending edits are saved too). The card only changes after the
+    /// write is confirmed and reloaded from disk.
+    /// </summary>
+    private void ToggleForensicsFromCard()
+    {
+        _forensicsEnabled = !_savedForensicsEnabled;
+        SaveSecurity();
+    }
+
+    private void AskClearDetections()
+    {
+        _result = null;
+        _confirmTitle = "Clear the detection buffer?";
+        _confirmMessage = "This removes every in-memory detection entry. Nothing is written to disk, and it cannot be undone.";
+        _pendingPrompt = key => RunClear(() => Admin.ClearDetections(key));
+        _confirmVisible = true;
+    }
+
+    private void OpenKeyPrompt()
+    {
+        _confirmVisible = false;
+        _promptVisible = true;
+    }
+
+    private void CancelConfirm()
+    {
+        _confirmVisible = false;
+        _pendingPrompt = null;
+    }
+
+    private void CancelPrompt()
+    {
+        _promptVisible = false;
+        _pendingPrompt = null;
+    }
+
+    private void OnPromptCompleted(AdminResult result)
+    {
+        _result = result;
+        _pendingPrompt = null;
+        RefreshDetections(); // the table must reflect the clear
+        StateHasChanged();
+    }
+
+    private async Task<AdminResult> RunClear(Func<AdminResult> operation)
+    {
+        _result = null;
+        _busy = true;
+        StateHasChanged();
+        await Task.Yield();
+        try
+        {
+            var result = operation();
+            _result = result; // always reflect the outcome, even if the modal stays open
+            StateHasChanged();
+            return result;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
     private void AddCt() => _byContentType.Add(new CtRow(string.Empty, "block"));
 
     private void RemoveCt(CtRow row) => _byContentType.Remove(row);
+
+    private static string Short(string value)
+        => string.IsNullOrEmpty(value) ? "-" : value.Length <= 8 ? value : value[..8];
 
     private sealed class CtRow(string type, string action)
     {

@@ -55,7 +55,8 @@ public sealed record ActivityView(
     string PresentedHash,
     string ExpectedHash,
     string Owner,
-    string UA);
+    string UA,
+    string RedactionKinds);
 
 public sealed record KeyMetaView(
     string KeyRef,
@@ -130,7 +131,57 @@ public sealed record RedactionSettingsView(
     bool NotifyInResponse,
     string? WarnTemplate,
     DetectSettingsView Detect,
-    IReadOnlyList<string> Allow);
+    IReadOnlyList<string> Allow,
+    ForensicsSettingsView Forensics);
+
+/// <summary>
+/// Detection forensics (metadata only): off by default, in memory. Records where/which
+/// layer fired - never the value.
+/// </summary>
+public sealed record ForensicsSettingsView(bool Enabled, int Capacity);
+
+/// <summary>
+/// One forensic detection row: structural JSON path, layer, kind, length and a
+/// process-local, non-reversible fingerprint. Never contains the detected value.
+/// <para>
+/// <c>Quote</c> is <c>"\""</c> or <c>"'"</c> when the matched context used that quote,
+/// <c>""</c> for a <c>context</c> finding with no quotes - a <c>format</c> that inherits its
+/// shape from such an unquoted <c>context</c> also gets <c>""</c> - and <c>null</c> for a layer
+/// without shape (<c>field</c>, <c>entropy</c>, or a <c>format</c> that did not inherit a
+/// shape from an overlapping <c>context</c> finding at the same offset).
+/// </para>
+/// </summary>
+public sealed record DetectionView(
+    DateTimeOffset Timestamp,
+    string RequestId,
+    string Client,
+    string Route,
+    string Method,
+    string Path,
+    string? Model,
+    string JsonPath,
+    string Layer,
+    string Kind,
+    int Length,
+    string Fingerprint,
+    string? Name,
+    string? Sep,
+    string? Quote);
+
+/// <summary>
+/// Pattern column for detection forensics: <c>-</c> when the row has no shape
+/// (<c>field</c>/<c>entropy</c>, or a <c>format</c> that inherited nothing), otherwise the
+/// identifier plus separator and, when the value was quoted, a quoted ellipsis.
+/// Pure formatting kept out of the Razor page so it can be unit-tested.
+/// </summary>
+public static class DetectionPattern
+{
+    public static string Format(string? name, string? sep, string? quote)
+        => name is null
+            ? "-"
+            : name + " " + sep
+              + (string.IsNullOrEmpty(quote) ? string.Empty : " " + quote + "\u2026" + quote);
+}
 
 public sealed record DetectSettingsView(
     bool ByFieldName,
@@ -194,6 +245,10 @@ public interface IDashboardFacade
     IReadOnlyList<KeyMetaView> GetKeyMeta();
     IReadOnlyList<ActivityView> GetActivity(int hours, int limit);
     int LocalKeyCount();
+
+    // Detection forensics (in memory, metadata only). Reading is a plain facade operation;
+    // clearing is destructive and goes through IDashboardAdminService (admin key re-check).
+    IReadOnlyList<DetectionView> GetDetections(int limit);
 
     // Admin write phase (2.6.0): read-only views for the editable screens.
     SecurityOptionsView GetSecurityOptions();

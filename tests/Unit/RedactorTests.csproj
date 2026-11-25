@@ -12,6 +12,9 @@
   <ItemGroup>
     <!-- Tests the proxy's real sources (in isolation, without compiling the whole app). -->
     <Compile Include="..\..\src\AiRouterProxy\Detection\SecretRedactor.cs" Link="SecretRedactor.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Detection\DetectionFingerprint.cs" Link="Detection\DetectionFingerprint.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\DetectionStore.cs" Link="Observability\DetectionStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\RedactionNotice.cs" Link="Observability\RedactionNotice.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\NoticeInjector.cs" Link="NoticeInjector.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\RouteResolver.cs" Link="RouteResolver.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\ProxyOptions.cs" Link="ProxyOptions.cs" />

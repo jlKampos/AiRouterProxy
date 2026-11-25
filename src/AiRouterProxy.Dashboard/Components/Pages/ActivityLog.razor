@@ -1,91 +1,261 @@
 @page "/activity"
 @inject IDashboardFacade Facade
+@inject IDashboardAdminService Admin
 
 @{
-    var activity = Facade.GetActivity(_hours, 200);
+    var all = Facade.GetActivity(_hours, 500);          // 500 = capacidade do buffer
+    var total = all.Count;
+    var pageSize = _pageSize;
+    var pages = Math.Max(1, (int)Math.Ceiling(total / (double)pageSize));
+    var page = Math.Clamp(_page, 1, pages);
+    if (_page != page) { _page = page; }
+    var skip = (page - 1) * pageSize;
+    var rows = all.Skip(skip).Take(pageSize).ToList();
+    var refused = all.Count(e => e.Refused);
+    var redacted = all.Sum(e => e.Redacted);
 }
 
 <h1 class="title"><span class="grad">Activity</span></h1>
 <p class="sub">In-memory request log (500 newest entries). Metadata only - hashes, status, duration and redaction counts. Keys and payloads never appear here.</p>
 
-<div class="filters">
-    @foreach (var h in new[] { 1, 6, 24, 72 })
-    {
-        <button class="fc @(h == _hours ? "on" : "")" type="button" @onclick="() => _hours = h">@h h</button>
-    }
-    <button class="fc" type="button" @onclick="() => { }">refresh</button>
-</div>
+<ResultBanner Result="@_result" Title="Logs cleared." />
+
+@if (_busy)
+{
+    <div class="note amber"><b>Working...</b> clearing logs.</div>
+}
 
 <div class="panel">
-    <div class="tbl-wrap">
-        <table>
-            <thead>
-                <tr>
-                    <th>Time</th>
-                    <th>Client</th>
-                    <th>Method</th>
-                    <th>Path</th>
-                    <th>Route</th>
-                    <th>Status</th>
-                    <th>Dur</th>
-                    <th>Red</th>
-                    <th>Presented hash</th>
-                    <th>Expected hash</th>
-                </tr>
-            </thead>
-            <tbody>
-                @if (activity.Count == 0)
-                {
-                    <tr><td colspan="10"><span class="empty" style="padding: 14px;">No entries in this window.</span></td></tr>
-                }
-                @foreach (var e in activity)
-                {
-                    <tr>
-                        <td><span class="mono">@e.Timestamp.ToLocalTime().ToString("MM-dd HH:mm:ss")</span></td>
-                        <td><span class="mono">@(string.IsNullOrEmpty(e.Client) ? "-" : e.Client)</span></td>
-                        <td><span class="mono">@e.Method</span></td>
-                        <td><span class="mono">@(Trunc(e.Path, 30))</span></td>
-                        <td><code>@(string.IsNullOrEmpty(e.Route) ? "-" : e.Route)</code></td>
-                        <td>
-                            @if (e.Status >= 200 && e.Status < 400)
-                            {
-                                <span class="up"><b>@e.Status</b></span>
-                            }
-                            else
-                            {
-                                <span class="down"><b>@e.Status</b></span>
-                            }
-                        </td>
-                        <td><span class="mono">@e.DurationMs</span></td>
-                        <td>
-                            @if (e.Redacted > 0)
-                            {
-                                <span class="chip" style="--c: var(--amber);"><i class="d"></i>@e.Redacted</span>
-                            }
-                            else
-                            {
-                                <span class="hint">-</span>
-                            }
-                        </td>
-                        <td><span class="hash @(HashClass(e))">@(e.PresentedHash ?? "-")</span></td>
-                        <td><span class="hash">@(ExpectedCell(e))</span></td>
-                    </tr>
-                }
-            </tbody>
-        </table>
+    <div class="log-head">
+        <div>
+            <h2>Logs &amp; activity</h2>
+            <div class="h2-rule"></div>
+            <p class="head-desc">Request metadata plus the destructive log operations. Each clear asks for confirmation and then re-authenticates with the primary local key.</p>
+        </div>
+        <button class="btn ghost" type="button" aria-expanded="@(_expanded ? "true" : "false")" aria-controls="activity-body" @onclick="ToggleExpanded">@(_expanded ? "Collapse" : "Expand")</button>
     </div>
+
+    <div class="log-toolbar">
+        <div class="filters">
+            @foreach (var h in new[] { 1, 6, 24, 72 })
+            {
+                <button class="fc @(h == _hours ? "on" : "")" type="button" @onclick="() => SelectHours(h)">@h h</button>
+            }
+            <button class="fc" type="button" @onclick="Refresh">refresh</button>
+        </div>
+        <div class="log-actions">
+            <span class="chip">@total entries</span>
+            <button class="btn ghost" type="button" disabled="@_busy" @onclick="AskClearActivity">Clear activity</button>
+            <button class="btn ghost" type="button" disabled="@_busy" @onclick="AskClearEventLog">Clear Event Log</button>
+        </div>
+    </div>
+
+    <div class="note">
+        <b>Activity buffer:</b> in-memory only, capped at 500 entries. Clearing removes the whole buffer, not just the current filter.
+        The admin audit trail (<code class="path">data/audit.log</code>) is intentionally not clearable from this dashboard.
+    </div>
+
+    <div id="activity-body" hidden="@(!_expanded)">
+        <div class="tbl-wrap tall">
+            <table>
+                <thead>
+                    <tr>
+                        <th scope="col">Time</th>
+                        <th scope="col">Client</th>
+                        <th scope="col">Method</th>
+                        <th scope="col">Path</th>
+                        <th scope="col">Route</th>
+                        <th scope="col">Status</th>
+                        <th scope="col">Dur</th>
+                        <th scope="col">Red</th>
+                        <th scope="col">Presented hash</th>
+                        <th scope="col">Expected hash</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @if (rows.Count == 0)
+                    {
+                        <tr><td colspan="10"><span class="empty" style="padding: 14px;">No entries in this window.</span></td></tr>
+                    }
+                    @foreach (var e in rows)
+                    {
+                        <tr>
+                            <td><span class="mono">@e.Timestamp.ToLocalTime().ToString("MM-dd HH:mm:ss")</span></td>
+                            <td><span class="mono">@(string.IsNullOrEmpty(e.Client) ? "-" : e.Client)</span></td>
+                            <td><span class="mono">@e.Method</span></td>
+                            <td><span class="mono">@(Trunc(e.Path, 30))</span></td>
+                            <td><code>@(string.IsNullOrEmpty(e.Route) ? "-" : e.Route)</code></td>
+                            <td>
+                                @if (e.Status >= 200 && e.Status < 400)
+                                {
+                                    <span class="up"><b>@e.Status</b></span>
+                                }
+                                else
+                                {
+                                    <span class="down"><b>@e.Status</b></span>
+                                }
+                            </td>
+                            <td><span class="mono">@e.DurationMs</span></td>
+                            <td>
+                                @if (e.Redacted > 0)
+                                {
+                                    <span class="chip" style="--c: var(--amber);"><i class="d"></i>@e.Redacted</span>
+                                }
+                                else
+                                {
+                                    <span class="hint">-</span>
+                                }
+                            </td>
+                            <td><span class="hash @(HashClass(e))">@(e.PresentedHash ?? "-")</span></td>
+                            <td><span class="hash">@(ExpectedCell(e))</span></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+
+        <div class="pager">
+            <div class="filters">
+                @foreach (var size in new[] { 25, 50, 100 })
+                {
+                    <button class="fc @(size == _pageSize ? "on" : "")" type="button" @onclick="() => SetPageSize(size)">@size</button>
+                }
+            </div>
+            <div class="form-line">
+                <span class="hint">@(rows.Count == 0 ? "Showing 0 of 0" : $"Showing {skip + 1}–{skip + rows.Count} of {total}")</span>
+            </div>
+            <div class="log-actions">
+                <button class="btn ghost" type="button" disabled="@(page <= 1)" @onclick="PrevPage">Previous</button>
+                <span class="hint">@(page) / @pages</span>
+                <button class="btn ghost" type="button" disabled="@(page >= pages)" @onclick="NextPage">Next</button>
+            </div>
+        </div>
+    </div>
+
+    @if (!_expanded)
+    {
+        <div class="note">@_hours h · @total entries · @refused refused · @redacted redacted</div>
+    }
+
+    <details class="note teal">
+        <summary>Reading hashes</summary>
+        The presented hash is a fingerprint of the local key used in this
+        request (recorded for every request, so traffic can be attributed to a key without ever
+        storing keys). The expected hash - shown only on refused authentication - is the fingerprint
+        of the primary local key; with several local keys there is no single expected value, hence
+        "(multiple keys)". A mismatch with a refused status means the caller used a key that is not valid.
+    </details>
 </div>
 
-<div class="note teal">
-    <b>Reading hashes:</b> the presented hash is a fingerprint of the local key used in this
-    request (recorded for every request, so traffic can be attributed to a key without ever
-    storing keys). The expected hash - shown only on refused authentication - is the fingerprint
-    of the primary local key; with several local keys there is no single expected value, hence
-    "(multiple keys)". A mismatch with a refused status means the caller used a key that is not valid.
-</div>
+<ConfirmDialog @bind-Visible="_confirmVisible"
+               Title="@_confirmTitle"
+               Message="@_confirmMessage"
+               OnConfirm="OpenKeyPrompt"
+               OnCancel="CancelConfirm" />
+
+<AdminKeyPrompt @bind-Visible="_promptVisible"
+                Title="Admin key required"
+                Message="Clearing logs is destructive. The primary local key re-authenticates this operation."
+                OnSubmit="_pendingPrompt"
+                OnCompleted="OnPromptCompleted"
+                OnCancel="CancelPrompt" />
 
 @code {
     private int _hours = 24;
+
+    private bool _expanded = true;
+    private int _page = 1;
+    private int _pageSize = 50;
+
+    private AdminResult? _result;
+    private bool _busy;
+    private bool _confirmVisible;
+    private bool _promptVisible;
+    private string _confirmTitle = string.Empty;
+    private string _confirmMessage = string.Empty;
+    private Func<string, Task<AdminResult>>? _pendingPrompt;
+
+    private void ToggleExpanded() => _expanded = !_expanded;
+
+    private void SelectHours(int h) { _hours = h; _page = 1; }
+
+    private (int Page, int Pages) PageState()
+    {
+        var total = Facade.GetActivity(_hours, 500).Count;
+        var pages = Math.Max(1, (int)Math.Ceiling(total / (double)_pageSize));
+        return (Math.Clamp(_page, 1, pages), pages);
+    }
+
+    private void PrevPage() { var (page, _) = PageState(); _page = Math.Max(1, page - 1); }
+
+    private void NextPage() { var (page, pages) = PageState(); _page = Math.Min(pages, page + 1); }
+
+    private void SetPageSize(int size) { _pageSize = size; _page = 1; }
+
+    private void Refresh() => StateHasChanged();
+
+    private void AskClearActivity()
+    {
+        _result = null;
+        _confirmTitle = "Clear the activity buffer?";
+        _confirmMessage = "This removes every in-memory activity entry (the whole 500-entry buffer), not just the entries in the current time filter. It cannot be undone.";
+        _pendingPrompt = key => RunClear(() => Admin.ClearActivityLog(key));
+        _confirmVisible = true;
+    }
+
+    private void AskClearEventLog()
+    {
+        _result = null;
+        _confirmTitle = "Clear the Windows Event Log?";
+        _confirmMessage = "This permanently deletes every entry in the dedicated 'AIRouterProxy' Windows Event Log. It cannot be undone and may require elevated rights.";
+        _pendingPrompt = key => RunClear(() => Admin.ClearEventLog(key));
+        _confirmVisible = true;
+    }
+
+    private void OpenKeyPrompt()
+    {
+        _confirmVisible = false;
+        _promptVisible = true;
+    }
+
+    private void CancelConfirm()
+    {
+        _confirmVisible = false;
+        _pendingPrompt = null;
+    }
+
+    private void CancelPrompt()
+    {
+        _promptVisible = false;
+        _pendingPrompt = null;
+    }
+
+    private void OnPromptCompleted(AdminResult result)
+    {
+        _result = result;
+        _pendingPrompt = null;
+        StateHasChanged();
+    }
+
+    private async Task<AdminResult> RunClear(Func<AdminResult> operation)
+    {
+        _result = null;
+        _busy = true;
+        StateHasChanged();
+        await Task.Yield();
+        try
+        {
+            var result = operation();
+            _result = result; // always reflect the outcome, even if the modal stays open
+            StateHasChanged();
+            return result;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
 
     private static bool KeyOk(ActivityView e)
         => e.ExpectedHash is { Length: > 0 } && e.ExpectedHash != "-" && e.PresentedHash == e.ExpectedHash;

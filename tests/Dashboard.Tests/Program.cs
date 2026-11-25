@@ -5,8 +5,10 @@ using System.Text.Json.Nodes;
 using AIRouterProxy;
 using AiRouterProxy.AdminPersistence;
 using AiRouterProxy.AdminServices;
+using AiRouterProxy.AdminUi;
 using AiRouterProxy.AdminValidation;
 using AiRouterProxy.Dashboard.Models;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using RouteOptions = AIRouterProxy.RouteOptions;
 
@@ -40,17 +42,30 @@ class Program
     /// <summary>Builds a real DashboardAdminService against a throwaway temp layout (dev layout: config next to base).</summary>
     static (DashboardAdminService Service, string Root, string ConfigDir) MakeService(ProxyOptions options, ReloadConfirmer? confirmer = null)
     {
+        var (service, root, configDir, _, _) = MakeServiceWithStore(options, confirmer);
+        return (service, root, configDir);
+    }
+
+    /// <summary>Same as MakeService but also exposes the ActivityStore and the fake Event Log seam (log-clearing tests).</summary>
+    static (DashboardAdminService Service, string Root, string ConfigDir, ActivityStore Store, FakeEventLogStore EventLogs) MakeServiceWithStore(ProxyOptions options, ReloadConfirmer? confirmer = null)
+    {
         var root = TempRoot();
         var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
         var backups = new ConfigBackup(paths);
+        var activity = new ActivityStore();
+        var eventLogs = new FakeEventLogStore();
         var service = new DashboardAdminService(
             new TestOptionsMonitor<ProxyOptions>(options),
             paths,
             backups,
             confirmer ?? new ReloadConfirmer(backups),
             new KeyMetaStore(paths),
-            new AuditLog(paths));
-        return (service, root, root);
+            new AuditLog(paths),
+            activity,
+            eventLogs,
+            new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+        return (service, root, root, activity, eventLogs);
     }
 
     static void Main()
@@ -58,6 +73,7 @@ class Program
         TestRouteValidator();
         TestKeyValidator();
         TestSecurityValidator();
+        TestSecurityValidatorForensics();
         TestImportValidator();
         TestAdminHash();
         TestAtomicWriter();
@@ -81,6 +97,18 @@ class Program
         TestImportSaveAtomicFailureRollsBack();
         TestReloadConfirmRestoreFailedSignaling();
         TestConfigFileReader();
+        TestLogClearing();
+        TestClearDetections();
+        TestForensicsRoundTrip();
+        TestForensicsPersistence();
+        TestForensicsPurgeScope();
+        TestDetectionViewRoundTrip();
+        TestDetectionPattern();
+        TestLogClearingResilience();
+        TestLogClearingSafety();
+        TestLogClearingLoggingFailure();
+        TestUiSessionManager();
+        TestUiSessionMiddleware();
 
         foreach (var dir in _tmpRoots)
         {
@@ -194,6 +222,49 @@ class Program
         CheckTrue("security: non-boolean enabled", () => !SecurityValidator.Validate(JsonNode.Parse("{\"enabled\":\"yes\"}"), null, out _));
         CheckTrue("security: entropy in range ok", () => SecurityValidator.Validate(JsonNode.Parse("{\"detect\":{\"entropyThreshold\":0}}"), null, out _));
         CheckTrue("security: null sections pass", () => SecurityValidator.Validate(null, null, out _));
+    }
+
+    // --------------------------------------------------------------
+    // Detection forensics: Redaction.forensics validation + sanitize projection.
+    // --------------------------------------------------------------
+    static void TestSecurityValidatorForensics()
+    {
+        CheckTrue("forensics: capacity 9 rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":9}}"), null, out _));
+        CheckTrue("forensics: capacity 10 accepted", () =>
+            SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":10}}"), null, out _));
+        CheckTrue("forensics: capacity 1000 accepted", () =>
+            SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":1000}}"), null, out _));
+        CheckTrue("forensics: capacity 1001 rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":1001}}"), null, out _));
+        CheckTrue("forensics: capacity 10.5 rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":10.5}}"), null, out _));
+        CheckTrue("forensics: capacity non-number rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"capacity\":\"abc\"}}"), null, out _));
+        CheckTrue("forensics: enabled non-boolean rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"enabled\":\"yes\"}}"), null, out _));
+        CheckTrue("forensics: non-object rejected", () =>
+            !SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":true}"), null, out _));
+        CheckTrue("forensics: enabled+capacity accepted", () =>
+            SecurityValidator.Validate(JsonNode.Parse("{\"forensics\":{\"enabled\":true,\"capacity\":500}}"), null, out _));
+
+        // SanitizeRedaction keeps enabled+capacity and drops unknown properties (nested and top-level).
+        var sanitized = SecurityValidator.SanitizeRedaction(JsonNode.Parse(
+            "{\"enabled\":true,\"forensics\":{\"enabled\":true,\"capacity\":300,\"smuggled\":\"x\"},\"unknown\":1}"));
+        CheckTrue("forensics: sanitize keeps enabled+capacity", () => sanitized is not null
+            && sanitized["forensics"] is JsonObject forensics
+            && forensics["enabled"] is JsonValue enabledValue && enabledValue.TryGetValue<bool>(out var enabled) && enabled
+            && forensics["capacity"] is JsonValue capacityValue && capacityValue.TryGetValue<int>(out var capacity) && capacity == 300);
+        CheckTrue("forensics: sanitize drops unknown nested property", () => sanitized?["forensics"] is JsonObject forensics
+            && forensics.Count == 2
+            && forensics["smuggled"] is null);
+        CheckTrue("forensics: sanitize drops unknown top-level property", () => sanitized?["unknown"] is null);
+
+        // Regression: a Redaction section without forensics stays valid (defaults off/200 apply).
+        CheckTrue("forensics: absent section still valid", () => SecurityValidator.Validate(
+            JsonNode.Parse("{\"enabled\":true,\"detect\":{\"byFieldName\":true}}"), null, out _));
+        CheckTrue("forensics: absent section not invented by sanitize", () =>
+            SecurityValidator.SanitizeRedaction(JsonNode.Parse("{\"enabled\":true}"))?["forensics"] is null);
     }
 
     // --------------------------------------------------------------
@@ -707,7 +778,11 @@ class Program
             backups,
             failing,
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
         const string originalRoutes = "{\"Proxy\":{\"Routes\":[{\"name\":\"keep-me\",\"prefix\":\"/keep\",\"upstream\":\"https://api.example.com\",\"keyRef\":\"\"}]}}";
@@ -822,7 +897,11 @@ class Program
             backups,
             new ReloadConfirmer(backups),
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var redPath = Path.Combine(root, "redaction.json");
         const string good = "{\"Proxy\":{\"Redaction\":{\"enabled\":true},\"Inspection\":{\"defaultAction\":\"block\"}}}";
@@ -1060,7 +1139,11 @@ class Program
             backups,
             failing,
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
         const string originalRoutes = "{\"Proxy\":{\"Routes\":[{\"name\":\"a\",\"prefix\":\"/a\",\"upstream\":\"https://api.example.com\",\"keyRef\":\"\"}]}}";
@@ -1102,7 +1185,11 @@ class Program
             backups,
             new ReloadConfirmer(backups),
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var routesPath = Path.Combine(root, "routes.json");
         const string originalRoutes = "{\"Proxy\":{\"Routes\":[{\"name\":\"a\",\"prefix\":\"/a\",\"upstream\":\"https://api.example.com\",\"keyRef\":\"\"}]}}";
@@ -1143,7 +1230,11 @@ class Program
             restorer,
             confirmer,
             new KeyMetaStore(paths),
-            new AuditLog(paths));
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
 
         var redPath = Path.Combine(root, "redaction.json");
         const string good = "{\"Proxy\":{\"Redaction\":{\"enabled\":true}}}";
@@ -1302,6 +1393,723 @@ class Program
             && nullLiveKeys.LocalKey is null && nullLiveKeys.LocalKeys.Count == 0);
     }
 
+    // --------------------------------------------------------------
+    // Log clearing: destructive operations require the admin key, the
+    // activity buffer is emptied only after auth, and the audit log records
+    // the clear. Event Log behaviour is exercised through the IEventLogStore
+    // fake - these checks NEVER touch the machine's real Windows Event Log.
+    // --------------------------------------------------------------
+    static void TestLogClearing()
+    {
+        var adminKey = "admin-primary-key";
+        var (svc, root, cfg, store, eventLogs) = MakeServiceWithStore(NewOptions());
+
+        store.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "GET", Path = "/one", Status = 200 });
+        store.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "POST", Path = "/two", Status = 401 });
+
+        var noAuth = svc.ClearActivityLog(null);
+        CheckTrue("logs: clear activity requires admin key", () => !noAuth.Ok && noAuth.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("logs: unauthorized clear keeps the entries", () => store.Count == 2);
+
+        var wrongKey = svc.ClearActivityLog("wrong");
+        CheckTrue("logs: clear activity wrong key rejected", () => !wrongKey.Ok && wrongKey.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("logs: wrong key keeps the entries", () => store.Count == 2);
+
+        var cleared = svc.ClearActivityLog(adminKey);
+        CheckTrue("logs: clear activity ok", () => cleared.Ok);
+        CheckTrue("logs: activity buffer emptied", () => store.Count == 0);
+        CheckTrue("logs: activity clear audited", () =>
+            File.ReadAllText(Path.Combine(cfg, "data", "audit.log")).Contains("logs.clear.activity", StringComparison.Ordinal));
+
+        // Unauthorized Event Log clear must not reach the log at all.
+        var noAuthEvent = svc.ClearEventLog(null);
+        CheckTrue("logs: clear event log requires admin key", () => !noAuthEvent.Ok && noAuthEvent.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("logs: unauthorized event log clear never calls the log", () => eventLogs.ClearCalls == 0);
+
+        // Log does not exist -> success ("nothing to clear"), no Clear call, audited unavailable.
+        eventLogs.ExistsResult = false;
+        var missing = svc.ClearEventLog(adminKey);
+        CheckTrue("logs: missing event log -> ok", () => missing.Ok);
+        CheckTrue("logs: missing event log -> nothing to clear", () => missing.Message.Contains("nothing to clear", StringComparison.OrdinalIgnoreCase));
+        CheckTrue("logs: missing event log -> no clear call", () => eventLogs.ClearCalls == 0);
+        CheckTrue("logs: missing event log audited unavailable", () =>
+        {
+            var audit = File.ReadAllText(Path.Combine(cfg, "data", "audit.log"));
+            return audit.Contains("\"logs.clear.eventlog\"", StringComparison.Ordinal)
+                && audit.Contains("\"unavailable\"", StringComparison.Ordinal);
+        });
+
+        // Existing log -> success with the entry count, exactly one Clear call.
+        eventLogs.ExistsResult = true;
+        eventLogs.CountResult = 3;
+        var clearedEvent = svc.ClearEventLog(adminKey);
+        CheckTrue("logs: event log cleared ok", () => clearedEvent.Ok);
+        CheckTrue("logs: event log message carries the count", () => clearedEvent.Message.Contains("3", StringComparison.Ordinal));
+        CheckTrue("logs: event log cleared exactly once", () => eventLogs.ClearCalls == 1);
+
+        // Clear throws -> clean internal failure, generic message, never rethrown.
+        eventLogs.ThrowOnClear = true;
+        AdminResult? throwing = null;
+        CheckTrue("logs: event log clear failure never throws", () =>
+        {
+            try
+            {
+                throwing = svc.ClearEventLog(adminKey);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        });
+        CheckTrue("logs: event log clear failure is internal", () =>
+            throwing is not null && !throwing.Ok && throwing.ErrorType == AdminResult.TypeInternal);
+        CheckTrue("logs: event log failure message is generic", () =>
+            throwing is not null
+            && !SafeText(throwing).Contains("UnauthorizedAccess", StringComparison.OrdinalIgnoreCase)
+            && !SafeText(throwing).Contains("InvalidOperationException", StringComparison.OrdinalIgnoreCase)
+            && !SafeText(throwing).Contains("boom", StringComparison.OrdinalIgnoreCase));
+        _ = root;
+    }
+
+    // --------------------------------------------------------------
+    // Detection forensics clearing: same protected path as the activity buffer
+    // (admin key re-check before the destructive in-memory clear, audited).
+    // --------------------------------------------------------------
+    static void TestClearDetections()
+    {
+        var adminKey = "admin-primary-key";
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var detections = new DetectionStore();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            detections,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        detections.AddRange(new[] { Entry(1), Entry(2) }, 100);
+
+        var noAuth = svc.ClearDetections(null);
+        CheckTrue("detections: clear requires admin key", () => !noAuth.Ok && noAuth.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("detections: unauthorized clear keeps the entries", () => detections.Count == 2);
+
+        var wrongKey = svc.ClearDetections("wrong");
+        CheckTrue("detections: clear wrong key rejected", () => !wrongKey.Ok && wrongKey.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("detections: wrong key keeps the entries", () => detections.Count == 2);
+
+        var cleared = svc.ClearDetections(adminKey);
+        CheckTrue("detections: clear ok", () => cleared.Ok);
+        CheckTrue("detections: buffer emptied", () => detections.Count == 0);
+        CheckTrue("detections: clear audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("logs.clear.detections", StringComparison.Ordinal));
+    }
+
+    // --------------------------------------------------------------
+    // Detection forensics: redaction.json round-trip (enabled/capacity), purge on disable,
+    // and the empty Recent(0) contract.
+    // --------------------------------------------------------------
+    static void TestForensicsPersistence()
+    {
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var detections = new DetectionStore();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            detections,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        var redaction = new JsonObject
+        {
+            ["enabled"] = true,
+            ["detect"] = new JsonObject { ["byFieldName"] = true },
+            ["allow"] = new JsonArray(),
+            ["forensics"] = new JsonObject { ["enabled"] = true, ["capacity"] = 350 },
+        };
+
+        var applied = svc.ApplySecurity(redaction, null);
+        CheckTrue("forensics: apply ok", () => applied.Ok);
+
+        var disk = ConfigFileReader.ReadSecurity(paths.ConfigDir);
+        CheckTrue("forensics: round-trip enabled+capacity", () => disk?.Redaction is { } section
+            && section.Forensics.Enabled
+            && section.Forensics.Capacity == 350);
+
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        // Recent(0) means "no entries" - the caller asked for none.
+        detections.AddRange(new[] { Entry(1) }, 100);
+        CheckTrue("forensics: Recent(0) is empty", () => detections.Recent(0).Count == 0);
+        CheckTrue("forensics: Recent(1) keeps the entry", () => detections.Recent(1).Count == 1);
+
+        // Disabling forensics purges the in-memory buffer after the confirmed write.
+        var disabled = svc.ApplySecurity(new JsonObject
+        {
+            ["enabled"] = true,
+            ["forensics"] = new JsonObject { ["enabled"] = false, ["capacity"] = 200 },
+        }, null);
+
+        CheckTrue("forensics: disabling purges the buffer", () => disabled.Ok && detections.Count == 0);
+        CheckTrue("forensics: disabling is persisted", () => ConfigFileReader.ReadSecurity(paths.ConfigDir)?.Redaction is { } section
+            && !section.Forensics.Enabled);
+
+        // Enabling them again keeps the buffer empty (nothing is replayed).
+        var reEnabled = svc.ApplySecurity(new JsonObject
+        {
+            ["enabled"] = true,
+            ["forensics"] = new JsonObject { ["enabled"] = true, ["capacity"] = 200 },
+        }, null);
+        CheckTrue("forensics: re-enabling keeps the buffer empty", () => reEnabled.Ok && detections.Count == 0);
+    }
+
+    // --------------------------------------------------------------
+    // N2/N7: a save that does not disable forensics (section without "forensics", or the
+    // feature already off with an empty buffer) must not purge, audit or add a banner.
+    // --------------------------------------------------------------
+    static void TestForensicsPurgeScope()
+    {
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var detections = new DetectionStore();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            detections,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        detections.AddRange(new[] { Entry(1), Entry(2) }, 100);
+
+        // Redaction section WITHOUT "forensics": the setting is untouched, so is the buffer.
+        var noForensics = svc.ApplySecurity(new JsonObject
+        {
+            ["enabled"] = true,
+            ["detect"] = new JsonObject { ["byFieldName"] = true },
+        }, null);
+
+        var auditPath = Path.Combine(root, "data", "audit.log");
+        CheckTrue("forensics: save without section keeps the buffer", () => noForensics.Ok && detections.Count == 2);
+        CheckTrue("forensics: save without section does not audit a clear", () =>
+            !File.Exists(auditPath) || !File.ReadAllText(auditPath).Contains("logs.clear.detections", StringComparison.Ordinal));
+        CheckTrue("forensics: save without section adds no banner", () =>
+            noForensics.Message == "Security settings applied and the engine reloaded.");
+
+        // Explicitly disabling with an EMPTY buffer: also silent (no empty audit line/banner).
+        detections.Clear();
+        var disabledEmpty = svc.ApplySecurity(new JsonObject
+        {
+            ["enabled"] = true,
+            ["forensics"] = new JsonObject { ["enabled"] = false, ["capacity"] = 200 },
+        }, null);
+
+        CheckTrue("forensics: disabling with an empty buffer stays silent", () => disabledEmpty.Ok
+            && detections.Count == 0
+            && disabledEmpty.Message == "Security settings applied and the engine reloaded.");
+        CheckTrue("forensics: empty-buffer disable does not audit a clear", () =>
+            !File.ReadAllText(auditPath).Contains("logs.clear.detections", StringComparison.Ordinal));
+    }
+
+    // --------------------------------------------------------------
+    // Detection forensics round-trip through the WRITE path: ApplySecurity writes
+    // redaction.json, ConfigFileReader re-reads it (the UI reads the file, not the
+    // debounced live snapshot) and the security view exposes the saved values.
+    // Turning forensics off also purges the in-memory buffer (m1).
+    // --------------------------------------------------------------
+    static void TestForensicsRoundTrip()
+    {
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var detections = new DetectionStore();
+        var options = NewOptions();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(options),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore(),
+            detections,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        var on = JsonNode.Parse("{\"enabled\":true,\"forensics\":{\"enabled\":true,\"capacity\":500}}")!;
+        var applied = svc.ApplySecurity(on, null);
+        CheckTrue("forensics-roundtrip: apply ok", () => applied.Ok);
+
+        var disk = ConfigFileReader.ReadSecurity(paths.ConfigDir);
+        CheckTrue("forensics-roundtrip: disk keeps enabled/capacity", () =>
+            disk?.Redaction?.Forensics is { Enabled: true, Capacity: 500 });
+
+        var facade = new HostDashboardFacade(
+            new TestOptionsMonitor<ProxyOptions>(options),
+            new ActivityStore(),
+            paths,
+            new KeyMetaStore(paths),
+            detections);
+
+        var view = facade.GetSecurityOptionsFromDisk();
+        CheckTrue("forensics-roundtrip: security view exposes saved values", () => view is not null
+            && view.Redaction.Forensics.Enabled
+            && view.Redaction.Forensics.Capacity == 500);
+
+        // m1: turning forensics off (write confirmed) purges the in-memory buffer and audits it.
+        static DetectionEntry Entry(int i) => new(
+            DateTimeOffset.UtcNow, "req" + i, "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", "$.c", "format", "openai", 40, "abcdef0" + (i % 10));
+
+        detections.AddRange(new[] { Entry(1), Entry(2) }, 100);
+        CheckTrue("forensics-roundtrip: buffer seeded", () => detections.Count == 2);
+
+        var off = JsonNode.Parse("{\"enabled\":true,\"forensics\":{\"enabled\":false,\"capacity\":500}}")!;
+        var disabled = svc.ApplySecurity(off, null);
+        CheckTrue("forensics-roundtrip: disable applied", () => disabled.Ok);
+        CheckTrue("forensics-roundtrip: disable purges buffer", () => detections.Count == 0);
+        CheckTrue("forensics-roundtrip: purge audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("logs.clear.detections", StringComparison.Ordinal));
+
+        var viewOff = facade.GetSecurityOptionsFromDisk();
+        CheckTrue("forensics-roundtrip: view shows disabled", () => viewOff is not null
+            && !viewOff.Redaction.Forensics.Enabled);
+    }
+
+    // --------------------------------------------------------------
+    // DetectionRecord -> DetectionEntry -> DetectionView round-trip. Both records carry
+    // 15 positional parameters and Name/Sep are adjacent strings (a swap compiles today),
+    // so the mapping is pinned with distinct marker values.
+    // --------------------------------------------------------------
+    static void TestDetectionViewRoundTrip()
+    {
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var detections = new DetectionStore();
+        var options = NewOptions();
+
+        var record = new DetectionRecord("$.c", "context", "key_in_text", 12, "deadbeef", "token", ":", "\"");
+        CheckTrue("detections round-trip: DetectionRecord positional shape", () =>
+            record.Name == "token" && record.Sep == ":" && record.Quote == "\"");
+
+        // Production mapping order (ProxyMiddleware): Name, Sep, Quote - all positional.
+        var entry = new DetectionEntry(
+            DateTimeOffset.UtcNow, "req-rt", "127.0.0.1", "default", "POST", "/v1/chat/completions",
+            "model-x", record.JsonPath, record.Layer, record.Kind, record.Length, record.Fingerprint,
+            record.Name, record.Sep, record.Quote);
+        CheckTrue("detections round-trip: DetectionEntry positional shape", () =>
+            entry.Name == "token" && entry.Sep == ":" && entry.Quote == "\"");
+
+        detections.AddRange(new[] { entry }, 100);
+
+        var facade = new HostDashboardFacade(
+            new TestOptionsMonitor<ProxyOptions>(options),
+            new ActivityStore(),
+            paths,
+            new KeyMetaStore(paths),
+            detections);
+
+        var view = facade.GetDetections(10).SingleOrDefault();
+        CheckTrue("detections round-trip: name/sep/quote order preserved", () => view is not null
+            && view.Name == "token" && view.Sep == ":" && view.Quote == "\"");
+
+        // None of the forensic types may expose a value/raw property.
+        CheckTrue("detections round-trip: no value/raw property", () =>
+            !HasValueOrRawProperty(typeof(DetectionRecord))
+            && !HasValueOrRawProperty(typeof(DetectionEntry))
+            && !HasValueOrRawProperty(typeof(DetectionView)));
+    }
+
+    static bool HasValueOrRawProperty(Type type) => type.GetProperties().Any(p =>
+        p.Name.Equals("value", StringComparison.OrdinalIgnoreCase)
+        || p.Name.Equals("raw", StringComparison.OrdinalIgnoreCase));
+
+    // --------------------------------------------------------------
+    // Pattern column formatting (shared by the Security page): "-" when the row has no
+    // shape, otherwise `name sep` plus a quoted ellipsis for quoted values.
+    // --------------------------------------------------------------
+    static void TestDetectionPattern()
+    {
+        Check("pattern cell: no shape -> dash", DetectionPattern.Format(null, null, null) == "-");
+        Check("pattern cell: unquoted context", DetectionPattern.Format("token", "=", "") == "token =");
+        Check("pattern cell: double-quoted context", DetectionPattern.Format("token", ":", "\"") == "token : \"\u2026\"");
+        Check("pattern cell: single-quoted context", DetectionPattern.Format("password", "=", "'") == "password = '\u2026'");
+    }
+
+    // --------------------------------------------------------------
+    // UI session cookie: the signing key derives from the primary local key, so a service
+    // restart keeps the session and a key rotation kills it.
+    // --------------------------------------------------------------
+    static void TestUiSessionManager()
+    {
+        var options = NewOptions();
+        var sessions = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(options));
+        var token = sessions.CreateToken();
+
+        CheckTrue("ui-session: token validates on the same instance", () => sessions.Validate(token));
+
+        // New instance + same local key = a service restart (this used to invalidate everything).
+        var afterRestart = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(NewOptions()));
+        CheckTrue("ui-session: survives a restart", () => afterRestart.Validate(token));
+
+        // Rotating the primary local key must invalidate every existing session.
+        var rotated = NewOptions();
+        rotated.Keys.LocalKey = options.Keys.LocalKey + "-rotated";
+        var afterRotation = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(rotated));
+        CheckTrue("ui-session: key rotation invalidates", () => !afterRotation.Validate(token));
+
+        // Tampered signature: flip the first signature char (a full base64 group, so the decoded
+        // MAC always changes - the last char carries padding bits and may decode identically).
+        var dot = token.IndexOf('.');
+        var signature = token[(dot + 1)..];
+        var tamperedSignature = (signature[0] == 'A' ? 'B' : 'A') + signature[1..];
+        var tampered = token[..(dot + 1)] + tamperedSignature;
+        CheckTrue("ui-session: tampered token rejected", () => !sessions.Validate(tampered));
+
+        CheckTrue("ui-session: null/empty rejected", () => !sessions.Validate(null) && !sessions.Validate(string.Empty));
+
+        // Multi-key-only config (no primary LocalKey): the signing key comes from the
+        // multi-keys - stable across restarts, order-insensitive, but never predictable.
+        static ProxyOptions MultiConfig(params string[] keys)
+        {
+            var o = NewOptions();
+            o.Keys.LocalKey = string.Empty;
+            o.Keys.LocalKeys = keys.ToList();
+            return o;
+        }
+
+        var multiSessions = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(MultiConfig("alpha", "beta")));
+        var multiToken = multiSessions.CreateToken();
+        CheckTrue("ui-session: multi-key survives a restart (order-insensitive)", () =>
+            new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(MultiConfig("beta", "alpha"))).Validate(multiToken));
+
+        CheckTrue("ui-session: multi-key rotation invalidates", () =>
+            !new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(MultiConfig("alpha", "gamma"))).Validate(multiToken));
+
+        // No key at all: ephemeral signing key - a restart must invalidate, otherwise the
+        // shared constant would allow cookie forgery without knowing any key.
+        static ProxyOptions Keyless()
+        {
+            var o = NewOptions();
+            o.Keys.LocalKey = string.Empty;
+            o.Keys.LocalKeys = new List<string>();
+            return o;
+        }
+
+        var keylessSessions = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(Keyless()));
+        var keylessToken = keylessSessions.CreateToken();
+        CheckTrue("ui-session: no keys validates on the same instance", () => keylessSessions.Validate(keylessToken));
+        CheckTrue("ui-session: no keys does not survive a restart", () =>
+            !new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(Keyless())).Validate(keylessToken));
+    }
+
+    // --------------------------------------------------------------
+    // UI session middleware: Blazor circuit endpoints fail fast with 401 (a 302 to the HTML
+    // login page hangs the reconnect loop), while the login page/static assets stay reachable
+    // and normal pages still redirect to the login form.
+    // --------------------------------------------------------------
+    static void TestUiSessionMiddleware()
+    {
+        var options = NewOptions();
+        var sessions = new UiSessionManager(new TestOptionsMonitor<ProxyOptions>(options));
+        var validCookie = sessions.CreateToken();
+
+        static (UiSessionMiddleware Middleware, Func<bool> NextCalled) Build(ProxyOptions options, UiSessionManager sessions)
+        {
+            var called = false;
+            var middleware = new UiSessionMiddleware(
+                _ => { called = true; return Task.CompletedTask; },
+                sessions,
+                new TestOptionsMonitor<ProxyOptions>(options),
+                new RateLimiter(new RateLimitOptions()));
+            return (middleware, () => called);
+        }
+
+        static DefaultHttpContext Request(string path, string? cookie)
+        {
+            var ctx = new DefaultHttpContext();
+            ctx.Request.Method = HttpMethods.Get;
+            ctx.Request.Path = path; // no path base: UsePathBase strips it before this middleware
+            if (cookie is not null)
+            {
+                ctx.Request.Headers.Cookie = UiSessionManager.CookieName + "=" + cookie;
+            }
+            return ctx;
+        }
+
+        static int Invoke(UiSessionMiddleware middleware, DefaultHttpContext ctx)
+        {
+            middleware.InvokeAsync(ctx).GetAwaiter().GetResult();
+            return ctx.Response.StatusCode;
+        }
+
+        // 1. Valid session: /_blazor is gated but the request goes through.
+        var (withSession, withSessionNext) = Build(options, sessions);
+        var allowed = Request("/_blazor", validCookie);
+        CheckTrue("ui-mw: valid session reaches /_blazor", () => Invoke(withSession, allowed) == 200 && withSessionNext());
+
+        // 2-4. No session: every circuit endpoint must be 401 (never a 302 to HTML).
+        var (circuit, circuitNext) = Build(options, sessions);
+        var plain = Request("/_blazor", null);
+        var negotiate = Request("/_blazor/negotiate", null);
+        var upper = Request("/_BLAZOR/NEGOTIATE", null);
+        CheckTrue("ui-mw: /_blazor without session -> 401", () => Invoke(circuit, plain) == 401 && !circuitNext());
+        CheckTrue("ui-mw: /_blazor/negotiate without session -> 401", () => Invoke(circuit, negotiate) == 401 && !circuitNext());
+        CheckTrue("ui-mw: circuit matcher is case-insensitive", () => Invoke(circuit, upper) == 401 && !circuitNext());
+
+        // 5 + 7. The login page and static assets stay reachable without a session.
+        var (publics, publicsNext) = Build(options, sessions);
+        CheckTrue("ui-mw: /login stays public", () => Invoke(publics, Request("/login", null)) == 200 && publicsNext());
+
+        var (assets, assetsNext) = Build(options, sessions);
+        CheckTrue("ui-mw: static assets stay public", () => Invoke(assets, Request("/app.css", null)) == 200 && assetsNext());
+
+        // 6. A normal page without a session redirects to the login form.
+        var (pages, pagesNext) = Build(options, sessions);
+        var page = Request("/security", null);
+        CheckTrue("ui-mw: page without session -> 302 login", () => Invoke(pages, page) == StatusCodes.Status302Found
+            && page.Response.Headers.Location == "/admin/ui/login"
+            && !pagesNext());
+
+        // 8. The matcher is precise: "/_blazorx" is NOT a circuit endpoint (falls to the redirect).
+        var (near, nearNext) = Build(options, sessions);
+        CheckTrue("ui-mw: /_blazorx is not a circuit endpoint", () =>
+            Invoke(near, Request("/_blazorx", null)) == StatusCodes.Status302Found && !nearNext());
+    }
+
+    // --------------------------------------------------------------
+    // Log clearing resilience (review fixes):
+    //  R3 - a failing audit write must NOT fail (or undo) the destructive clear;
+    //  R2 - concurrent audit appends must all land as parseable JSONL lines;
+    //  generic message - the Event Log failure must not leak the exception text,
+    //  machine paths or the exception type.
+    // --------------------------------------------------------------
+    static void TestLogClearingResilience()
+    {
+        var adminKey = "admin-primary-key";
+
+        // R3: DataDir is a FILE, so AuditLog's Directory.CreateDirectory fails and
+        // every audit append throws. The clear must still succeed and say so.
+        var root = TempRoot();
+        File.WriteAllText(Path.Combine(root, "blocked"), "x");
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "blocked"));
+        var backups = new ConfigBackup(paths);
+        var activity = new ActivityStore();
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            activity,
+            new FakeEventLogStore(),
+            new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        activity.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "GET", Path = "/one", Status = 200 });
+        activity.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "POST", Path = "/two", Status = 401 });
+
+        var auditFailed = svc.ClearActivityLog(adminKey);
+        CheckTrue("logs-audit: failing audit does not fail the clear", () => auditFailed.Ok);
+        CheckTrue("logs-audit: failing audit still empties the buffer", () => activity.Count == 0);
+        CheckTrue("logs-audit: failing audit is disclosed to the caller", () =>
+            auditFailed.Message.Contains("audit entry could not be written", StringComparison.OrdinalIgnoreCase));
+
+        // R2: 50 concurrent appends -> 50 non-empty, individually parseable JSON lines.
+        var auditRoot = TempRoot();
+        var auditPaths = new DashboardPaths(auditRoot, auditRoot, Path.Combine(auditRoot, "data"));
+        var audit = new AuditLog(auditPaths);
+        Parallel.For(0, 50, i => audit.Append("test", "t", "ok", "-"));
+
+        var lines = File.ReadAllLines(auditPaths.AuditLogPath).Where(l => l.Length > 0).ToList();
+        CheckTrue("audit: 50 concurrent appends produce 50 lines", () => lines.Count == 50);
+        CheckTrue("audit: every concurrent line is valid JSON", () =>
+        {
+            foreach (var line in lines)
+            {
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                }
+                catch (JsonException)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        // Generic message: the exception carries "Access denied" + a machine path, none
+        // of which may reach the caller.
+        var genericRoot = TempRoot();
+        var genericPaths = new DashboardPaths(genericRoot, genericRoot, Path.Combine(genericRoot, "data"));
+        var genericBackups = new ConfigBackup(genericPaths);
+        var throwingLogs = new FakeEventLogStore
+        {
+            ExistsResult = true,
+            ClearException = new UnauthorizedAccessException(@"Access denied for C:\Services\AIRouterProxy"),
+        };
+        var genericSvc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            genericPaths,
+            genericBackups,
+            new ReloadConfirmer(genericBackups),
+            new KeyMetaStore(genericPaths),
+            new AuditLog(genericPaths),
+            new ActivityStore(),
+            throwingLogs,
+            new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance);
+
+        var denied = genericSvc.ClearEventLog(adminKey);
+        const string expected = "Could not clear the Windows Event Log - it may require elevated rights or be in use.";
+        CheckTrue("logs-eventlog: failure message is exactly the generic one", () => denied.Message == expected);
+        CheckTrue("logs-eventlog: failure leaks no exception detail", () =>
+            !SafeText(denied).Contains("Access denied", StringComparison.OrdinalIgnoreCase)
+            && !SafeText(denied).Contains(@"C:\Services", StringComparison.OrdinalIgnoreCase)
+            && !SafeText(denied).Contains("UnauthorizedAccess", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // --------------------------------------------------------------
+    // Log clearing safety (review fix M6): the destructive clears touch ONLY
+    // the in-memory activity buffer and the (fake) Event Log. The audit trail
+    // and the config files/backups are never deleted or modified - they are
+    // not clearable through this surface.
+    // --------------------------------------------------------------
+    static void TestLogClearingSafety()
+    {
+        var adminKey = "admin-primary-key";
+        var (svc, root, cfg, store, eventLogs) = MakeServiceWithStore(NewOptions());
+
+        // Pre-existing audit trail (sentinel line) + a config file with a backup.
+        var dataDir = Path.Combine(root, "data");
+        Directory.CreateDirectory(dataDir);
+        var auditPath = Path.Combine(dataDir, "audit.log");
+        const string sentinel = "{\"ts\":\"sentinel\",\"action\":\"pre-existing\"}";
+        File.WriteAllText(auditPath, sentinel + Environment.NewLine);
+
+        var routesPath = Path.Combine(cfg, "routes.json");
+        const string routesContent = "{\"Proxy\":{\"Routes\":[]}}";
+        File.WriteAllText(routesPath, routesContent);
+
+        var backups = new ConfigBackup(new DashboardPaths(root, root, dataDir));
+        var created = backups.Backup(cfg, "routes.json");
+        CheckTrue("logs-safety: routes.json backup created", () => created.Count == 1 && File.Exists(created[0]));
+
+        store.Add(new ActivityEntry { Timestamp = DateTimeOffset.UtcNow, Client = "test", Method = "GET", Path = "/one", Status = 200 });
+        eventLogs.ExistsResult = true;
+        eventLogs.CountResult = 5;
+
+        var activity = svc.ClearActivityLog(adminKey);
+        var eventLog = svc.ClearEventLog(adminKey);
+        CheckTrue("logs-safety: both clears succeed", () => activity.Ok && eventLog.Ok);
+        CheckTrue("logs-safety: activity buffer emptied", () => store.Count == 0);
+        CheckTrue("logs-safety: event log cleared", () => eventLogs.ClearCalls == 1);
+
+        // Nothing besides the logs: audit trail keeps its pre-existing line, routes.json
+        // keeps its exact content and the backup survives.
+        CheckTrue("logs-safety: audit trail keeps the pre-existing line", () =>
+            File.Exists(auditPath) && File.ReadAllText(auditPath).Contains(sentinel, StringComparison.Ordinal));
+        CheckTrue("logs-safety: routes.json is untouched", () =>
+            File.Exists(routesPath) && File.ReadAllText(routesPath) == routesContent);
+        CheckTrue("logs-safety: routes.json backup survives the clears", () => File.Exists(created[0]));
+
+        // Wrong key on the Event Log: rejected before any destructive call.
+        var (svc2, _, _, _, eventLogs2) = MakeServiceWithStore(NewOptions());
+        eventLogs2.ExistsResult = true;
+        eventLogs2.CountResult = 5;
+        var wrong = svc2.ClearEventLog("wrong-key");
+        CheckTrue("logs-safety: wrong key rejected for the event log", () =>
+            !wrong.Ok && wrong.ErrorType == AdminResult.TypeAuthentication);
+        CheckTrue("logs-safety: wrong key never calls the event log", () => eventLogs2.ClearCalls == 0);
+        CheckTrue("logs-safety: wrong key never touches the log at all", () => eventLogs2.ExistsCalls == 0);
+
+        // A failing Count is stat-only: the clear must still happen, message without a count.
+        var (svc3, _, _, _, eventLogs3) = MakeServiceWithStore(NewOptions());
+        eventLogs3.ExistsResult = true;
+        eventLogs3.ThrowOnCount = true;
+        var countFailed = svc3.ClearEventLog(adminKey);
+        CheckTrue("logs-safety: failing count does not abort the clear", () =>
+            countFailed.Ok && eventLogs3.ClearCalls == 1);
+        CheckTrue("logs-safety: message omits the count when it is unknown", () =>
+            !countFailed.Message.Contains("entries", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // --------------------------------------------------------------
+    // Log clearing with a broken logging provider (review N-A/N-B): in
+    // production the only logging provider is the Event Log being cleared,
+    // so a LogWarning can itself throw (log full/removed/source
+    // unregistered). That warning must never escape and mask the failure.
+    // --------------------------------------------------------------
+    static void TestLogClearingLoggingFailure()
+    {
+        var adminKey = "admin-primary-key";
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var svc = new DashboardAdminService(
+            new TestOptionsMonitor<ProxyOptions>(NewOptions()),
+            paths,
+            backups,
+            new ReloadConfirmer(backups),
+            new KeyMetaStore(paths),
+            new AuditLog(paths),
+            new ActivityStore(),
+            new FakeEventLogStore { ExistsResult = true, ThrowOnClear = true },
+            new DetectionStore(),
+            new ThrowingLogger());
+
+        AdminResult? result = null;
+        CheckTrue("logs-logger: a throwing LogWarning never escapes", () =>
+        {
+            try
+            {
+                result = svc.ClearEventLog(adminKey);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        });
+        CheckTrue("logs-logger: failure is still internal", () =>
+            result is not null && !result.Ok && result.ErrorType == AdminResult.TypeInternal);
+        CheckTrue("logs-logger: generic message is preserved", () =>
+            result is not null
+            && result.Message == "Could not clear the Windows Event Log - it may require elevated rights or be in use.");
+    }
+
     private static ProxyOptions NewOptions()
         => new()
         {
@@ -1401,5 +2209,82 @@ sealed class FailingRestorer : ConfigBackup
     {
         Attempted.Add(fileName);
         throw new IOException("simulated locked config file");
+    }
+}
+
+/// <summary>
+/// In-memory IEventLogStore fake: never touches the machine's real Windows Event Log.
+/// Lets the log-clearing tests drive exists/count/clear outcomes deterministically.
+/// </summary>
+sealed class FakeEventLogStore : IEventLogStore
+{
+    public bool ExistsResult { get; set; }
+    public int CountResult { get; set; }
+    public bool ThrowOnCount { get; set; }
+    public bool ThrowOnClear { get; set; }
+
+    /// <summary>When set, Clear throws this instance instead of the generic simulated failure.</summary>
+    public Exception? ClearException { get; set; }
+    public int ExistsCalls { get; private set; }
+    public int ClearCalls { get; private set; }
+    public string? LastClearedLog { get; private set; }
+
+    public bool Exists(string logName)
+    {
+        ExistsCalls++;
+        return ExistsResult;
+    }
+
+    public int Count(string logName)
+        => ThrowOnCount ? throw new InvalidOperationException("simulated count failure") : CountResult;
+
+    public void Clear(string logName)
+    {
+        ClearCalls++;
+        LastClearedLog = logName;
+        if (ClearException is not null)
+        {
+            throw ClearException;
+        }
+
+        if (ThrowOnClear)
+        {
+            throw new InvalidOperationException("simulated event log failure");
+        }
+    }
+}
+
+/// <summary>
+/// ILogger fake whose LogWarning throws, mirroring the production hazard: the only
+/// logging provider is the Event Log being cleared, and EventLog.WriteEntry throws
+/// when the log is full, removed or its source unregistered. All other levels no-op.
+/// </summary>
+sealed class ThrowingLogger : ILogger<DashboardAdminService>
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+
+    public bool IsEnabled(LogLevel logLevel) => true;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (logLevel == LogLevel.Warning)
+        {
+            throw new InvalidOperationException("logger down");
+        }
+    }
+}
+
+/// <summary>No-op scope returned by <see cref="ThrowingLogger"/>.</summary>
+sealed class NullScope : IDisposable
+{
+    public static readonly NullScope Instance = new();
+
+    public void Dispose()
+    {
     }
 }

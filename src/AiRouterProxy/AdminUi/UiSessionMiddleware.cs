@@ -7,8 +7,14 @@ namespace AiRouterProxy.AdminUi;
 
 /// <summary>
 /// Issues and validates the dashboard UI session cookie. The token is an HMAC over
-/// (expiry | fingerprint of the current primary local key), signed with an ephemeral
-/// per-process key: rotating the local key or restarting the service invalidates sessions.
+/// (expiry | fingerprint of the current primary local key), signed with a key derived from the
+/// configured keys: a restart keeps sessions alive while any key is configured (the primary
+/// local key, or the multi-key list when there is no primary), and rotating the key(s) always
+/// invalidates them. With no key configured at all the signing key is ephemeral (sessions do
+/// not survive a restart) - a fixed constant there would let anyone forge a cookie.
+/// The multi-key and ephemeral branches are defense-in-depth: today the host refuses to start
+/// without LocalKey and the login form only accepts the primary key, so in production the
+/// derivation always uses the primary.
 /// Nothing sensitive is ever written to the cookie.
 /// </summary>
 public sealed class UiSessionManager
@@ -16,8 +22,11 @@ public sealed class UiSessionManager
     public const string CookieName = "airproxy_ui";
     private static readonly TimeSpan Lifetime = TimeSpan.FromHours(12);
 
-    private readonly byte[] _signingKey = RandomNumberGenerator.GetBytes(32);
     private readonly IOptionsMonitor<ProxyOptions> _options;
+
+    // Last resort only (no key configured at all): never reuse a constant across processes.
+    private readonly Lazy<byte[]> _ephemeralSigningKey =
+        new(() => RandomNumberGenerator.GetBytes(32));
 
     public UiSessionManager(IOptionsMonitor<ProxyOptions> options) => _options = options;
 
@@ -73,9 +82,44 @@ public sealed class UiSessionManager
         IsEssential = true,
     };
 
+    /// <summary>
+    /// Session signing key. Derived from the primary local key; when there is none, from the
+    /// configured multi-keys (order-insensitive) so a restart keeps sessions alive while the
+    /// keys stay the same. With no key configured at all it falls back to an ephemeral
+    /// per-instance key: predictable material there would allow forging a session cookie
+    /// without knowing any key.
+    /// </summary>
+    private byte[] SigningKey()
+    {
+        var primary = _options.CurrentValue.Keys.LocalKey;
+        if (!string.IsNullOrEmpty(primary))
+        {
+            return SHA256.HashData(Encoding.UTF8.GetBytes("airproxy-ui-session|" + primary));
+        }
+
+        // No primary key: derive from the configured multi-keys (stable, still secret) so the
+        // session survives a restart without ever falling back to a predictable constant.
+        var multi = _options.CurrentValue.Keys.LocalKeys;
+        if (multi is { Count: > 0 })
+        {
+            var material = string.Join('\n', multi
+                .Where(k => !string.IsNullOrEmpty(k))
+                .OrderBy(k => k, StringComparer.Ordinal)
+                .Select(k => $"{k.Length}:{k}"));
+            if (material.Length > 0)
+            {
+                return SHA256.HashData(Encoding.UTF8.GetBytes("airproxy-ui-session|multi|" + material));
+            }
+        }
+
+        // No key configured at all: ephemeral key. Sessions then do NOT survive a restart,
+        // but a known-constant signing key would allow forgery - security wins.
+        return _ephemeralSigningKey.Value;
+    }
+
     private string Sign(string payload)
     {
-        var mac = HMACSHA256.HashData(_signingKey, Encoding.UTF8.GetBytes(payload));
+        var mac = HMACSHA256.HashData(SigningKey(), Encoding.UTF8.GetBytes(payload));
         return ToUrlSafe(Convert.ToBase64String(mac));
     }
 
@@ -168,6 +212,14 @@ public sealed class UiSessionMiddleware
             return;
         }
 
+        // Blazor circuit endpoints (negotiate / WebSocket / disconnect) must fail fast with 401.
+        // A 302 to the HTML login page makes the client's reconnect loop hang forever.
+        if (IsBlazorCircuit(path))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            return;
+        }
+
         // Public static assets (css/js/images/icons) hold no data and must keep
         // working without a session, otherwise the login page renders unstyled.
         if (IsPublicStaticAsset(path))
@@ -177,7 +229,8 @@ public sealed class UiSessionMiddleware
         }
 
         // The login page itself must render without a session.
-        if (path.StartsWith('/') && path.StartsWith("/login", StringComparison.Ordinal))
+        if (path.Equals("/login", StringComparison.Ordinal)
+            || path.StartsWith("/login/", StringComparison.Ordinal))
         {
             await _next(context);
             return;
@@ -236,6 +289,11 @@ public sealed class UiSessionMiddleware
         var ext = Path.GetExtension(path);
         return ext.Length > 0 && PublicStaticExtensions.Contains(ext);
     }
+
+    /// <summary>Blazor circuit endpoints: "/_blazor" and everything under "/_blazor/".</summary>
+    private static bool IsBlazorCircuit(string path)
+        => path.Equals("/_blazor", StringComparison.OrdinalIgnoreCase)
+           || path.StartsWith("/_blazor/", StringComparison.OrdinalIgnoreCase);
 
     private static void RedirectTo(HttpContext context, string location)
     {

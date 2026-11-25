@@ -120,6 +120,29 @@ public sealed class RedactionOptions
     /// Empty = current behavior (no exemptions).
     /// </summary>
     public List<string> Allow { get; set; } = new();
+
+    /// <summary>
+    /// Detection forensics (metadata only, in memory, off by default). Records WHERE and
+    /// WHICH layer fired - never the value (see <see cref="ForensicsOptions"/>).
+    /// </summary>
+    public ForensicsOptions Forensics { get; set; } = new();
+}
+
+/// <summary>
+/// Detection forensics: keeps an in-memory ring buffer of detection metadata (JSON path,
+/// layer, kind, length, process-local fingerprint) so the dashboard can show where
+/// redaction fires. Off by default; nothing is written to disk.
+/// </summary>
+public sealed class ForensicsOptions
+{
+    /// <summary>Turns metadata collection on/off (default: off - zero cost on the hot path).</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>
+    /// Ring buffer size. Configured range 10..1000 (enforced by SecurityValidator and
+    /// clamped at use); default 200.
+    /// </summary>
+    public int Capacity { get; set; } = 200;
 }
 
 /// <summary>

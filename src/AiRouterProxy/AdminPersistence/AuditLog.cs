@@ -16,6 +16,10 @@ public sealed class AuditLog
 
     private readonly DashboardPaths _paths;
 
+    // File.AppendAllText is not concurrency-safe; the service is a singleton and the
+    // log-clearing methods append outside its config write lock.
+    private readonly object _gate = new();
+
     public AuditLog(DashboardPaths paths) => _paths = paths;
 
     /// <summary>Appends one audit entry. <paramref name="actorHash"/> is a key fingerprint, never a value.</summary>
@@ -30,12 +34,15 @@ public sealed class AuditLog
             actor = actorHash ?? "-",
         });
 
-        var directory = Path.GetDirectoryName(_paths.AuditLogPath);
-        if (!string.IsNullOrEmpty(directory))
+        lock (_gate)
         {
-            Directory.CreateDirectory(directory);
-        }
+            var directory = Path.GetDirectoryName(_paths.AuditLogPath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
 
-        File.AppendAllText(_paths.AuditLogPath, line + Environment.NewLine, Utf8NoBom);
+            File.AppendAllText(_paths.AuditLogPath, line + Environment.NewLine, Utf8NoBom);
+        }
     }
 }

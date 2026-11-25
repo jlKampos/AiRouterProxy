@@ -4,8 +4,8 @@
 {
     @if (r.Ok)
     {
-        <div class="note good">
-            <b>Config applied.</b> @r.Message
+        <div class="note good" role="alert">
+            <b>@Title</b> @r.Message
             @if (r.Warnings is { Length: > 0 })
             {
                 <ul class="banner-list">
@@ -19,7 +19,7 @@
     }
     else
     {
-        <div class="note error">
+        <div class="note error" role="alert">
             <b>Operation failed.</b> @r.Message
             @if (r.Restored)
             {
@@ -40,4 +40,5 @@
 
 @code {
     [Parameter] public AdminResult? Result { get; set; }
+    [Parameter] public string Title { get; set; } = "Config applied.";
 }

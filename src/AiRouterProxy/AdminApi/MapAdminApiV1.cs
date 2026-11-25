@@ -169,6 +169,11 @@ public static class MapAdminApiV1Extensions
                         entropyThreshold = s.Redaction.Detect.EntropyThreshold,
                     },
                     allow = s.Redaction.Allow,
+                    forensics = new
+                    {
+                        enabled = s.Redaction.Forensics.Enabled,
+                        capacity = s.Redaction.Forensics.Capacity,
+                    },
                 },
                 inspection = new
                 {
@@ -197,6 +202,38 @@ public static class MapAdminApiV1Extensions
             // ones, so a single-section body never blanks the other section.
             return Respond(svc.ApplySecurity(body.redaction, body.inspection, Bearer(ctx)), ctx);
         });
+
+        // Detection forensics (in memory, metadata only): where/which layer fired - never the value.
+        app.MapGet("/admin/api/v1/detections", (IDashboardFacade facade, int limit = 50) =>
+        {
+            limit = Math.Clamp(limit, 1, 200);
+            var rows = facade.GetDetections(limit);
+            return Results.Ok(new
+            {
+                count = rows.Count,
+                detections = rows.Select(d => new
+                {
+                    timestamp = d.Timestamp,
+                    requestId = d.RequestId,
+                    client = d.Client,
+                    route = d.Route,
+                    method = d.Method,
+                    path = d.Path,
+                    model = d.Model,
+                    jsonPath = d.JsonPath,
+                    layer = d.Layer,
+                    kind = d.Kind,
+                    length = d.Length,
+                    fingerprint = d.Fingerprint,
+                    name = d.Name,
+                    sep = d.Sep,
+                    quote = d.Quote,
+                }),
+            });
+        });
+
+        app.MapDelete("/admin/api/v1/detections", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearDetections(Bearer(ctx)), ctx));
 
         app.MapPost("/admin/api/v1/keys/lookup", async (HttpContext ctx, IOptionsMonitor<ProxyOptions> optsMonitor, KeyMetaStore metaStore) =>
         {
@@ -308,6 +345,28 @@ public static class MapAdminApiV1Extensions
                 restored = result.Restored,
                 message = result.Message,
             });
+        });
+
+        app.MapDelete("/admin/api/v1/logs/activity", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearActivityLog(Bearer(ctx)), ctx));
+
+        app.MapDelete("/admin/api/v1/logs/eventlog", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearEventLog(Bearer(ctx)), ctx));
+
+        // Legacy aliases kept for compatibility - they now go through the audited service path.
+        app.MapDelete("/admin/activity", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearActivityLog(Bearer(ctx)), ctx));
+
+        app.MapDelete("/admin/logs", (IDashboardAdminService svc, HttpContext ctx) =>
+        {
+            var key = Bearer(ctx);
+            // Preserve the historical semantics: clear BOTH the Event Log and the in-memory
+            // activity buffer (both attempted, like the previous hand-written handler).
+            var eventLog = svc.ClearEventLog(key);
+            var activity = svc.ClearActivityLog(key);
+            if (!eventLog.Ok) return Respond(eventLog, ctx);
+            if (!activity.Ok) return Respond(activity, ctx);
+            return Respond(AdminResult.Success($"{eventLog.Message} {activity.Message}"), ctx);
         });
 
         return app;

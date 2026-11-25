@@ -8,51 +8,115 @@ retryButton.addEventListener("click", retry);
 const resumeButton = document.getElementById("components-resume-button");
 resumeButton.addEventListener("click", resume);
 
+// After a definitive failure the circuit is gone: give the user a short window to press
+// Retry, then reload instead of leaving the dialog stuck forever (F5 by hand).
+const AUTO_RELOAD_MS = 10000;
+// Reload cap: a circuit that dies right after every load would otherwise loop forever
+// ("loads, dies, reloads..."). Three reloads inside a minute, then stop reloading and leave
+// the decision to the user (the Retry button stays available).
+const AUTO_RELOAD_MAX = 3;
+const RELOAD_WINDOW_MS = 60000;
+const RELOAD_STATE_KEY = "airproxy-reconnect-reloads";
+
+let autoReloadHandle = null;
+
+function scheduleAutoReload() {
+    cancelAutoReload();
+    autoReloadHandle = setTimeout(() => reloadWithCap(), AUTO_RELOAD_MS);
+}
+
+function cancelAutoReload() {
+    if (autoReloadHandle !== null) {
+        clearTimeout(autoReloadHandle);
+        autoReloadHandle = null;
+    }
+}
+
+function reloadWithCap() {
+    let count = 0;
+    let ts = 0;
+    try {
+        const raw = sessionStorage.getItem(RELOAD_STATE_KEY);
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            // Number() coercion, no bitwise ops: int32 coercion truncated Date.now() (~1.8e12),
+            // which reset the counter on every call and defeated the reload cap.
+            count = Number(parsed.count);
+            ts = Number(parsed.ts);
+            if (!Number.isFinite(count)) { count = 0; }
+            if (!Number.isFinite(ts)) { ts = 0; }
+        }
+    } catch { /* storage unavailable: fall through with count 0 */ }
+
+    // A reload more than a minute ago is a different incident: start counting again.
+    if (Date.now() - ts > RELOAD_WINDOW_MS) { count = 0; }
+
+    if (count >= AUTO_RELOAD_MAX) {
+        // Stop reloading and leave the Retry button to the user.
+        return false;
+    }
+
+    try { sessionStorage.setItem(RELOAD_STATE_KEY, JSON.stringify({ count: count + 1, ts: Date.now() })); } catch { }
+    location.reload();
+    return true;
+}
+
 function handleReconnectStateChanged(event) {
     if (event.detail.state === "show") {
         reconnectModal.showModal();
     } else if (event.detail.state === "hide") {
+        cancelAutoReload();
+        document.removeEventListener("visibilitychange", retryWhenDocumentBecomesVisible);
         reconnectModal.close();
     } else if (event.detail.state === "failed") {
+        scheduleAutoReload();
         document.addEventListener("visibilitychange", retryWhenDocumentBecomesVisible);
     } else if (event.detail.state === "rejected") {
-        location.reload();
+        reloadWithCap();
     }
 }
 
 async function retry() {
+    cancelAutoReload();
     document.removeEventListener("visibilitychange", retryWhenDocumentBecomesVisible);
 
     try {
-        // Reconnect will asynchronously return:
-        // - true to mean success
-        // - false to mean we reached the server, but it rejected the connection (e.g., unknown circuit ID)
-        // - exception to mean we didn't reach the server (this can be sync or async)
         const successful = await Blazor.reconnect();
         if (!successful) {
-            // We have been able to reach the server, but the circuit is no longer available.
-            // We'll reload the page so the user can continue using the app as quickly as possible.
-            const resumeSuccessful = await Blazor.resumeCircuit();
-            if (!resumeSuccessful) {
-                location.reload();
+            const resumed = await tryResumeCircuit();
+            if (!resumed) {
+                reloadWithCap();
             } else {
                 reconnectModal.close();
             }
         }
     } catch (err) {
-        // We got an exception, server is currently unavailable
+        // Server unreachable: try again when the tab becomes visible, but never hang.
+        scheduleAutoReload();
         document.addEventListener("visibilitychange", retryWhenDocumentBecomesVisible);
     }
 }
 
-async function resume() {
+async function tryResumeCircuit() {
+    // resumeCircuit only exists when circuit pause/resume is supported; a missing or
+    // throwing implementation must not block the reload fallback.
+    if (typeof Blazor === "undefined" || typeof Blazor.resumeCircuit !== "function") {
+        return false;
+    }
     try {
-        const successful = await Blazor.resumeCircuit();
-        if (!successful) {
-            location.reload();
-        }
+        return await Blazor.resumeCircuit();
     } catch {
-        reconnectModal.classList.replace("components-reconnect-paused", "components-reconnect-resume-failed");
+        return false;
+    }
+}
+
+async function resume() {
+    cancelAutoReload();
+    document.removeEventListener("visibilitychange", retryWhenDocumentBecomesVisible);
+
+    const resumed = await tryResumeCircuit();
+    if (!resumed) {
+        reloadWithCap();
     }
 }
 

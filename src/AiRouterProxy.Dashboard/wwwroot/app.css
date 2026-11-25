@@ -363,3 +363,16 @@ table.editable tbody td input.cell-input, table.editable tbody td select.cell-in
   .modal { padding: 20px 16px; }
 }
 /* cache-bust r4: admin write phase CSS */
+
+/* ---------- activity / logs page ---------- */
+.log-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.log-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 4px 0 10px; }
+.log-toolbar .filters { margin-bottom: 0; }
+.log-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+.pager .filters { margin-bottom: 0; }
+.pager .form-line { margin: 0; }
+details.note summary { cursor: pointer; font-weight: 700; color: var(--text); }
+details.note[open] summary { margin-bottom: 10px; }
+.tbl-wrap.tall { max-height: 60vh; overflow: auto; }
+.tbl-wrap.tall thead th { position: sticky; top: 0; z-index: 2; }
