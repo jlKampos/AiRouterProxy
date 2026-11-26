@@ -1,7 +1,18 @@
+using System.Diagnostics;
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using AiRouterProxy.AdminPersistence;
+using AiRouterProxy.AdminValidation;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using AIRouterProxy;
 
 class Program
@@ -53,6 +64,24 @@ class Program
         TestInspectionPolicy();
         TestRouteHeaders();
         TestRouteMaxBodySize();
+        TestTransportStore();
+        TestBaselineStore();
+        TestTransportPolicy();
+        TestTransportClientFactory();
+        TestTransportTls();
+        TestAttestationBehaviour();
+        TestPinValidator();
+        TestEnforcePolicy();
+        TestAttestationMapper();
+        TestDriftStore();
+        TestLearnedPinStore();
+        TestAttestationRecorderPins();
+        TestEndpointProbe();
+        TestProvidersFeed();
+        TestBlocklist();
+        TestProviderMerge();
+        TestAttribution();
+        TestOriginParse();
         Console.WriteLine();
         Console.WriteLine($"RESULT: {_passed} PASS, {_failed} FAIL");
         Environment.ExitCode = _failed == 0 ? 0 : 1;
@@ -2171,5 +2200,1572 @@ class Program
         }
 
         return sb.ToString();
+    }
+
+    // --------------------------------------------------------------
+    // Transport/Endpoint attestation (Phase 1) - capture/observation only.
+    // --------------------------------------------------------------
+
+    static TransportObservation Row(string route, string ip, int seq) => new(
+        DateTimeOffset.UtcNow.AddSeconds(seq),
+        route,
+        "host.test",
+        ip,
+        443,
+        "abcd1234",
+        "abcd1234",
+        "CN=test",
+        "TLS 1.3",
+        "TLS_AES_128_GCM_SHA256",
+        null,
+        "observed");
+
+    static EndpointIdentity Identity(string route, string host, string ip, int port, string spki, string certSha, DateTimeOffset when) => new(
+        route, host, ip, port, spki, certSha, "CN=test", when.AddDays(-30), when.AddDays(30),
+        "TLS 1.3", "TLS_AES_128_GCM_SHA256", null, when, when, "learn");
+
+    static void TestTransportStore()
+    {
+        var store = new TransportStore();
+        CheckTrue("transport-store: empty at start", () => store.Count == 0);
+
+        // Clamp: capacity below the minimum (10) is raised.
+        for (var i = 1; i <= 15; i++)
+        {
+            store.Add(Row("r", "10.0.0." + i, i), capacity: 5);
+        }
+
+        CheckTrue("transport-store: capacity clamped to min 10", () => store.Count == 10);
+
+        // Newest-first reads.
+        var top = store.Recent(3);
+        CheckTrue("transport-store: newest first", () =>
+            top.Count == 3 && top[0].Ip == "10.0.0.15" && top[1].Ip == "10.0.0.14" && top[2].Ip == "10.0.0.13");
+
+        // Clamp: capacity above the maximum (1000) is lowered.
+        var big = new TransportStore();
+        for (var i = 1; i <= 1200; i++)
+        {
+            big.Add(Row("r", "10.1.0." + (i % 250 + 1), i), capacity: 1500);
+        }
+
+        CheckTrue("transport-store: capacity clamped to max 1000", () => big.Count == 1000);
+
+        CheckTrue("transport-store: null entry ignored", () => { store.Add(null!, 100); return store.Count == 10; });
+
+        var cleared = store.Clear();
+        CheckTrue("transport-store: clear returns removed count", () => cleared == 10);
+        CheckTrue("transport-store: clear empties buffer", () => store.Count == 0);
+    }
+
+    static void TestBaselineStore()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "baseline-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "data"));
+        try
+        {
+            var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+            var store = new BaselineStore(paths);
+
+            // Absent file: empty baseline, no error.
+            CheckTrue("baseline: absent file is empty", () => store.GetRoutes().Count == 0 && store.GetRoute("x") is null);
+
+            // Round-trip: record + reload from the file.
+            var now = DateTimeOffset.UtcNow;
+            store.Record(Identity("rt", "host.test", "10.0.0.5", 443, "spkiAA", "certAA", now));
+            var file = Path.Combine(root, "data", "endpoint-baseline.json");
+            CheckTrue("baseline: file written after record", () => File.Exists(file));
+
+            var reloaded = new BaselineStore(paths);
+            var rt = reloaded.GetRoute("rt");
+            CheckTrue("baseline: round-trip preserves entry", () => rt is not null && rt.Entries.Count == 1
+                && rt.Entries[0].Ip == "10.0.0.5" && rt.Entries[0].SpkiHash == "spkiAA");
+            CheckTrue("baseline: host kept", () => rt is not null && rt.Host == "host.test");
+
+            // Max 8 entries per route; the oldest (by first seen) is dropped.
+            var many = new BaselineStore(paths);
+            for (var i = 1; i <= 9; i++)
+            {
+                many.Record(Identity("many", "host.test", "10.0.0." + i, 443, "spki" + i, "cert" + i, now.AddMinutes(i)));
+            }
+
+            var manyRoute = many.GetRoute("many");
+            CheckTrue("baseline: max 8 entries per route", () => manyRoute is not null && manyRoute.Entries.Count == 8);
+            CheckTrue("baseline: oldest entry dropped", () => manyRoute is not null
+                && !manyRoute.Entries.Any(e => e.Ip == "10.0.0.1"));
+
+            // Hard 64 KB size cap: many routes x entries must never exceed it on disk -
+            // the trim runs BEFORE serializing (real round-trip to this tmp file), so the
+            // WRITTEN tree is the bounded one. Oversized cert fingerprints inflate each entry:
+            // 32 routes x 8 entries x ~450B serialized is well past the cap, forcing the trim.
+            var big = new BaselineStore(paths);
+            for (var r = 1; r <= 32; r++)
+            {
+                for (var i = 1; i <= 8; i++)
+                {
+                    big.Record(Identity("cap" + r, "host.test", "10.1." + r + "." + i, 443,
+                        "spki-cap-" + r + "-" + i, new string('C', 192) + r, now.AddDays(r)));
+                }
+            }
+
+            var bigFile = new FileInfo(file);
+            CheckTrue("baseline: file under 64 KB cap after trim", () => bigFile.Exists && bigFile.Length <= 64 * 1024);
+            var reloadedBig = new BaselineStore(paths);
+            CheckTrue("baseline: capped file still round-trips", () => reloadedBig.GetRoutes().Count > 0);
+
+            // Corrupt file: tolerated (empty baseline), never throws.
+            File.WriteAllText(file, "{ not json at all");
+            var broken = new BaselineStore(paths);
+            CheckTrue("baseline: corrupt file tolerated", () => broken.GetRoutes().Count == 0);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* cleanup only */ }
+        }
+    }
+
+    static ProxyOptions PolicyOptions()
+    {
+        var o = new ProxyOptions
+        {
+            Transport = new TransportOptions { Enabled = false },
+            Routes = new List<RouteOptions>
+            {
+                new RouteOptions { Name = "tls-route", Prefix = "/tls", Upstream = "https://endpoint.test" },
+                new RouteOptions { Name = "plain-route", Prefix = "/plain", Upstream = "https://plain.test" },
+            },
+        };
+        o.Routes[0].Transport = new RouteTransportOptions { Enabled = true };
+        return o;
+    }
+
+    static void TestTransportPolicy()
+    {
+        var opts = PolicyOptions();
+        var policyProvider = new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts));
+
+        // Per-route enabled overrides the global off default.
+        var p = policyProvider.ForRoute("tls-route");
+        CheckTrue("transport-policy: per-route enable wins", () => p is not null && p.Enabled);
+
+        // Route without a transport section + global off => disabled (null).
+        CheckTrue("transport-policy: no-policy route is null", () => policyProvider.ForRoute("plain-route") is null);
+
+        // Unknown route => null.
+        CheckTrue("transport-policy: unknown route is null", () => policyProvider.ForRoute("nope") is null);
+
+        // Global on + route without section => inherits.
+        var globalOn = PolicyOptions();
+        globalOn.Transport.Enabled = true;
+        var g = new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(globalOn));
+        CheckTrue("transport-policy: route inherits global enable", () => g.ForRoute("plain-route") is not null);
+
+        // Defaults on the resolved policy.
+        CheckTrue("transport-policy: defaults (observe/grace 7)", () => p is not null
+            && p.Enforce == "observe" && p.GraceDays == 7 && p.PoolLifetimeMinutes is null);
+
+        // Buffer capacity clamped at use.
+        globalOn.Transport.BufferCapacity = 5;
+        var gr = new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(globalOn)).ForRoute("tls-route");
+        CheckTrue("transport-policy: buffer capacity clamped", () => gr is not null && gr.BufferCapacity == TransportStore.MinCapacity);
+    }
+
+    static void TestTransportClientFactory()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "transport-factory-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "data"));
+        try
+        {
+            var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+            var opts = PolicyOptions();
+            var store = new TransportStore();
+            var baseline = new BaselineStore(paths);
+            var recorder = new AttestationRecorder(
+                new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts)),
+                new LearnedPinStore(paths),
+                new DriftStore(),
+                store,
+                baseline,
+                NullLogger<AttestationRecorder>.Instance);
+            var factory = new TransportClientFactory(
+                new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts)),
+                recorder,
+                NullLogger<TransportClientFactory>.Instance);
+
+            // Route WITHOUT an active policy -> the shared default client (no custom handler).
+            var plain = opts.Routes[1];
+            var defaultClient = factory.GetClient(plain.Name, plain, 15000);
+            CheckTrue("transport-factory: no-policy route uses default client", () => ReferenceEquals(defaultClient, factory.DefaultClient));
+            CheckTrue("transport-factory: no custom handler for no-policy route", () => factory.GetActiveHandler(plain.Name, plain) is null);
+
+            // Route WITH an active policy -> dedicated client + custom handler.
+            var tls = opts.Routes[0];
+            var custom = factory.GetClient(tls.Name, tls, 15000);
+            CheckTrue("transport-factory: policy route gets dedicated client", () => !ReferenceEquals(custom, factory.DefaultClient));
+            var handler = factory.GetActiveHandler(tls.Name, tls);
+            CheckTrue("transport-factory: policy route has custom handler", () => handler is not null);
+            CheckTrue("transport-factory: handler has connect callback", () => handler!.ConnectCallback is not null);
+
+            // Per-request deadline contract (review fix): the shared clients' Timeout is
+            // NEVER mutated per request - ProxyMiddleware owns each request's deadline
+            // via a per-request CancellationTokenSource linked to the request-abort
+            // token. Both clients therefore stay at Timeout.InfiniteTimeSpan, so two
+            // concurrent routes with different requestTimeoutMs cannot race on a shared
+            // property.
+            CheckTrue("transport-factory: default client Timeout is InfiniteTimeSpan", () => defaultClient.Timeout == Timeout.InfiniteTimeSpan);
+            CheckTrue("transport-factory: policy client Timeout is InfiniteTimeSpan", () => custom.Timeout == Timeout.InfiniteTimeSpan);
+
+            // No summary before any connection completes.
+            CheckTrue("transport-factory: no summary before first connection", () => factory.LastObservationSummary(tls.Name) is null);
+
+            // Config change (hot reload) -> fresh client for the same route name.
+            var changedRoute = new RouteOptions
+            {
+                Name = tls.Name,
+                Prefix = tls.Prefix,
+                Upstream = "https://endpoint2.test",
+                Transport = new RouteTransportOptions { Enabled = true },
+            };
+            var custom2 = factory.GetClient(tls.Name, changedRoute, 15000);
+            CheckTrue("transport-factory: config change builds a fresh client", () => !ReferenceEquals(custom, custom2));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* cleanup only */ }
+        }
+    }
+
+    static void TestTransportTls()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "transport-tls-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "data"));
+        try
+        {
+            RunTlsSuccessAsync(root).GetAwaiter().GetResult();
+            RunTlsUntrustedRejectedAsync(root).GetAwaiter().GetResult();
+            RunConnectRefusedAsync(root).GetAwaiter().GetResult();
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* cleanup only */ }
+        }
+    }
+
+    static async Task RunTlsSuccessAsync(string root)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        using var serverCert = CreateSelfSignedCert();
+        var server = Task.Run(async () =>
+        {
+            try
+            {
+                using var tcp = await listener.AcceptTcpClientAsync();
+                await using var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+                // TLS 1.2 pinned (harness only): Windows Schannel cannot use in-memory
+                // (ephemeral) RSA keys when TLS 1.3 is negotiated on loopback
+                // ("platform does not support ephemeral keys") - production is untouched.
+                await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions { ServerCertificate = serverCert, EnabledSslProtocols = SslProtocols.Tls12 });
+                var sb = new StringBuilder();
+                var buf = new byte[4096];
+                while (sb.Length <= 65536 && !sb.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+                {
+                    var n = await ssl.ReadAsync(buf);
+                    if (n == 0) break;
+                    sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+                }
+
+                var head = Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
+                await ssl.WriteAsync(head);
+                await ssl.WriteAsync(Encoding.ASCII.GetBytes("OK"));
+                await ssl.FlushAsync();
+            }
+            catch (Exception ex)
+            {
+                // Client-side failure surfaces in the test below; never crash the harness.
+                // Brief diagnostic so a server-side handshake failure is visible.
+                Console.WriteLine($"      (tls server error: {ex.GetType().Name}: {ex.Message})");
+            }
+        });
+
+        var opts = PolicyOptions();
+        var tls = opts.Routes[0];
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var store = new TransportStore();
+        var baseline = new BaselineStore(paths);
+        var recorder = new AttestationRecorder(
+            new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts)),
+            new LearnedPinStore(paths),
+            new DriftStore(),
+            store,
+            baseline,
+            NullLogger<AttestationRecorder>.Instance);
+        var factory = new TransportClientFactory(
+            new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts)),
+            recorder,
+            NullLogger<TransportClientFactory>.Instance);
+
+        var client = factory.GetClient(tls.Name, tls, 15000);
+        var handler = factory.GetActiveHandler(tls.Name, tls);
+        CheckTrue("tls: policy-active client has custom handler", () => handler is not null);
+
+        // Test-only trust: the production path keeps the default chain validation
+        // (verified by the untrusted-cert test below). TLS 1.2 pinned (harness only),
+        // matching the server - Windows Schannel cannot use in-memory (ephemeral) RSA
+        // keys with TLS 1.3 on loopback ("platform does not support ephemeral keys").
+        handler!.SslOptions.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+        handler.SslOptions.EnabledSslProtocols = SslProtocols.Tls12;
+
+        try
+        {
+            using var response = await client.GetAsync($"https://127.0.0.1:{port}/v1/attestation-check");
+            var text = await response.Content.ReadAsStringAsync();
+            CheckTrue("tls: successful round-trip", () => (int)response.StatusCode == 200 && text == "OK");
+        }
+        catch (Exception ex)
+        {
+            Check("tls: successful round-trip", false);
+            var ie = ex.InnerException;
+            Console.WriteLine($"      (tls round-trip error: {ex.GetType().Name}: {ex.Message}"
+                + (ie is null ? "" : $" | inner: {ie.GetType().Name}: {ie.Message}") + ")");
+        }
+
+        await server;
+        listener.Stop();
+
+        var entry = baseline.GetRoute(tls.Name)?.Entries.FirstOrDefault();
+        CheckTrue("tls: baseline entry recorded", () => entry is not null);
+        if (entry is not null)
+        {
+            CheckTrue("tls: ip is loopback", () => IsLoopbackIp(entry!.Ip));
+            CheckTrue("tls: port is the server port", () => entry!.Port == port);
+            var spki = serverCert.PublicKey.ExportSubjectPublicKeyInfo();
+            CheckTrue("tls: spki hash matches server cert",
+                () => entry!.SpkiHash == TransportHashes.Sha256Base64Url(spki));
+            CheckTrue("tls: cert sha256 matches server cert",
+                () => entry!.CertSha256 == serverCert.GetCertHashString(HashAlgorithmName.SHA256));
+            CheckTrue("tls: issuer coherent", () => entry!.Issuer == serverCert.Issuer);
+            CheckTrue("tls: validity coherent", () => entry!.NotBefore <= entry!.NotAfter);
+            CheckTrue("tls: tls version >= 1.2",
+                () => entry!.TlsVersion == "TLS 1.2" || entry!.TlsVersion == "TLS 1.3");
+            CheckTrue("tls: source is learn", () => entry!.Source == "learn");
+        }
+
+        var summary = factory.LastObservationSummary(tls.Name);
+        CheckTrue("tls: activity summary present", () => summary is not null
+            && summary!.Contains("tls=")
+            && (summary.Contains("ip=127.0.0.1") || summary.Contains("ip=::ffff:127.0.0.1") || summary.Contains("ip=::1")));
+
+        var recent = store.Recent(5).FirstOrDefault(o => o.Route == tls.Name);
+        CheckTrue("tls: ring observation recorded", () => recent is not null && IsLoopbackIp(recent.Ip));
+    }
+
+    static async Task RunTlsUntrustedRejectedAsync(string root)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        using var serverCert = CreateSelfSignedCert();
+        var server = Task.Run(async () =>
+        {
+            try
+            {
+                using var tcp = await listener.AcceptTcpClientAsync();
+                await using var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+                try
+                {
+                    await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions { ServerCertificate = serverCert, EnabledSslProtocols = SslProtocols.Tls12 });
+                    var buf = new byte[1024];
+                    while (await ssl.ReadAsync(buf) > 0) { }
+                }
+                catch
+                {
+                    // The client aborts the handshake - expected here.
+                }
+            }
+            catch
+            {
+                // Listener may be stopped before accept - fine.
+            }
+        });
+
+        var opts = PolicyOptions();
+        var tls = opts.Routes[0];
+        // Separate data dir from the success test: a baseline entry written by
+        // RunTlsSuccessAsync would otherwise be visible here and trip
+        // "failed handshake writes no baseline entry".
+        var untrustedData = Path.Combine(root, "data-untrusted");
+        Directory.CreateDirectory(untrustedData);
+        var paths = new DashboardPaths(root, root, untrustedData);
+        var store = new TransportStore();
+        var baseline = new BaselineStore(paths);
+        var recorder = new AttestationRecorder(
+            new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts)),
+            new LearnedPinStore(paths),
+            new DriftStore(),
+            store,
+            baseline,
+            NullLogger<AttestationRecorder>.Instance);
+        var factory = new TransportClientFactory(
+            new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts)),
+            recorder,
+            NullLogger<TransportClientFactory>.Instance);
+
+        var client = factory.GetClient(tls.Name, tls, 15000);
+        var handler = factory.GetActiveHandler(tls.Name, tls);
+        // NOTE: no trust-all callback here - the DEFAULT validation must reject the
+        // self-signed cert exactly like the pre-attestation pipeline. (TLS 1.2 pinned on
+        // the harness like the success test - the ephemeral-key abort is a server-side
+        // loopback limitation, irrelevant to what this test exercises.)
+        handler!.SslOptions.EnabledSslProtocols = SslProtocols.Tls12;
+
+        var rejected = false;
+        try
+        {
+            using var response = await client.GetAsync($"https://127.0.0.1:{port}/v1/check");
+            _ = response.StatusCode; // if it arrives, validation was bypassed -> failure
+        }
+        catch (HttpRequestException)
+        {
+            rejected = true;
+        }
+        catch (AuthenticationException)
+        {
+            rejected = true;
+        }
+        catch (IOException)
+        {
+            rejected = true;
+        }
+
+        CheckTrue("tls: untrusted cert rejected (default validation)", () => rejected);
+        CheckTrue("tls: failed handshake records nothing", () => store.Recent(5).Count == 0);
+        CheckTrue("tls: failed handshake writes no baseline entry", () => baseline.GetRoute(tls.Name) is null);
+
+        listener.Stop();
+        _ = server; // tolerated - never observed.
+    }
+
+    // --------------------------------------------------------------
+    // Review fixes, end to end over a real local socket: the "block" flow (route with
+    // enforce=block) and the plain-http upstream regression. The middleware is NOT
+    // linked into this harness - the 526 WIRE mapping lives in the integration harness;
+    // here we validate the exact exception shape the middleware's generic catch maps
+    // (wrapped AttestationException, via TransportErrorMapper) plus the ConnectTelemetry
+    // disposal fix (server-side EOF proves the stream/socket were released, not leaked).
+    // --------------------------------------------------------------
+
+    static void TestAttestationBehaviour()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "attestation-behaviour-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "data"));
+        try
+        {
+            RunBlock526Async(root).GetAwaiter().GetResult();
+            RunPlainHttpRoundTripAsync(root).GetAwaiter().GetResult();
+            RunPerRequestTimeoutAsync(root).GetAwaiter().GetResult();
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* cleanup only */ }
+        }
+    }
+
+    static async Task RunBlock526Async(string root)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        using var serverCert = CreateSelfSignedCert();
+        var eofObserved = false;
+        var server = Task.Run(async () =>
+        {
+            try
+            {
+                using var tcp = await listener.AcceptTcpClientAsync();
+                await using var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+                await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                {
+                    ServerCertificate = serverCert,
+                    EnabledSslProtocols = SslProtocols.Tls12,
+                });
+                // The client aborts right after the handshake (block verdict). If the
+                // ConnectCallback leaked the stream, this read would hang -> EOF is the
+                // measurable "no leak" assertion below.
+                var buf = new byte[1024];
+                while (await ssl.ReadAsync(buf) > 0) { }
+                eofObserved = true;
+            }
+            catch
+            {
+                // Handshake may abort too; the leak assertion is about the client side.
+            }
+        });
+
+        // enforce=block whose expected IPs exclude the loopback: the observed endpoint
+        // gets severity HIGH via "unexpected-ip" regardless of grace (a brand-new
+        // endpoint would otherwise be low/grace and only warn), so the block is
+        // deterministic on the very first connection.
+        var opts = new ProxyOptions
+        {
+            Transport = new TransportOptions { Enabled = false },
+            Routes = new List<RouteOptions>
+            {
+                new RouteOptions { Name = "block-route", Prefix = "/block", Upstream = "https://blocked.test" },
+            },
+        };
+        opts.Routes[0].Transport = new RouteTransportOptions
+        {
+            Enabled = true,
+            Enforce = "block",
+            ExpectedIps = new List<string> { "10.99.0.0/16" },
+        };
+
+        var monitor = new TestOptionsMonitor<ProxyOptions>(opts);
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var store = new TransportStore();
+        var baseline = new BaselineStore(paths);
+        var recorder = new AttestationRecorder(
+            new TransportPolicyProvider(monitor),
+            new LearnedPinStore(paths),
+            new DriftStore(),
+            store,
+            baseline,
+            NullLogger<AttestationRecorder>.Instance);
+        var factory = new TransportClientFactory(
+            new TransportPolicyProvider(monitor),
+            recorder,
+            NullLogger<TransportClientFactory>.Instance);
+
+        var route = opts.Routes[0];
+        var client = factory.GetClient(route.Name, route, 15000);
+        var handler = factory.GetActiveHandler(route.Name, route);
+        CheckTrue("526: block route gets a custom attested handler", () => handler is not null);
+        // Harness trust + TLS 1.2 like the other local-TLS tests (Schannel loopback quirk).
+        handler!.SslOptions.RemoteCertificateValidationCallback = (_, _, _, _) => true;
+        handler.SslOptions.EnabledSslProtocols = SslProtocols.Tls12;
+
+        // The client must NOT receive a stream: GetAsync throws HttpRequestException
+        // wrapping the AttestationException thrown by the ConnectCallback - exactly the
+        // shape the middleware's generic catch maps to 526 (validated via the mapper).
+        Exception? clientEx = null;
+        try
+        {
+            using var response = await client.GetAsync($"https://127.0.0.1:{port}/v1/block-check");
+            _ = response.StatusCode; // a response at all means the block was bypassed
+        }
+        catch (Exception ex)
+        {
+            clientEx = ex;
+        }
+
+        // Bounded wait for the server-side EOF: a leaked socket keeps this read open.
+        // The client disposes the stream chain on the block path (ConnectTelemetry fix),
+        // so the server must observe EOF promptly.
+        await Task.WhenAny(server, Task.Delay(TimeSpan.FromSeconds(8)));
+        listener.Stop();
+
+        CheckTrue("526: wrapped AttestationException surfaces (SocketsHttpHandler wrap)", () =>
+            TransportErrorMapper.TryGetAttestation(clientEx, out var a)
+            && a is not null && a!.Route == "block-route");
+        CheckTrue("526: unexpected endpoint still recorded for review/accept", () => baseline.GetRoute("block-route") is not null);
+        CheckTrue("526: last enforcement header is block", () => factory.LastEnforcementHeader("block-route") == "block");
+        CheckTrue("526: no socket leak - server observed EOF (client disposed)", () => eofObserved);
+        // No unconditional `await server` here: when the leak assertion above FAILS the
+        // server read never completes, so awaiting it would hang the harness instead of
+        // reporting the failure. The bounded wait above already covered the probe.
+    }
+
+    /// <summary>
+    /// Plain-http upstream regression: attestation is a TLS concept, so an http://
+    /// upstream must NEVER get the attested ConnectCallback (installing it would force a
+    /// TLS handshake and 502 the route). The factory keeps the shared default client and
+    /// no custom handler; the round trip succeeds over plain http; no TLS observation is
+    /// ever recorded (summary + enforcement header stay null).
+    /// </summary>
+    static async Task RunPlainHttpRoundTripAsync(string root)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        var server = Task.Run(async () =>
+        {
+            try
+            {
+                using var tcp = await listener.AcceptTcpClientAsync();
+                using var stream = tcp.GetStream();
+                var sb = new StringBuilder();
+                var buf = new byte[4096];
+                while (sb.Length <= 65536 && !sb.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+                {
+                    var n = await stream.ReadAsync(buf);
+                    if (n == 0) break;
+                    sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+                }
+
+                var head = Encoding.ASCII.GetBytes(
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
+                await stream.WriteAsync(head);
+                await stream.WriteAsync(Encoding.ASCII.GetBytes("OK"));
+                await stream.FlushAsync();
+            }
+            catch
+            {
+                // Client-side failure surfaces in the test below; never crash the harness.
+            }
+        });
+
+        // A real transport policy (enforce + pins) configured on an http:// upstream:
+        // the guard must still skip the attested callback because UsesHttpsUpstream is
+        // false. This is the exact config that used to 502-ify before the review fix.
+        var opts = new ProxyOptions
+        {
+            Transport = new TransportOptions { Enabled = false },
+            Routes = new List<RouteOptions>
+            {
+                new RouteOptions { Name = "plain-http", Prefix = "/plain", Upstream = $"http://127.0.0.1:{port}" },
+            },
+        };
+        opts.Routes[0].Transport = new RouteTransportOptions
+        {
+            Enabled = true,
+            Enforce = "block",
+            ExpectedIps = new List<string> { "10.99.0.0/16" },
+            Pins = new List<string> { "spki://sha256/" + new string('A', 44) },
+        };
+
+        var monitor = new TestOptionsMonitor<ProxyOptions>(opts);
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var store = new TransportStore();
+        var baseline = new BaselineStore(paths);
+        var recorder = new AttestationRecorder(
+            new TransportPolicyProvider(monitor),
+            new LearnedPinStore(paths),
+            new DriftStore(),
+            store,
+            baseline,
+            NullLogger<AttestationRecorder>.Instance);
+        var factory = new TransportClientFactory(
+            new TransportPolicyProvider(monitor),
+            recorder,
+            NullLogger<TransportClientFactory>.Instance);
+
+        var route = opts.Routes[0];
+        var client = factory.GetClient(route.Name, route, 15000);
+        CheckTrue("plain-http: http upstream keeps the shared default client", () => ReferenceEquals(client, factory.DefaultClient));
+        CheckTrue("plain-http: no attested handler for http upstream", () => factory.GetActiveHandler(route.Name, route) is null);
+
+        using var response = await client.GetAsync($"http://127.0.0.1:{port}/v1/ping");
+        var body = await response.Content.ReadAsStringAsync();
+        await Task.WhenAny(server, Task.Delay(TimeSpan.FromSeconds(8)));
+        listener.Stop();
+
+        CheckTrue("plain-http: round trip succeeds (200 OK)", () => response.StatusCode == HttpStatusCode.OK && body == "OK");
+        CheckTrue("plain-http: no TLS observation recorded", () => factory.LastObservationSummary(route.Name) is null);
+        CheckTrue("plain-http: no enforcement header recorded", () => factory.LastEnforcementHeader(route.Name) is null);
+    }
+
+    /// <summary>
+    /// Connect to a CLOSED loopback port through the attested ConnectCallback: the
+    /// manual Socket.ConnectAsync fails (refused) and the review fix disposes the socket
+    /// in-place BEFORE the NetworkStream would take ownership, so the failure surfaces
+    /// cleanly and promptly with no leaked handle. A leak would only defer GC and is not
+    /// directly observable, so the deterministic assertions are: it throws fast, and it
+    /// records nothing (the connect never reached the handshake/observation phase).
+    /// </summary>
+    static async Task RunConnectRefusedAsync(string root)
+    {
+        // Reserve a loopback port, then release it: the very next connect is refused.
+        var probe = new TcpListener(IPAddress.Loopback, 0);
+        probe.Start();
+        var port = ((IPEndPoint)probe.LocalEndpoint).Port;
+        probe.Stop();
+
+        // Separate data dir, exactly like the untrusted test: RunTlsSuccessAsync already
+        // wrote a baseline entry for tls-route in root/data and would trip the
+        // "failed connect writes no baseline entry" assertion below.
+        var refusedData = Path.Combine(root, "data-refused");
+        Directory.CreateDirectory(refusedData);
+        var opts = PolicyOptions();
+        var tls = opts.Routes[0];
+        var paths = new DashboardPaths(root, root, refusedData);
+        var store = new TransportStore();
+        var baseline = new BaselineStore(paths);
+        var recorder = new AttestationRecorder(
+            new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts)),
+            new LearnedPinStore(paths),
+            new DriftStore(),
+            store,
+            baseline,
+            NullLogger<AttestationRecorder>.Instance);
+        var factory = new TransportClientFactory(
+            new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(opts)),
+            recorder,
+            NullLogger<TransportClientFactory>.Instance);
+
+        var client = factory.GetClient(tls.Name, tls, 15000);
+        CheckTrue("connect-refused: attested handler installed", () => factory.GetActiveHandler(tls.Name, tls) is not null);
+
+        var sw = Stopwatch.StartNew();
+        var failed = false;
+        try
+        {
+            using var response = await client.GetAsync($"https://127.0.0.1:{port}/v1/connect-refused");
+            _ = response.StatusCode; // a response from a closed port is impossible
+        }
+        catch
+        {
+            failed = true; // SocketException (refused), wrapped by SocketsHttpHandler
+        }
+        sw.Stop();
+
+        CheckTrue("connect-refused: clean exception surfaces promptly (no hang)", () =>
+            failed && sw.Elapsed < TimeSpan.FromSeconds(10));
+        CheckTrue("connect-refused: failed connect records no observation", () => store.Recent(5).Count == 0);
+        CheckTrue("connect-refused: failed connect writes no baseline entry", () => baseline.GetRoute(tls.Name) is null);
+    }
+
+    /// <summary>
+    /// The per-request timeout, wired exactly as ProxyMiddleware now does it (a
+    /// CancellationTokenSource linked to the request-abort token + CancelAfter), against
+    /// an upstream that accepts the connection and then stalls forever. Previously the
+    /// deadline was a MUTATION of the shared client's Timeout; the review fix moves it to
+    /// a per-request CTS so concurrent routes with different timeouts cannot race on a
+    /// shared property. The stalled upstream must abort with OperationCanceledException
+    /// around the interval - the middleware maps that to 502 (a real client abort, which
+    /// also cancels the linked token, would map to 499 via the RequestAborted filter).
+    /// </summary>
+    static async Task RunPerRequestTimeoutAsync(string root)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        // Accept the connection, read the request head, then send NOTHING: the request
+        // stalls on headers unless the per-request CTS aborts it. The client-side abort
+        // closes the socket, which the server observes as EOF/RST and its task ends.
+        var server = Task.Run(async () =>
+        {
+            try
+            {
+                using var tcp = await listener.AcceptTcpClientAsync();
+                using var stream = tcp.GetStream();
+                var sb = new StringBuilder();
+                var buf = new byte[4096];
+                while (sb.Length <= 65536 && !sb.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+                {
+                    var n = await stream.ReadAsync(buf);
+                    if (n == 0) break;
+                    sb.Append(Encoding.ASCII.GetString(buf, 0, n));
+                }
+                try { while (await stream.ReadAsync(buf) > 0) { } } catch { /* aborted */ }
+            }
+            catch
+            {
+                // Client abort or listener teardown - the harness must never crash.
+            }
+        });
+
+        var opts = new ProxyOptions
+        {
+            Transport = new TransportOptions { Enabled = false },
+            Routes = new List<RouteOptions>
+            {
+                new RouteOptions { Name = "slow-http", Prefix = "/slow", Upstream = $"http://127.0.0.1:{port}" },
+            },
+        };
+        // A REAL policy configured on an http:// upstream: the guard skips the attested
+        // callback (UsesHttpsUpstream false) and returns the shared default client - the
+        // same factory path the middleware serves, with the same per-request CTS wiring.
+        opts.Routes[0].Transport = new RouteTransportOptions
+        {
+            Enabled = true,
+            Enforce = "block",
+            ExpectedIps = new List<string> { "10.99.0.0/16" },
+            Pins = new List<string> { "spki://sha256/" + new string('A', 44) },
+        };
+
+        var monitor = new TestOptionsMonitor<ProxyOptions>(opts);
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var recorder = new AttestationRecorder(
+            new TransportPolicyProvider(monitor),
+            new LearnedPinStore(paths),
+            new DriftStore(),
+            new TransportStore(),
+            new BaselineStore(paths),
+            NullLogger<AttestationRecorder>.Instance);
+        var factory = new TransportClientFactory(
+            new TransportPolicyProvider(monitor),
+            recorder,
+            NullLogger<TransportClientFactory>.Instance);
+
+        var route = opts.Routes[0];
+        var client = factory.GetClient(route.Name, route, 15000);
+        CheckTrue("timeout-cts: http upstream keeps the shared default client", () => ReferenceEquals(client, factory.DefaultClient));
+
+        const int requestTimeoutMs = 400;
+        // The middleware wiring: the request's own deadline = a CTS linked to the
+        // request-abort token + CancelAfter(requestTimeoutMs). CancellationToken.None
+        // stands in for an already-uncancelled request-abort token.
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(CancellationToken.None);
+        timeoutCts.CancelAfter(requestTimeoutMs);
+
+        var sw = Stopwatch.StartNew();
+        Exception? sendEx = null;
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, $"http://127.0.0.1:{port}/v1/slow");
+            using var response = await client.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
+            _ = response.StatusCode; // a response means the stall was NOT aborted -> failure
+        }
+        catch (Exception ex)
+        {
+            sendEx = ex;
+        }
+        sw.Stop();
+        await Task.WhenAny(server, Task.Delay(TimeSpan.FromSeconds(8)));
+        listener.Stop();
+
+        CheckTrue("timeout-cts: stalled upstream aborts with OperationCanceledException", () =>
+            sendEx is OperationCanceledException);
+        CheckTrue("timeout-cts: abort happens around the per-request interval", () =>
+            sw.Elapsed >= TimeSpan.FromMilliseconds(300) && sw.Elapsed < TimeSpan.FromSeconds(10));
+        CheckTrue("timeout-cts: client Timeout stays InfiniteTimeSpan (never mutated)", () =>
+            client.Timeout == Timeout.InfiniteTimeSpan);
+        // No unconditional `await server`: the abort closes the socket, so the server read
+        // loop ends on its own; the bounded wait above already covered it.
+    }
+
+    /// <summary>The IPv4 loopback may be observed as its dual-stack (v4-mapped) form on Windows.</summary>
+    static bool IsLoopbackIp(string ip) => ip is "127.0.0.1" or "::1" or "::ffff:127.0.0.1";
+
+    static X509Certificate2 CreateSelfSignedCert()
+    {
+        using var rsa = RSA.Create(2048);
+        var req = new CertificateRequest("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddDnsName("localhost");
+        san.AddIpAddress(IPAddress.Loopback);
+        req.CertificateExtensions.Add(san.Build());
+
+        // Windows Schannel refuses a server credential without key usage + the
+        // Server Authentication EKU (1.3.6.1.5.5.7.3.1); without these the server
+        // aborts AuthenticateAsServerAsync and the client only ever sees EOF.
+        req.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
+            critical: true));
+        req.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+            new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") },
+            critical: false)); // Server Authentication
+
+        using var signed = req.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
+
+        // Windows Schannel also refuses an in-memory (ephemeral) CNG RSA key as a
+        // server credential (SEC_E_UNSUPPORTED_KEYS - "platform does not support
+        // ephemeral keys" - seen on loopback regardless of TLS version). Round-trip
+        // through a PFX so the key reaches Schannel as a persisted, exportable key -
+        // the same PKCS12 round-trip trick production uses for its PEM certs.
+        const string password = "transport-tls-test";
+        var pfxBytes = signed.Export(X509ContentType.Pfx, password);
+        return X509CertificateLoader.LoadPkcs12(pfxBytes, password, X509KeyStorageFlags.Exportable);
+    }
+
+    /// <summary>Base64url (unpadded) SHA-256 digest of 64 hex chars - the pin format used by the tests.</summary>
+    static string B64UrlOfHex(string hex)
+        => Convert.ToBase64String(Convert.FromHexString(hex)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    static TransportPolicy TPolicy(string enforce, IReadOnlyList<string>? pins = null, IReadOnlyList<string>? ips = null, string? floor = null)
+        => new(true, 100, enforce, null, ips ?? Array.Empty<string>(), floor, 7, pins ?? Array.Empty<string>(), 0);
+
+    // --------------------------------------------------------------
+    // Transport/Endpoint attestation (Phase 2) - pinning + drift.
+    // --------------------------------------------------------------
+
+    static void TestPinValidator()
+    {
+        var hex = string.Concat(Enumerable.Repeat("ab", 32)); // 64 hex chars -> 32 bytes
+        var b64 = B64UrlOfHex(hex);
+        var other = B64UrlOfHex(string.Concat(Enumerable.Repeat("cd", 32)));
+
+        // NormalizePin: 64-hex -> unpadded base64url; base64url/base64 (padded) -> base64url.
+        CheckTrue("pin: hex normalizes to base64url", () => TransportHashes.NormalizePin(hex) == b64);
+        CheckTrue("pin: base64url identity", () => TransportHashes.NormalizePin(b64) == b64);
+        CheckTrue("pin: padded base64 normalizes", () => TransportHashes.NormalizePin(b64 + "=") == b64);
+        CheckTrue("pin: whitespace trimmed", () => TransportHashes.NormalizePin("  " + b64 + "  ") == b64);
+        CheckTrue("pin: empty/null rejected", () => TransportHashes.NormalizePin(null) is null && TransportHashes.NormalizePin("") is null);
+        CheckTrue("pin: malformed rejected", () => TransportHashes.NormalizePin("not-a-pin") is null
+            && TransportHashes.NormalizePin(hex[..63]) is null
+            && TransportHashes.NormalizePin(new string('z', 64)) is null);
+
+        // Evaluate: nothing to compare against -> Ok.
+        CheckTrue("pin: null pins ok", () => PinValidator.Evaluate(null, b64, false) == PinVerdict.Ok);
+        CheckTrue("pin: empty pins ok", () => PinValidator.Evaluate(new List<string>(), b64, false) == PinVerdict.Ok);
+        CheckTrue("pin: null observed ok", () => PinValidator.Evaluate(new List<string> { b64 }, null, false) == PinVerdict.Ok);
+
+        // Matches, including cross-format (hex config pin vs base64url observation).
+        CheckTrue("pin: exact match ok", () => PinValidator.Evaluate(new List<string> { b64 }, b64, false) == PinVerdict.Ok);
+        CheckTrue("pin: hex pin matches base64url observed", () => PinValidator.Evaluate(new List<string> { hex }, b64, false) == PinVerdict.Ok);
+        CheckTrue("pin: matches cross-format", () => PinValidator.Matches(hex, b64) && !PinValidator.Matches(other, b64));
+        CheckTrue("pin: matches null-safe", () => !PinValidator.Matches(null, b64) && !PinValidator.Matches(b64, null));
+
+        // Mismatch: inside grace -> Grace; past grace -> Mismatch.
+        CheckTrue("pin: mismatch within grace", () => PinValidator.Evaluate(new List<string> { b64 }, other, true) == PinVerdict.Grace);
+        CheckTrue("pin: mismatch past grace", () => PinValidator.Evaluate(new List<string> { b64 }, other, false) == PinVerdict.Mismatch);
+    }
+
+    static void TestEnforcePolicy()
+    {
+        var b64 = B64UrlOfHex(string.Concat(Enumerable.Repeat("ab", 32)));
+        var other = B64UrlOfHex(string.Concat(Enumerable.Repeat("cd", 32)));
+
+        // observe: drift is recorded but the wire stays untouched.
+        var obs = EnforcePolicy.Evaluate(TPolicy("observe", new[] { b64 }), new[] { b64 }, other, "10.0.0.1", "TLS 1.3", false);
+        CheckTrue("enforce: observe keeps allow on mismatch", () => obs.Action == "allow" && obs.Severity == "high" && obs.Reason == "spki-mismatch");
+
+        // warn: tagged, never blocked.
+        var warn = EnforcePolicy.Evaluate(TPolicy("warn", new[] { b64 }), new[] { b64 }, other, "10.0.0.1", "TLS 1.3", false);
+        CheckTrue("enforce: warn tags mismatch", () => warn.Action == "warn" && warn.Severity == "high" && warn.Reason == "spki-mismatch");
+
+        // block + high -> block; grace (low) is NEVER blocked.
+        var block = EnforcePolicy.Evaluate(TPolicy("block", new[] { b64 }), new[] { b64 }, other, "10.0.0.1", "TLS 1.3", false);
+        CheckTrue("enforce: block rejects mismatch", () => block.Action == "block" && block.Severity == "high" && block.Reason == "spki-mismatch");
+        var grace = EnforcePolicy.Evaluate(TPolicy("block", new[] { b64 }), new[] { b64 }, other, "10.0.0.1", "TLS 1.3", true);
+        CheckTrue("enforce: block never blocks grace", () => grace.Action == "warn" && grace.Severity == "low" && grace.Reason == "new-endpoint-grace");
+
+        // block without anything to block on -> allow.
+        var noPins = EnforcePolicy.Evaluate(TPolicy("block"), Array.Empty<string>(), other, "10.0.0.1", "TLS 1.3", false);
+        CheckTrue("enforce: block without pins allows", () => noPins.Action == "allow" && noPins.Severity == "none");
+
+        // Clean handshake (matching pin) -> allow/none even under block.
+        var clean = EnforcePolicy.Evaluate(TPolicy("block", new[] { b64 }), new[] { b64 }, b64, "10.0.0.1", "TLS 1.3", false);
+        CheckTrue("enforce: matching pin is clean", () => clean.Action == "allow" && clean.Severity == "none");
+
+        // Chain is strictest first: unexpected IP, then TLS floor, then pins.
+        var badIp = EnforcePolicy.Evaluate(TPolicy("block", new[] { b64 }, new[] { "10.0.0.0/16" }), new[] { b64 }, b64, "192.168.1.5", "TLS 1.2", false);
+        CheckTrue("enforce: unexpected ip blocks first", () => badIp.Action == "block" && badIp.Reason == "unexpected-ip");
+        var badTls = EnforcePolicy.Evaluate(TPolicy("block", new[] { b64 }, new[] { "10.0.0.0/16" }, "1.3"), new[] { b64 }, b64, "10.0.0.9", "TLS 1.2", false);
+        CheckTrue("enforce: tls floor blocks", () => badTls.Action == "block" && badTls.Reason == "tls-floor");
+
+        // Header mapping.
+        CheckTrue("enforce: header block", () => EnforcePolicy.HeaderFor("r", block) == "block");
+        CheckTrue("enforce: header warn route:severity", () => EnforcePolicy.HeaderFor("r", warn) == "r:high" && EnforcePolicy.HeaderFor("r", grace) == "r:low");
+        CheckTrue("enforce: header allow null", () => EnforcePolicy.HeaderFor("r", clean) is null
+            && EnforcePolicy.HeaderFor("r", obs) is null && EnforcePolicy.HeaderFor("r", noPins) is null);
+
+        // IP/CIDR matching: IPv4 + IPv6, exact + prefix.
+        CheckTrue("enforce: cidr v4 match", () => DriftEvaluator.IpMatchesAny("10.1.2.3", new[] { "10.0.0.0/8" }));
+        CheckTrue("enforce: cidr v4 no match", () => !DriftEvaluator.IpMatchesAny("192.168.1.1", new[] { "10.0.0.0/8" }));
+        CheckTrue("enforce: exact ip match", () => DriftEvaluator.IpMatchesAny("10.0.0.5", new[] { "10.0.0.5" }));
+        CheckTrue("enforce: exact ip mismatch", () => !DriftEvaluator.IpMatchesAny("10.0.0.6", new[] { "10.0.0.5" }));
+        CheckTrue("enforce: cidr v6 match", () => DriftEvaluator.IpMatchesAny("2001:db8::1", new[] { "2001:db8::/32" }));
+        CheckTrue("enforce: cidr v6 no match", () => !DriftEvaluator.IpMatchesAny("2001:db9::1", new[] { "2001:db8::/32" }));
+        CheckTrue("enforce: bad entries skipped", () => !DriftEvaluator.IpMatchesAny("10.0.0.5", new[] { "", "not-an-ip" }));
+
+        // TLS floor comparisons.
+        CheckTrue("enforce: tls below floor", () => DriftEvaluator.TlsBelowFloor("1.3", "TLS 1.2"));
+        CheckTrue("enforce: tls at or above floor", () => !DriftEvaluator.TlsBelowFloor("1.3", "TLS 1.3") && !DriftEvaluator.TlsBelowFloor("1.2", "TLS 1.3"));
+        CheckTrue("enforce: tls null/empty floor never fails", () => !DriftEvaluator.TlsBelowFloor(null, "TLS 1.0") && !DriftEvaluator.TlsBelowFloor("", "TLS 1.0"));
+        CheckTrue("enforce: tls unknown negotiated fails toward suspicion", () => DriftEvaluator.TlsBelowFloor("1.2", "weird"));
+        var (fmaj, fmin) = DriftEvaluator.ParseVersion("TLSv1.3");
+        CheckTrue("enforce: parse version helper", () => fmaj == 1 && fmin == 3 && DriftEvaluator.ParseVersion("garbage") is (-1, -1));
+    }
+
+    // --------------------------------------------------------------
+    // 526 mapping (review fix): SocketsHttpHandler wraps ConnectCallback exceptions in
+    // HttpRequestException, so TransportErrorMapper must find AttestationException
+    // through the InnerException chain. Pure helper - no IO, no middleware. (The
+    // middleware itself is NOT linked into this harness; the integration harness
+    // validates the real HTTP 526 + X-AIRouterProxy-Attestation header. The ConnectTelemetry
+    // block flow is covered end-to-end in TestAttestationBehaviour below.)
+    // --------------------------------------------------------------
+
+    static void TestAttestationMapper()
+    {
+        // Direct throw (the middleware's dedicated catch path).
+        var direct = new AttestationException("r", "spki-mismatch");
+        CheckTrue("526-mapper: direct exception found", () => TransportErrorMapper.TryGetAttestation(direct, out var a)
+            && a is not null && a!.Route == "r" && a.Reason == "spki-mismatch");
+
+        // .NET 10 wrap: ConnectHelper.CreateWrappedException -> HttpRequestException(inner).
+        var wrapped = new HttpRequestException("connection failed", new AttestationException("r2", "unexpected-ip"));
+        CheckTrue("526-mapper: wrapped as HttpRequestException inner", () => TransportErrorMapper.TryGetAttestation(wrapped, out var w)
+            && w is not null && w!.Route == "r2");
+
+        // Deeper nesting (any layer of the chain).
+        var deep = new HttpRequestException("outer", new IOException("io", new AttestationException("r3", "tls-floor")));
+        CheckTrue("526-mapper: deep chain found", () => TransportErrorMapper.TryGetAttestation(deep, out var x)
+            && x is not null && x!.Route == "r3" && x.Reason == "tls-floor");
+
+        // Generic failures never map to attestation.
+        CheckTrue("526-mapper: generic exceptions never match", () =>
+            !TransportErrorMapper.TryGetAttestation(new HttpRequestException("plain", new IOException("inner")), out _)
+            && !TransportErrorMapper.TryGetAttestation(new InvalidOperationException("nope"), out _)
+            && !TransportErrorMapper.TryGetAttestation(null, out _));
+    }
+
+    static void TestDriftStore()
+    {
+        var store = new DriftStore();
+        var now = DateTimeOffset.UtcNow;
+
+        // Episodes are keyed by (route, reason, IP): the first occurrence alerts; the
+        // same episode is deduped for 1h, but a DISTINCT endpoint (ip) or a strictly
+        // higher severity re-alerts immediately.
+        CheckTrue("drift: first alert fires", () => store.TryAlert("r", "10.0.0.1", "spki-mismatch", "low", now));
+        CheckTrue("drift: same episode (ip) suppressed inside window", () => !store.TryAlert("r", "10.0.0.1", "spki-mismatch", "low", now.AddMinutes(10)));
+        CheckTrue("drift: episode stays active", () => store.Count == 1);
+
+        // Same route + reason, DIFFERENT ip -> a brand-new episode that alerts right away.
+        CheckTrue("drift: distinct ip re-alerts immediately", () => store.TryAlert("r", "10.0.0.2", "spki-mismatch", "high", now.AddMinutes(15)));
+        CheckTrue("drift: two episodes (one per ip)", () => store.Count == 2);
+
+        // Escalation: same episode (same ip), strictly higher severity -> re-alert + bump + update.
+        CheckTrue("drift: higher severity re-alerts and bumps", () => store.TryAlert("r", "10.0.0.1", "spki-mismatch", "high", now.AddMinutes(20)));
+        var escalated = store.Recent(10).First(e => e.Route == "r" && e.Reason == "spki-mismatch" && e.Ip == "10.0.0.1");
+        CheckTrue("drift: escalation bumps count and severity", () => escalated.AlertCount == 2 && escalated.Severity == "high");
+
+        // Same episode, lower/equal severity inside the window -> suppressed (no downgrade).
+        CheckTrue("drift: lower severity suppressed inside window", () => !store.TryAlert("r", "10.0.0.1", "spki-mismatch", "low", now.AddMinutes(25)));
+        CheckTrue("drift: severity not downgraded", () => store.Recent(10).First(e => e.Route == "r" && e.Reason == "spki-mismatch" && e.Ip == "10.0.0.1").Severity == "high");
+
+        // Different reason / different route are separate episodes.
+        CheckTrue("drift: different reason alerts", () => store.TryAlert("r", "10.0.0.1", "tls-floor", "high", now.AddMinutes(30)));
+        CheckTrue("drift: different route alerts", () => store.TryAlert("r2", "10.0.0.3", "spki-mismatch", "high", now.AddMinutes(30)));
+        CheckTrue("drift: four episodes", () => store.Count == 4);
+
+        // After the 1h window the same episode re-alerts and bumps its counter.
+        CheckTrue("drift: re-alert after window", () => store.TryAlert("r", "10.0.0.2", "spki-mismatch", "high", now.AddHours(2).AddSeconds(1)));
+        var afterReAlert = store.Recent(10).First(e => e.Route == "r" && e.Reason == "spki-mismatch" && e.Ip == "10.0.0.2");
+        CheckTrue("drift: re-alert bumps count", () => afterReAlert.AlertCount == 2 && afterReAlert.Ip == "10.0.0.2");
+
+        // In-window touch keeps the episode active but emits no alert.
+        CheckTrue("drift: touch suppressed", () => !store.TryAlert("r2", "10.0.0.3", "spki-mismatch", "high", now.AddMinutes(60)));
+        // (r2 was first alerted at now+30m, so now+60m is still inside its window.)
+
+        // Newest-alerted-first ordering.
+        var recent = store.Recent(10);
+        CheckTrue("drift: recent newest first", () => recent.Count == 4
+            && recent[0].Route == "r2" && recent[0].Ip == "10.0.0.3"
+            && recent[1].Reason == "spki-mismatch" && recent[1].Ip == "10.0.0.2" && recent[1].AlertCount == 2
+            && recent[2].Reason == "tls-floor"
+            && recent[3].Reason == "spki-mismatch" && recent[3].Ip == "10.0.0.1");
+
+        // Capacity clamping + trimming (oldest alerts dropped first).
+        var capped = new DriftStore { Capacity = 10 };
+        for (var i = 1; i <= 15; i++)
+        {
+            capped.TryAlert("c" + i, "10.0.0." + i, "spki-mismatch", "high", now.AddMinutes(i));
+        }
+        CheckTrue("drift: capacity keeps ring bounded", () => capped.Count == 10 && capped.Recent(100).Count == 10);
+        CheckTrue("drift: capacity min clamp", () => new DriftStore { Capacity = 3 }.Capacity == DriftStore.MinCapacity);
+        CheckTrue("drift: capacity max clamp", () => new DriftStore { Capacity = 500 }.Capacity == DriftStore.MaxCapacity);
+        CheckTrue("drift: clear returns count", () => capped.Clear() == 10 && capped.Count == 0 && capped.Recent(10).Count == 0);
+
+        // Recent limit clamps negative/zero.
+        CheckTrue("drift: recent limit clamp", () =>
+        {
+            var s = new DriftStore();
+            s.TryAlert("x", "10.0.0.1", "r1", "high", now);
+            return s.Recent(-1).Count == 0 && s.Recent(0).Count == 0 && s.Recent(5).Count == 1;
+        });
+
+        // Invalid args are ignored.
+        CheckTrue("drift: invalid args ignored", () => !store.TryAlert("", "ip", "reason", "high", now)
+            && !store.TryAlert("r", "ip", "", "high", now));
+    }
+
+    static void TestLearnedPinStore()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "pins-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "data"));
+        try
+        {
+            var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+            var store = new LearnedPinStore(paths);
+            var now = DateTimeOffset.UtcNow;
+
+            var b64 = B64UrlOfHex(string.Concat(Enumerable.Repeat("ab", 32)));
+            var b1 = B64UrlOfHex(string.Concat(Enumerable.Repeat("cd", 32)));
+            var b2 = B64UrlOfHex(string.Concat(Enumerable.Repeat("ef", 32)));
+
+            // Absent file: empty, no error.
+            CheckTrue("pins: absent file empty", () => store.GetRoutes().Count == 0 && store.GetRoute("r") is null);
+
+            // Add + persist + duplicate/empty guards.
+            CheckTrue("pins: add returns true", () => store.AddPin("r", b64, now));
+            var file = Path.Combine(root, "data", "pins.json");
+            CheckTrue("pins: file written", () => File.Exists(file));
+            CheckTrue("pins: duplicate add false", () => !store.AddPin("r", b64, now));
+            CheckTrue("pins: empty args false", () => !store.AddPin("", b1, now) && !store.AddPin("r", "", now));
+
+            // Round-trip: a fresh store instance on the same paths reloads the pin.
+            var reloaded = new LearnedPinStore(paths);
+            CheckTrue("pins: round-trip", () => reloaded.GetForRoute("r") is { Count: 1 } p && p[0] == b64);
+
+            // Max 5 per route; the oldest (by AddedAt) is dropped.
+            store.AddPin("r", b1, now.AddMinutes(1));
+            store.AddPin("r", b2, now.AddMinutes(2));
+            store.AddPin("r", B64UrlOfHex(string.Concat(Enumerable.Repeat("01", 32))), now.AddMinutes(10));
+            store.AddPin("r", B64UrlOfHex(string.Concat(Enumerable.Repeat("23", 32))), now.AddMinutes(11));
+            store.AddPin("r", B64UrlOfHex(string.Concat(Enumerable.Repeat("45", 32))), now.AddMinutes(12));
+            CheckTrue("pins: max 5 per route", () => store.GetForRoute("r").Count == 5);
+            CheckTrue("pins: oldest dropped", () => !store.GetForRoute("r").Contains(b64));
+            var lastPin = B64UrlOfHex(string.Concat(Enumerable.Repeat("45", 32)));
+            CheckTrue("pins: newest retained", () => store.GetForRoute("r").Last() == lastPin);
+
+            // Snapshot is newest-first; the route list is sorted by name.
+            var snap = store.GetRoute("r");
+            CheckTrue("pins: snapshot newest first", () => snap is not null && snap.Pins.Count == 5 && snap.Pins[0].Pin == lastPin);
+            CheckTrue("pins: route list", () => store.GetRoutes() is { Count: 1 } routes && routes[0].Route == "r");
+
+            // RemoveRoute + ClearAll.
+            CheckTrue("pins: remove unknown returns 0", () => store.RemoveRoute("nope") == 0);
+            CheckTrue("pins: remove route", () => store.RemoveRoute("r") == 1 && store.GetRoute("r") is null);
+            store.AddPin("a", b1, now);
+            store.AddPin("b", b2, now);
+            CheckTrue("pins: clear all returns count", () => store.ClearAll() == 2 && store.GetRoutes().Count == 0);
+
+            // Corrupt file is tolerated (empty pins, no throw).
+            File.WriteAllText(file, "{ not json");
+            var broken = new LearnedPinStore(paths);
+            CheckTrue("pins: corrupt file tolerated", () => broken.GetRoutes().Count == 0);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* cleanup only */ }
+        }
+    }
+
+    static void TestAttestationRecorderPins()
+    {
+        var a = B64UrlOfHex(string.Concat(Enumerable.Repeat("ab", 32)));
+        var b = B64UrlOfHex(string.Concat(Enumerable.Repeat("cd", 32)));
+        var c = B64UrlOfHex(string.Concat(Enumerable.Repeat("ef", 32)));
+
+        // Config pins first, then learned; canonical dedupe across formats.
+        var policy = new TransportPolicy(true, 100, "block", null, Array.Empty<string>(), null, 7, new[] { a, b }, 0);
+        var effective = AttestationRecorder.EffectivePins(policy, "r", new[] { c, b });
+        CheckTrue("pins: effective config first", () => effective.Count == 3 && effective[0] == a && effective[1] == b && effective[2] == c);
+
+        // Hex config pin dedupes against the base64url learned one (same digest).
+        var hexA = string.Concat(Enumerable.Repeat("ab", 32));
+        var policyHex = new TransportPolicy(true, 100, "block", null, Array.Empty<string>(), null, 7, new[] { hexA }, 0);
+        var effective2 = AttestationRecorder.EffectivePins(policyHex, "r", new[] { a });
+        CheckTrue("pins: hex vs b64 dedupe", () => effective2.Count == 1 && effective2[0] == a);
+
+        // Cap at 5: config pins win the slots; learned pins never displace them.
+        var many = new string[6];
+        for (var i = 0; i < 6; i++)
+        {
+            many[i] = B64UrlOfHex(string.Concat(Enumerable.Repeat(i.ToString("x2"), 32)));
+        }
+        var policy5 = new TransportPolicy(true, 100, "block", null, Array.Empty<string>(), null, 7, many, 0);
+        var eff5 = AttestationRecorder.EffectivePins(policy5, "r", new[] { c });
+        CheckTrue("pins: cap 5 config wins", () => eff5.Count == 5 && eff5[4] == many[4] && !eff5.Contains(c));
+
+        // Null-tolerant.
+        CheckTrue("pins: null learned pins", () => AttestationRecorder.EffectivePins(policy, "r", null).Count == 2);
+        CheckTrue("pins: null policy uses learned", () => AttestationRecorder.EffectivePins(null, "r", new[] { a }).Count == 1);
+    }
+
+    static ProxyOptions ProbeOptions(string? upstream = null)
+    {
+        var o = new ProxyOptions
+        {
+            Transport = new TransportOptions { Enabled = false },
+            Routes = new List<RouteOptions>
+            {
+                new RouteOptions
+                {
+                    Name = "p1",
+                    Prefix = "/p1",
+                    Upstream = upstream ?? "https://127.0.0.1:1",
+                    Transport = new RouteTransportOptions { Enabled = true, ProbeHours = 24 },
+                },
+                new RouteOptions
+                {
+                    Name = "p2",
+                    Prefix = "/p2",
+                    Upstream = "https://probe2.test",
+                    Transport = new RouteTransportOptions { Enabled = true, ProbeHours = 0 },
+                },
+                new RouteOptions { Name = "p3", Prefix = "/p3", Upstream = "https://probe3.test" },
+            },
+        };
+        return o;
+    }
+
+    static void TestEndpointProbe()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "probe-test-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "data"));
+        try
+        {
+            var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+            var store = new TransportStore();
+            var baseline = new BaselineStore(paths);
+            var monitor = new TestOptionsMonitor<ProxyOptions>(ProbeOptions());
+            var provider = new TransportPolicyProvider(monitor);
+            var recorder = new AttestationRecorder(provider, new LearnedPinStore(paths), new DriftStore(), store, baseline,
+                NullLogger<AttestationRecorder>.Instance);
+            var probe = new EndpointProbe(provider, recorder, NullLogger<EndpointProbe>.Instance);
+
+            // Target selection: only active routes with probeHours > 0.
+            var targets = provider.GetProbeTargets();
+            CheckTrue("probe: targets filtered", () => targets.Count == 1
+                && targets[0].Route == "p1" && targets[0].ProbeHours == 24 && targets[0].Upstream == "https://127.0.0.1:1");
+
+            // Unknown route fails fast (on-demand probe).
+            CheckTrue("probe: unknown route rejected", () => !probe.ProbeRouteAsync("nope").GetAwaiter().GetResult());
+
+            // Due route whose upstream refuses connections: probe fails, nothing recorded,
+            // and the run is immediately deduped by the lastProbe marker (failed probes
+            // don't hammer either).
+            CheckTrue("probe: refused upstream fails without recording", () =>
+                probe.ProbeDueAsync(DateTimeOffset.UtcNow, default).GetAwaiter().GetResult() == 0
+                && store.Count == 0 && baseline.GetRoute("p1") is null);
+            CheckTrue("probe: re-run deduped after attempt", () =>
+                probe.ProbeDueAsync(DateTimeOffset.UtcNow, default).GetAwaiter().GetResult() == 0);
+
+            // Untrusted endpoint: the probe performs a REAL TLS connect; default chain
+            // validation rejects the self-signed cert, nothing is recorded, failure reported.
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            using var serverCert = CreateSelfSignedCert();
+            var server = Task.Run(async () =>
+            {
+                try
+                {
+                    using var tcp = await listener.AcceptTcpClientAsync();
+                    await using var ssl = new SslStream(tcp.GetStream(), leaveInnerStreamOpen: false);
+                    try
+                    {
+                        await ssl.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+                        {
+                            ServerCertificate = serverCert,
+                            EnabledSslProtocols = SslProtocols.Tls12,
+                        });
+                        var buf = new byte[1024];
+                        while (await ssl.ReadAsync(buf) > 0) { }
+                    }
+                    catch
+                    {
+                        // The probe aborts the handshake - expected here.
+                    }
+                }
+                catch
+                {
+                    // Listener may be stopped before accept - fine.
+                }
+            });
+
+            var untrustedOpts = ProbeOptions("https://127.0.0.1:" + port);
+            var untrustedProvider = new TransportPolicyProvider(new TestOptionsMonitor<ProxyOptions>(untrustedOpts));
+            var untrustedProbe = new EndpointProbe(untrustedProvider, recorder, NullLogger<EndpointProbe>.Instance);
+            var ok = untrustedProbe.ProbeRouteAsync("p1").GetAwaiter().GetResult();
+            server.GetAwaiter().GetResult();
+            listener.Stop();
+
+            CheckTrue("probe: untrusted endpoint rejected", () => !ok);
+            CheckTrue("probe: untrusted endpoint records nothing", () => store.Count == 0 && baseline.GetRoute("p1") is null);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* cleanup only */ }
+        }
+    }
+
+    // --------------------------------------------------------------
+    // Phase 3: provider blocklist (2 tiers), body merge, attribution
+    // and the aggregator-origin helpers. All metadata only.
+    // --------------------------------------------------------------
+
+    static ProviderEntryOptions Entry(string id, string? sev = null, string[]? hosts = null, string[]? slugs = null, DateTimeOffset? until = null, bool zdr = false, bool deny = false)
+        => new()
+        {
+            Id = id,
+            Name = "pv-" + id,
+            Hosts = hosts is null ? new List<string>() : new List<string>(hosts),
+            ProviderSlugs = slugs is null ? new List<string>() : new List<string>(slugs),
+            Severity = sev ?? "info",
+            Until = until,
+            ZdrOnly = zdr,
+            DataCollectionDeny = deny,
+        };
+
+    static RouteOptions BlocklistRoute(string upstream, string providerPolicy = "merge", bool enabled = true, bool allowBlocked = false, string[]? aggregators = null, bool attribution = false)
+        => new()
+        {
+            Name = "blk-route",
+            Prefix = "/blk",
+            Upstream = upstream,
+            Transport = new RouteTransportOptions
+            {
+                Enabled = true,
+                Blocklist = new RouteBlocklistOptions
+                {
+                    Enabled = enabled,
+                    AllowBlocked = allowBlocked,
+                    ProviderPolicy = providerPolicy,
+                    Aggregators = aggregators is null ? new List<string>() : new List<string>(aggregators),
+                    Attribution = attribution,
+                },
+            },
+        };
+
+    static void TestProvidersFeed()
+    {
+        // Empty / null feed: always valid (the feature defaults to off).
+        CheckTrue("feed: empty valid", () => ProviderFeedValidator.Validate(new List<ProviderEntryOptions>(), out _));
+        CheckTrue("feed: null valid", () => ProviderFeedValidator.Validate(null, out _));
+
+        var ok = new List<ProviderEntryOptions> { Entry("a", "warn", new[] { "bad.test" }, new[] { "openrouter/auto" }) };
+        CheckTrue("feed: valid entry", () => ProviderFeedValidator.Validate(ok, out _));
+
+        // id: required, unique, <= 64.
+        CheckTrue("feed: missing id rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { Entry("") }, out var e1) && e1.Count > 0);
+        var dup = new List<ProviderEntryOptions> { Entry("x"), Entry("x") };
+        CheckTrue("feed: duplicate id rejected", () => !ProviderFeedValidator.Validate(dup, out _));
+        var longId = Entry(new string('i', 65), "warn", new[] { "x.test" });
+        CheckTrue("feed: >64 id rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { longId }, out _));
+
+        // At least one of hosts / providerSlugs.
+        CheckTrue("feed: no hosts or slugs rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { Entry("n") }, out _));
+
+        // Severity whitelist.
+        var badSev = new List<ProviderEntryOptions> { Entry("s", "nuclear", new[] { "x.test" }) };
+        CheckTrue("feed: bad severity rejected", () => !ProviderFeedValidator.Validate(badSev, out _));
+
+        // List bounds: <= 32 entries, each <= 128 chars; no empties / duplicates.
+        var tooMany = Entry("many", "warn", Enumerable.Range(0, 40).Select(i => "h" + i + ".test").ToArray());
+        CheckTrue("feed: >32 hosts rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { tooMany }, out _));
+        var tooLong = Entry("long", "warn", new[] { new string('h', 200) + ".test" });
+        CheckTrue("feed: >128 host rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { tooLong }, out _));
+        var emptyHost = Entry("empty", "warn", new[] { "  " });
+        CheckTrue("feed: empty host rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { emptyHost }, out _));
+        var dupSlug = Entry("d", "warn", null, new[] { "s/1", "s/1" });
+        CheckTrue("feed: duplicate slug rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { dupSlug }, out _));
+    }
+
+    static void TestBlocklist()
+    {
+        var feed = new ProviderFeedOptions
+        {
+            Entries = new List<ProviderEntryOptions>
+            {
+                Entry("host-block", "block", new[] { "bad.test" }),
+                Entry("host-warn", "warn", new[] { "*.warny.test" }),
+                Entry("host-info", "info", new[] { "info.test" }),
+                Entry("slug-warn", "warn", null, new[] { "openrouter/auto", "openrouter/auto" }),
+                Entry("zdr", "info", null, new[] { "openrouter/zdr" }, zdr: true),
+                Entry("deny", "info", null, new[] { "openrouter/dc" }, deny: true),
+            },
+        };
+
+        // No route policy -> nothing applies (zero cost when off).
+        var noPolicy = ProviderBlocklist.DecideForRoute(new RouteOptions { Name = "r", Upstream = "https://bad.test" }, feed);
+        CheckTrue("blocklist: no policy = none", () => noPolicy == BlocklistDecision.None);
+
+        // Host tier: strongest severity wins + reasons collected.
+        var blocked = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://bad.test"), feed);
+        CheckTrue("blocklist: host block tier", () => blocked.HostTier == "block" && blocked.Reasons.Count > 0 && blocked.IsActive);
+
+        // Wildcard "*.domain" matches subdomains and the apex.
+        var wildcard = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://api.warny.test"), feed);
+        CheckTrue("blocklist: wildcard subdomain warn", () => wildcard.HostTier == "warn");
+        var apex = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://warny.test"), feed);
+        CheckTrue("blocklist: wildcard apex warn", () => apex.HostTier == "warn");
+
+        // Non-aggregator route: the provider tier stays silent.
+        var notAgg = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://ok.test"), feed);
+        CheckTrue("blocklist: non-aggregator has no slugs", () => notAgg.ProviderSlugsToIgnore.Count == 0 && !notAgg.RequireZdr);
+
+        // Aggregator route: >= warn slugs collected (deduped), flags from slug-matching entries.
+        var aggregator = BlocklistRoute("https://openrouter.ai", aggregators: new[] { "openrouter.ai" });
+        var decision = ProviderBlocklist.DecideForRoute(aggregator, feed);
+        CheckTrue("blocklist: aggregator slugs deduped", () => decision.ProviderSlugsToIgnore.Count == 1
+            && decision.ProviderSlugsToIgnore[0] == "openrouter/auto");
+        CheckTrue("blocklist: aggregator zdr+deny flags", () => decision.RequireZdr && decision.DenyDataCollection);
+
+        // Aggregator entries may be full URLs (host is extracted).
+        var zdrRoute = BlocklistRoute("https://openrouter.ai", aggregators: new[] { "https://openrouter.ai/api" });
+        CheckTrue("blocklist: aggregator url value", () => ProviderBlocklist.DecideForRoute(zdrRoute, feed).RequireZdr);
+
+        // Expired entries are ignored.
+        var expired = new ProviderFeedOptions
+        {
+            Entries = new List<ProviderEntryOptions>
+            {
+                Entry("old", "block", new[] { "expired.test" }, until: DateTimeOffset.UtcNow.AddMinutes(-1)),
+            },
+        };
+        var expiredDecision = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://expired.test"), expired);
+        CheckTrue("blocklist: expired ignored", () => expiredDecision.HostTier == "none");
+
+        // HostOf: URL -> lowercased host; garbage/null -> empty.
+        CheckTrue("blocklist: host of url", () => ProviderBlocklist.HostOf("https://OpenRouter.AI/api") == "openrouter.ai");
+        CheckTrue("blocklist: host of garbage", () => ProviderBlocklist.HostOf("not a url") == string.Empty && ProviderBlocklist.HostOf(null) == string.Empty);
+
+        // AllowBlocked is middleware policy, not decision policy - the decision still says "block".
+        CheckTrue("blocklist: allowBlocked keeps block tier", () =>
+            ProviderBlocklist.DecideForRoute(BlocklistRoute("https://bad.test", allowBlocked: true), feed).HostTier == "block");
+    }
+
+    static void TestProviderMerge()
+    {
+        var slugs = new List<string> { "banned/provider" };
+        var decision = new BlocklistDecision("none", slugs, RequireZdr: true, DenyDataCollection: true, Reasons: new List<string>());
+        var policy = new RouteBlocklistOptions { Enabled = true };
+
+        // Client ignore list preserved; decision slugs appended (client first, stable order).
+        var input = Bytes("{\"model\":\"x\",\"provider\":{\"ignore\":[\"client/slug\"],\"zdr\":false},\"max_tokens\":5}");
+        var merged = ProviderBodyPolicy.MergeProvider(input, decision, policy);
+        CheckTrue("merge: union applied", () => !merged.Conflict && merged.Body is not null);
+        var node = JsonNode.Parse(merged.Body!)!;
+        var ignore = node["provider"]!["ignore"]!.AsArray().Select(x => x!.GetValue<string>()).ToList();
+        CheckTrue("merge: ignore client first", () => ignore.SequenceEqual(new[] { "client/slug", "banned/provider" }));
+        CheckTrue("merge: zdr forced true", () => node["provider"]!["zdr"]!.GetValue<bool>());
+        CheckTrue("merge: data_collection deny", () => node["provider"]!["data_collection"]!.GetValue<string>() == "deny");
+        CheckTrue("merge: other fields kept", () => node["max_tokens"]!.GetValue<int>() == 5 && node["model"]!.GetValue<string>() == "x");
+
+        // Byte-identical when nothing changes (client already carries the full policy).
+        var full = Bytes("{\"provider\":{\"ignore\":[\"client/slug\",\"banned/provider\"],\"zdr\":true,\"data_collection\":\"deny\"}}");
+        var noChange = ProviderBodyPolicy.MergeProvider(full, decision, policy);
+        CheckTrue("merge: byte-identical when nothing changes", () => !noChange.Conflict && full.SequenceEqual(noChange.Body));
+
+        // No provider-tier decision -> unchanged.
+        var nothing = ProviderBodyPolicy.MergeProvider(full, BlocklistDecision.None, policy);
+        CheckTrue("merge: none decision unchanged", () => nothing.Body.SequenceEqual(full));
+
+        // Policy off -> unchanged even with an active decision.
+        var off = ProviderBodyPolicy.MergeProvider(input, decision, new RouteBlocklistOptions { Enabled = false });
+        CheckTrue("merge: policy off unchanged", () => off.Body.SequenceEqual(input));
+
+        // Strict: provider.only with a blocked slug -> conflict, body untouched.
+        var strict = new RouteBlocklistOptions { Enabled = true, ProviderPolicy = "strict" };
+        var conflictBody = Bytes("{\"provider\":{\"only\":[\"banned/provider\"]}}");
+        var conflict = ProviderBodyPolicy.MergeProvider(conflictBody, decision, strict);
+        CheckTrue("merge: strict only conflict", () => conflict.Conflict && conflict.Reason is not null && conflict.Body.SequenceEqual(conflictBody));
+
+        // Strict: zdr:false while the policy requires zdr -> conflict.
+        var zdrConflict = ProviderBodyPolicy.MergeProvider(Bytes("{\"provider\":{\"zdr\":false}}"), decision, strict);
+        CheckTrue("merge: strict zdr conflict", () => zdrConflict.Conflict);
+
+        // Strict with a clean provider -> merge applies.
+        var cleanStrict = ProviderBodyPolicy.MergeProvider(Bytes("{\"provider\":{\"ignore\":[]}}"), decision, strict);
+        CheckTrue("merge: strict clean applies", () => !cleanStrict.Conflict
+            && JsonNode.Parse(cleanStrict.Body!)!["provider"]!["zdr"]!.GetValue<bool>());
+
+        // Invalid JSON -> unchanged (never crashes, never forwards garbage).
+        var bad = Bytes("{ nope");
+        var badMerge = ProviderBodyPolicy.MergeProvider(bad, decision, policy);
+        CheckTrue("merge: invalid json unchanged", () => badMerge.Body.SequenceEqual(bad));
+    }
+
+    static void TestAttribution()
+    {
+        // JSON: top-level provider wins when no endpoint is selected.
+        var json = Bytes("{\"id\":\"x\",\"provider\":\"OpenRouter (primary)\",\"openrouter_metadata\":{\"endpoints\":[{\"provider_name\":\"Provider B\",\"selected\":false}]}}");
+        var fromJson = AttributionExtractor.ExtractProviderFromJson(json);
+        CheckTrue("attribution: json top-level provider", () => fromJson.ServedBy == "OpenRouter (primary)"
+            && fromJson.Endpoints.Count == 1 && fromJson.Endpoints[0].Provider == "Provider B" && !fromJson.Endpoints[0].Selected);
+
+        // JSON: the selected endpoint wins over the top-level provider.
+        var selected = Bytes("{\"provider\":\"Provider A\",\"openrouter_metadata\":{\"endpoints\":[{\"provider_name\":\"Provider B\",\"selected\":true},{\"provider_name\":\"Provider C\",\"selected\":false}]}}");
+        CheckTrue("attribution: selected endpoint wins", () => AttributionExtractor.ExtractProviderFromJson(selected).ServedBy == "Provider B");
+
+        // Cache hit: metadata without endpoints -> top-level provider only.
+        var cached = Bytes("{\"id\":\"x\",\"provider\":\"OpenRouter\",\"openrouter_metadata\":{\"cache_hit\":true}}");
+        var fromCached = AttributionExtractor.ExtractProviderFromJson(cached);
+        CheckTrue("attribution: cache hit no endpoints", () => fromCached.ServedBy == "OpenRouter" && fromCached.Endpoints.Count == 0);
+
+        // No provider anywhere -> null (not an error).
+        CheckTrue("attribution: no provider null", () => AttributionExtractor.ExtractProviderFromJson(Bytes("{\"choices\":[]}")).ServedBy is null);
+        CheckTrue("attribution: blank name null", () => AttributionExtractor.NormalizeProviderName("  ") is null);
+
+        // Names bounded to 120 chars.
+        CheckTrue("attribution: name bounded", () => AttributionExtractor.NormalizeProviderName(new string('p', 300))!.Length == 120);
+
+        // SSE: last metadata event before [DONE] wins (selected endpoint name).
+        var sseBytes = Bytes(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{}}],\"openrouter_metadata\":{\"endpoints\":[{\"provider_name\":\"Anthropic\",\"selected\":true}]}}\n\n" +
+            "data: [DONE]\n\n");
+        CheckTrue("attribution: sse selected provider", () => AttributionExtractor.ExtractProviderFromSseFinal(sseBytes) == "Anthropic");
+
+        // SSE without metadata (cache hit) -> null.
+        var sseCached = Bytes("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n");
+        CheckTrue("attribution: sse cache hit null", () => AttributionExtractor.ExtractProviderFromSseFinal(sseCached) is null);
+
+        // Store: metadata only, per-route cell, normalized on write.
+        var store = new AttributionStore();
+        store.Set("agg", "Provider X");
+        store.Set("agg", "  Provider Y  ");
+        store.Set("", "ignored");
+        CheckTrue("attribution-store: last wins per route", () => store.Get("agg") == "Provider Y" && store.Count == 1);
+        CheckTrue("attribution-store: snapshot", () => store.Snapshot()["agg"] == "Provider Y");
+    }
+
+    static void TestOriginParse()
+    {
+        // BuildGenerationUrl: base with a path stays; bare base gets /api inserted.
+        CheckTrue("origin: url with path", () => AttestationOrigin.BuildGenerationUrl("https://openrouter.ai/api", "gen-1")
+            == "https://openrouter.ai/api/v1/generation?id=gen-1");
+        CheckTrue("origin: bare url normalized + escaped", () => AttestationOrigin.BuildGenerationUrl("https://openrouter.ai", "gen 1")
+            == "https://openrouter.ai/api/v1/generation?id=gen%201");
+        CheckTrue("origin: empty base", () => AttestationOrigin.BuildGenerationUrl("", "x") == string.Empty);
+
+        // Strict ParseResponse: ONLY the whitelisted string fields survive.
+        var payload = Bytes("{\"provider_name\":\"OpenRouter\",\"model\":\"gpt-4o\",\"upstream_id\":\"gen-123\",\"secret\":\"s3cr3t\",\"details\":{\"x\":1}}");
+        var view = AttestationOrigin.ParseResponse(payload);
+        CheckTrue("origin: whitelist only", () => view is not null
+            && view!.ProviderName == "OpenRouter"
+            && view.Model == "gpt-4o"
+            && view.UpstreamId == "gen-123");
+
+        // Shape guards: no whitelisted fields / malformed / non-object / wrong types -> null.
+        CheckTrue("origin: no whitelisted fields null", () => AttestationOrigin.ParseResponse(Bytes("{\"full\":\"payload\"}")) is null);
+        CheckTrue("origin: malformed json null", () => AttestationOrigin.ParseResponse(Bytes("{ nope")) is null);
+        CheckTrue("origin: non-object null", () => AttestationOrigin.ParseResponse(Bytes("[1,2]")) is null);
+        CheckTrue("origin: non-string values null", () => AttestationOrigin.ParseResponse(Bytes("{\"provider_name\":42,\"model\":true}")) is null);
+
+        // FindAggregatorRoute: only routes whose host matches an aggregator + have a key.
+        var opts = new ProxyOptions
+        {
+            Keys = new KeyOptions { UpstreamKey = "upstream-key-not-a-secret-in-tests" },
+            RouteKeys = new Dictionary<string, string> { ["agg-key"] = "route-key-not-a-secret-in-tests" },
+            Routes = new List<RouteOptions>
+            {
+                new RouteOptions { Name = "plain", Prefix = "/p", Upstream = "https://plain.test" },
+                new RouteOptions
+                {
+                    Name = "agg", Prefix = "/a", Upstream = "https://openrouter.ai/api", KeyRef = "agg-key",
+                    Transport = new RouteTransportOptions
+                    {
+                        Enabled = true,
+                        Blocklist = new RouteBlocklistOptions { Enabled = true, Aggregators = new List<string> { "openrouter.ai" } },
+                    },
+                },
+            },
+        };
+        var found = AttestationOrigin.FindAggregatorRoute(opts, new List<string> { "openrouter.ai" });
+        CheckTrue("origin: aggregator route found", () => found is not null && found!.Name == "agg");
+        CheckTrue("origin: no matching route null", () => AttestationOrigin.FindAggregatorRoute(opts, new List<string> { "other.ai" }) is null);
+    }
+
+    sealed class TestOptionsMonitor<T> : IOptionsMonitor<T>
+    {
+        private readonly T _value;
+        public TestOptionsMonitor(T value) => _value = value;
+        public T CurrentValue => _value;
+        public T Get(string? name) => _value;
+        public IDisposable? OnChange(Action<T, string?> listener) => null;
     }
 }

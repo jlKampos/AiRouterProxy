@@ -1,0 +1,582 @@
+@page "/attestation"
+@inject IDashboardFacade Facade
+@inject IDashboardAdminService Admin
+
+@{
+    var observed = Routes.Count(r => r.Status == "observed");
+    var warn = Routes.Count(r => r.Status == "warn");
+    var blocked = Routes.Count(r => r.Status == "blocked");
+    var baseline = Routes.Count(r => r.Status == "baseline");
+    var none = Routes.Count(r => r.Status == "none");
+}
+
+<h1 class="title"><span class="grad">Attestation</span></h1>
+<p class="sub">Transport / endpoint attestation: who actually answered each TLS connection, per route. Metadata only - certificate fingerprints, TLS version/cipher and ALPN. Phase 1 observes; Phase 2 pins endpoints (accept = pin the current certificate) and flags drift (<span class="mono">enforce: warn</span> tags responses, <span class="mono">enforce: block</span> rejects with HTTP 526). Keys and payloads never appear here.</p>
+
+<ResultBanner Result="@_result" />
+
+<div class="log-toolbar">
+    <div class="filters">
+        <button class="fc" type="button" @onclick="Refresh">refresh</button>
+    </div>
+    <div class="log-actions">
+        <span class="chip ok"><i class="d"></i>@observed observed</span>
+        <span class="chip"><i class="d" style="--c: var(--amber);"></i>@warn warn</span>
+        <span class="chip bad"><i class="d"></i>@blocked blocked</span>
+        <span class="chip"><i class="d" style="--c: var(--faint);"></i>@baseline baseline</span>
+        <span class="chip"><i class="d" style="--c: var(--faint);"></i>@none none</span>
+        <button class="btn ghost small" type="button" disabled="@_busy" @onclick="AskClearDrift">Clear drift</button>
+    </div>
+</div>
+
+@if (Routes.Count == 0)
+{
+    <div class="panel">
+        <div class="empty">No routes configured - no attestation data.</div>
+    </div>
+}
+
+@foreach (var route in Routes)
+{
+    <div class="panel" style="margin-top: 18px;">
+        <div class="log-head">
+            <div>
+                <h2>@(string.IsNullOrEmpty(route.Route) ? "-" : route.Route)</h2>
+                <div class="h2-rule"></div>
+                <p class="head-desc">
+                    <span class="mono">@(string.IsNullOrEmpty(route.Host) ? "-" : route.Host)</span>
+                    &middot; @StatusLabel(route.Status)
+                    @if (route.LastSeen is { } last)
+                    {
+                        <text>&middot; last seen <span class="mono">@TimeText(last)</span></text>
+                    }
+                    <text>&middot; served by <span class="mono">@(string.IsNullOrEmpty(route.ServedBy) ? "—" : route.ServedBy)</span></text>
+                </p>
+                @if (route.Policy is { } policy)
+                {
+                    <p class="head-desc">
+                        <b>policy:</b> <span class="mono">@policy.Enforce</span>
+                        &middot; grace @policy.GraceDays d
+                        &middot; probe @(policy.ProbeHours > 0 ? policy.ProbeHours + " h" : "off")
+                        @if (policy.TlsFloor is { } floor)
+                        {
+                            <text>&middot; tls &ge; @floor</text>
+                        }
+                        &middot; pins <span class="mono">@policy.PinCount</span>
+                        @if (policy.ExpectedIps.Count > 0)
+                        {
+                            <text>&middot; expected IPs <span class="mono">@string.Join(",", policy.ExpectedIps)</span></text>
+                        }
+                    </p>
+                }
+            </div>
+            <div class="log-actions" style="align-items: flex-start;">
+                <span class="chip @StatusChip(route.Status)"><i class="d"></i>@StatusLabel(route.Status)</span>
+                <button class="btn small" type="button" disabled="@(_busy || route.Entries.Count == 0)" @onclick="() => AskAccept(route)"
+                        title="Pins the latest endpoint certificate (SPKI) so it stops tripping drift. Admin key required.">Accept (pin)</button>
+                <button class="btn ghost small" type="button" disabled="@_busy" @onclick="() => AskLearn(route)"
+                        title="Probes the upstream now and records the current endpoint into the baseline. Admin key required.">Learn now</button>
+                <button class="btn ghost small" type="button" disabled="@_busy" @onclick="() => AskClearPins(route)"
+                        title="Removes the learned pins of this route. Admin key required.">Clear pins</button>
+            </div>
+        </div>
+
+        @if (route.Drift is { Count: > 0 })
+        {
+            <div class="tbl-wrap" style="margin-bottom: 12px;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th scope="col">Drift</th>
+                            <th scope="col">IP</th>
+                            <th scope="col">Reason</th>
+                            <th scope="col">First seen</th>
+                            <th scope="col">Last alerted</th>
+                            <th scope="col">Alerts</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var d in route.Drift)
+                        {
+                            <tr>
+                                <td><span class="chip @SeverityChip(d.Severity)"><i class="d"></i>@d.Severity</span></td>
+                                <td><span class="mono">@d.Ip</span></td>
+                                <td><span class="mono">@d.Reason</span></td>
+                                <td><span class="mono">@TimeText(d.FirstSeen)</span></td>
+                                <td><span class="mono">@TimeText(d.LastAlerted)</span></td>
+                                <td><span class="mono">@d.AlertCount</span></td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        }
+
+        @if (route.Entries.Count == 0)
+        {
+            <div class="note">
+                <b>No endpoint observed yet.</b>
+                Nothing has been written to the baseline for this route. Once a request completes a TLS
+                connection with the transport policy active (or a probe runs), the endpoint fingerprint appears here.
+            </div>
+        }
+        else
+        {
+            <div class="tbl-wrap">
+                <table>
+                    <thead>
+                        <tr>
+                            <th scope="col">Endpoint</th>
+                            <th scope="col">SPKI</th>
+                            <th scope="col">Cert</th>
+                            <th scope="col">Issuer</th>
+                            <th scope="col">TLS</th>
+                            <th scope="col">Cipher</th>
+                            <th scope="col">ALPN</th>
+                            <th scope="col">Validity</th>
+                            <th scope="col">First seen</th>
+                            <th scope="col">Last seen</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var e in route.Entries)
+                        {
+                            <tr>
+                                <td><span class="mono">@e.Ip:@e.Port</span></td>
+                                <td><span class="hash" title="@e.SpkiHash">@e.SpkiHashShort</span></td>
+                                <td><span class="hash" title="@e.CertSha256">@Short(e.CertSha256, 8)</span></td>
+                                <td><span class="mono">@Trunc(e.Issuer, 40)</span></td>
+                                <td><span class="up"><b>@e.TlsVersion</b></span></td>
+                                <td><span class="mono">@(string.IsNullOrEmpty(e.CipherSuite) ? "-" : e.CipherSuite)</span></td>
+                                <td><span class="mono">@(string.IsNullOrEmpty(e.Alpn) ? "-" : e.Alpn)</span></td>
+                                <td><span class="hint">@DateText(e.NotBefore) &rarr; @DateText(e.NotAfter)</span></td>
+                                <td><span class="mono">@TimeText(e.FirstSeen)</span></td>
+                                <td><span class="mono">@TimeText(e.LastSeen)</span></td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+            <div class="note teal" style="margin-top: 12px;">
+                <b>Baseline:</b> up to 8 persisted endpoints per route in <code class="path">data/endpoint-baseline.json</code>.
+                The SPKI fingerprint is the SHA-256 of the server's SubjectPublicKeyInfo (unpadded base64url) - the pin value:
+                effective pins = union(routes.json <code class="path">transport.pins</code> + accepted pins), max 5.
+                <b>Accept (pin)</b> adds the latest endpoint to the route's learned pins (stored in <code class="path">data/pins.json</code>).
+            </div>
+        }
+    </div>
+}
+
+<div class="panel" style="margin-top: 18px;">
+    <h2>Providers (blocklist &amp; ZDR)</h2>
+    <div class="h2-rule"></div>
+    <p class="head-desc">
+        Saved as a whole set with <b>Save providers</b> (admin key re-authenticates) into <code class="path">providers.json</code>, hot-reloaded.
+        <span class="mono">hosts</span> = route-level tier (<b>block</b> rejects with 403 <span class="mono">provider_blocked</span> + header
+        <span class="mono">X-AIRouterProxy-Blocklist</span>); <span class="mono">providerSlugs</span> = provider tier, applied inside aggregator
+        routes (merges <span class="mono">provider.ignore</span>, forces <span class="mono">zdr: true</span> and
+        <span class="mono">data_collection: "deny"</span> on the request body; <span class="mono">providerPolicy: strict</span> rejects conflicts with
+        400 <span class="mono">provider_policy_conflict</span>).
+    </p>
+
+    @if (_providers.Count == 0)
+    {
+        <div class="empty">No provider entries - the blocklist is off. Add the first entry below.</div>
+    }
+    else
+    {
+        <div class="tbl-wrap">
+            <table class="editable">
+                <thead>
+                    <tr>
+                        <th>Id</th>
+                        <th>Name</th>
+                        <th>Severity</th>
+                        <th>Hosts</th>
+                        <th>Provider slugs</th>
+                        <th>Until</th>
+                        <th>Flags</th>
+                        <th>Reason</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @for (var i = 0; i < _providers.Count; i++)
+                    {
+                        var idx = i;
+                        var row = _providers[idx];
+                        <tr>
+                            <td><input class="cell-input mono-cell" @bind="row.Id" placeholder="blocked-provider" /></td>
+                            <td><input class="cell-input" @bind="row.Name" placeholder="display name" /></td>
+                            <td>
+                                <div class="form-line">
+                                    <span class="chip @ProviderSeverityChip(row.Severity)"><i class="d" style="@ProviderSeverityDot(row.Severity)"></i>@row.Severity</span>
+                                    <select class="cell-input" style="width: 74px;" @bind="row.Severity">
+                                        <option value="info">info</option>
+                                        <option value="warn">warn</option>
+                                        <option value="block">block</option>
+                                    </select>
+                                </div>
+                            </td>
+                            <td><input class="cell-input wide" @bind="row.Hosts" placeholder="bad.test *.cdn.test (space separated)" /></td>
+                            <td><input class="cell-input wide" @bind="row.ProviderSlugs" placeholder="openrouter/auto (space separated)" /></td>
+                            <td><input class="cell-input" @bind="row.Until" placeholder="yyyy-MM-dd" /></td>
+                            <td>
+                                <label class="fcheck"><input type="checkbox" @bind="row.ZdrOnly" /> <span>zdr only</span></label>
+                                <label class="fcheck"><input type="checkbox" @bind="row.DataCollectionDeny" /> <span>deny data&nbsp;collection</span></label>
+                            </td>
+                            <td><input class="cell-input wide" @bind="row.Reason" placeholder="why (admin only)" /></td>
+                            <td>
+                                <button class="btn small" type="button" @onclick="() => RemoveProviderRow(idx)" title="Removes this entry from the feed. Saved when you click 'Save providers'.">Remove</button>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+
+    <div class="tbl-actions">
+        <button class="btn ghost" type="button" @onclick="AddProviderRow">+ Add entry</button>
+        <button class="btn primary" type="button" disabled="@_busy" @onclick="AskSaveProviders">Save providers</button>
+    </div>
+</div>
+
+<ConfirmDialog @bind-Visible="_confirmVisible"
+               Title="@_confirmTitle"
+               Message="@_confirmMessage"
+               OnConfirm="OpenKeyPrompt"
+               OnCancel="CancelConfirm" />
+
+<AdminKeyPrompt @bind-Visible="_promptVisible"
+                Title="@_promptTitle"
+                Message="@_promptMessage"
+                OnSubmit="_pendingPrompt"
+                OnCompleted="OnPromptCompleted"
+                OnCancel="CancelPrompt" />
+
+@code {
+    private IReadOnlyList<AttestationRouteView> Routes { get; set; } = Array.Empty<AttestationRouteView>();
+
+    private AdminResult? _result;
+    private bool _busy;
+    private bool _confirmVisible;
+    private bool _promptVisible;
+    private string _confirmTitle = string.Empty;
+    private string _confirmMessage = string.Empty;
+    private string _promptTitle = "Admin key required";
+    private string _promptMessage = "Attestation pinning and clears are security-posture changes. The primary local key re-authenticates this operation.";
+    private Func<string, Task<AdminResult>>? _pendingPrompt;
+
+    private List<ProviderRow> _providers = new();
+
+    protected override void OnInitialized()
+    {
+        Refresh();
+        RefreshProviders();
+    }
+
+    private void Refresh()
+    {
+        Routes = Facade.GetAttestation();
+        StateHasChanged();
+    }
+
+    private void RefreshProviders()
+    {
+        _providers = (Facade.GetProvidersFromDisk() ?? Facade.GetProviders())
+            .Select(ProviderRow.FromView)
+            .ToList();
+    }
+
+    private void OnPromptCompleted(AdminResult result)
+    {
+        _result = result;
+        _pendingPrompt = null;
+        Refresh(); // pins/drift/status must reflect the action
+        RefreshProviders(); // the provider feed was saved just now (or left untouched)
+        StateHasChanged();
+    }
+
+    private void OpenKeyPrompt()
+    {
+        _confirmVisible = false;
+        _promptVisible = true;
+    }
+
+    private void CancelConfirm()
+    {
+        _confirmVisible = false;
+        _pendingPrompt = null;
+    }
+
+    private void CancelPrompt()
+    {
+        _promptVisible = false;
+        _pendingPrompt = null;
+    }
+
+    private void AskAccept(AttestationRouteView route)
+    {
+        _result = null;
+        _confirmTitle = $"Pin the latest endpoint of '{route.Route}'?";
+        _confirmMessage = "The most recently observed certificate (SPKI) becomes a learned pin (max 5 per route, oldest dropped). " +
+                          "It stops tripping drift - use it only when you trust the current endpoint.";
+        _pendingPrompt = key => RunSync(() => Admin.AcceptAttestationPin(route.Route, null, key));
+        _confirmVisible = true;
+    }
+
+    private void AskLearn(AttestationRouteView route)
+    {
+        _result = null;
+        _confirmTitle = $"Probe '{route.Route}' now?";
+        _confirmMessage = "A plain TCP+TLS connect (no request is sent) records the current endpoint into the baseline and the drift feed.";
+        _pendingPrompt = key => RunAsync(() => Admin.LearnAttestationNowAsync(route.Route, key));
+        _confirmVisible = true;
+    }
+
+    private void AskClearPins(AttestationRouteView route)
+    {
+        _result = null;
+        _confirmTitle = $"Clear learned pins of '{route.Route}'?";
+        _confirmMessage = "Removes every accepted pin of this route from data/pins.json. Configured transport.pins are NOT touched.";
+        _pendingPrompt = key => RunSync(() => Admin.ClearAttestationPins(route.Route, key));
+        _confirmVisible = true;
+    }
+
+    private void AskClearDrift()
+    {
+        _result = null;
+        _confirmTitle = "Clear the attestation drift feed?";
+        _confirmMessage = "This removes every drift episode from the in-memory feed. Nothing is written to disk, and it cannot be undone.";
+        _pendingPrompt = key => RunSync(() => Admin.ClearAttestationDrift(key));
+        _confirmVisible = true;
+    }
+
+    // ----------------------------------------------------------
+    // Providers (blocklist & ZDR) editing - inline rows, saved as a whole set with the
+    // same confirm + admin-key re-auth as every other security-posture write.
+    // ----------------------------------------------------------
+
+    private void AddProviderRow()
+    {
+        _result = null;
+        // A prefilled id so the row is unique even before the user types; the server
+        // revalidates everything (id required/unique, hosts/slugs bounds, severity).
+        _providers.Add(new ProviderRow { Id = Guid.NewGuid().ToString("N")[..8], Severity = "info" });
+    }
+
+    private void RemoveProviderRow(int index)
+    {
+        if (index >= 0 && index < _providers.Count)
+        {
+            _providers.RemoveAt(index);
+        }
+    }
+
+    private void AskSaveProviders()
+    {
+        _result = null;
+
+        var (drafts, error) = BuildDrafts();
+        if (error is not null)
+        {
+            _result = AdminResult.Failure(error, AdminResult.TypeValidation);
+            return;
+        }
+
+        _confirmTitle = "Save provider feed?";
+        _confirmMessage = "Replaces the whole blocklist feed in providers.json (hot-reloaded). Host-tier entries reject with 403; " +
+                          "provider slugs merge inside aggregator routes. Admin key required.";
+        _pendingPrompt = key => Task.FromResult(Admin.ApplyProviders(drafts, key));
+        _confirmVisible = true;
+    }
+
+    /// <summary>
+    /// Light client-side validation mirroring ProviderFeedValidator, so invalid rows are
+    /// caught before the modal opens (the server still revalidates and refuses on PUT).
+    /// Returns the drafts plus the first problem found (null = clean).
+    /// </summary>
+    private (List<ProviderEntryDraft> Drafts, string? Error) BuildDrafts()
+    {
+        var drafts = new List<ProviderEntryDraft>(_providers.Count);
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+
+        for (var i = 0; i < _providers.Count; i++)
+        {
+            var row = _providers[i];
+            var id = (row.Id ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(id))
+            {
+                return (drafts, $"Entry #{i + 1}: 'id' is required.");
+            }
+            if (id.Length > 64)
+            {
+                return (drafts, $"Entry '{id}': 'id' must be at most 64 characters.");
+            }
+            if (!ids.Add(id))
+            {
+                return (drafts, $"Entry '{id}': duplicated 'id'.");
+            }
+
+            if (row.Severity is not ("info" or "warn" or "block"))
+            {
+                return (drafts, $"Entry '{id}': 'severity' must be one of info|warn|block.");
+            }
+
+            var hosts = SplitList(row.Hosts);
+            var slugs = SplitList(row.ProviderSlugs);
+            if (hosts.Count == 0 && slugs.Count == 0)
+            {
+                return (drafts, $"Entry '{id}': at least one of 'hosts' or 'providerSlugs' is required.");
+            }
+            if (hosts.Count > 32 || slugs.Count > 32)
+            {
+                return (drafts, $"Entry '{id}': 'hosts'/'providerSlugs' are limited to 32 entries each.");
+            }
+            if (hosts.Any(h => h.Length > 128) || slugs.Any(s => s.Length > 128))
+            {
+                return (drafts, $"Entry '{id}': host / providerSlug entries are limited to 128 characters.");
+            }
+
+            DateTimeOffset? until = null;
+            if (!string.IsNullOrWhiteSpace(row.Until))
+            {
+                if (!DateTimeOffset.TryParse(row.Until, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var parsed))
+                {
+                    return (drafts, $"Entry '{id}': 'until' must be a date (yyyy-MM-dd).");
+                }
+                until = parsed;
+            }
+
+            drafts.Add(new ProviderEntryDraft(
+                Id: id,
+                Name: (row.Name ?? string.Empty).Trim(),
+                Hosts: hosts,
+                ProviderSlugs: slugs,
+                Reason: (row.Reason ?? string.Empty).Trim(),
+                Severity: row.Severity,
+                Until: until,
+                ZdrOnly: row.ZdrOnly,
+                DataCollectionDeny: row.DataCollectionDeny));
+        }
+
+        return (drafts, null);
+    }
+
+    private static List<string> SplitList(string? text)
+        => string.IsNullOrWhiteSpace(text)
+            ? new List<string>()
+            : text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
+    private async Task<AdminResult> RunSync(Func<AdminResult> operation)
+    {
+        _result = null;
+        _busy = true;
+        StateHasChanged();
+        await Task.Yield();
+        try
+        {
+            var result = operation();
+            _result = result;
+            StateHasChanged();
+            return result;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private async Task<AdminResult> RunAsync(Func<Task<AdminResult>> operation)
+    {
+        _result = null;
+        _busy = true;
+        StateHasChanged();
+        await Task.Yield();
+        try
+        {
+            var result = await operation();
+            _result = result;
+            StateHasChanged();
+            return result;
+        }
+        finally
+        {
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private static string StatusLabel(string status) => status switch
+    {
+        "observed" => "observed (live)",
+        "warn" => "drift - warn",
+        "blocked" => "drift - blocked",
+        "baseline" => "baseline only",
+        _ => "none",
+    };
+
+    private static string StatusChip(string status) => status switch
+    {
+        "observed" => "ok",
+        "warn" => "",
+        "blocked" => "bad",
+        "baseline" => "",
+        _ => "bad",
+    };
+
+    private static string SeverityChip(string severity)
+        => severity == "high" ? "bad" : severity == "low" ? "" : "ok";
+
+    private static string TimeText(DateTimeOffset value) => value.ToLocalTime().ToString("MM-dd HH:mm");
+
+    private static string DateText(DateTimeOffset value) => value.ToLocalTime().ToString("yyyy-MM-dd");
+
+    private static string Short(string? value, int max)
+        => string.IsNullOrEmpty(value) ? "-" : value.Length <= max ? value : value[..max] + "…";
+
+    private static string Trunc(string? value, int max)
+        => string.IsNullOrEmpty(value) ? "-" : value.Length <= max ? value : value[..max] + "…";
+
+    private static string ProviderSeverityChip(string severity) => severity switch
+    {
+        "block" => "bad",
+        "info" => "ok",
+        _ => "",
+    };
+
+    private static string? ProviderSeverityDot(string severity) => severity switch
+    {
+        "warn" => "--c: var(--amber);",
+        "info" => "--c: var(--green);",
+        _ => null,
+    };
+
+    private sealed class ProviderRow
+    {
+        public string Id = string.Empty;
+        public string Name = string.Empty;
+        public string Hosts = string.Empty;
+        public string ProviderSlugs = string.Empty;
+        public string Reason = string.Empty;
+        public string Severity = "info";
+        public string Until = string.Empty;
+        public bool ZdrOnly;
+        public bool DataCollectionDeny;
+
+        public static ProviderRow FromView(ProviderEntryView v) => new()
+        {
+            Id = v.Id ?? string.Empty,
+            Name = v.Name ?? string.Empty,
+            Hosts = string.Join(" ", v.Hosts ?? Array.Empty<string>()),
+            ProviderSlugs = string.Join(" ", v.ProviderSlugs ?? Array.Empty<string>()),
+            Reason = v.Reason ?? string.Empty,
+            Severity = string.IsNullOrWhiteSpace(v.Severity) ? "info" : v.Severity,
+            Until = v.Until?.ToString("yyyy-MM-dd") ?? string.Empty,
+            ZdrOnly = v.ZdrOnly,
+            DataCollectionDeny = v.DataCollectionDeny,
+        };
+    }
+}

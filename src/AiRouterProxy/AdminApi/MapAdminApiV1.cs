@@ -32,6 +32,8 @@ public static class MapAdminApiV1Extensions
     private sealed record SecurityBody(JsonNode? redaction, JsonNode? inspection);
     private sealed record LookupBody(string? hash);
     private sealed record LocalKeyLabelBody(string? label);
+    private sealed record AcceptPinBody(string? spki);
+    private sealed record ProvidersBody(IReadOnlyList<ProviderEntryDraft>? providers);
 
     public static WebApplication MapAdminApiV1(this WebApplication app)
     {
@@ -76,6 +78,30 @@ public static class MapAdminApiV1Extensions
             }
 
             return Respond(svc.ApplyRoutes(body.routes, Bearer(ctx)), ctx);
+        });
+
+        // Provider blocklist feed (Phase 3): metadata-only, non-secret, hot-reloaded.
+        app.MapGet("/admin/api/v1/providers", (IOptionsMonitor<ProxyOptions> optsMonitor) =>
+        {
+            var opts = optsMonitor.CurrentValue;
+            var entries = opts.Providers?.Entries ?? new List<ProviderEntryOptions>();
+            return Results.Ok(new { providers = entries.Select(ToProviderJson) });
+        });
+
+        app.MapPut("/admin/api/v1/providers", async (IDashboardAdminService svc, HttpContext ctx) =>
+        {
+            var (invalid, body) = await ReadAsync<ProvidersBody>(ctx);
+            if (invalid)
+            {
+                return Error(400, "validation_error", "Invalid JSON body.");
+            }
+
+            if (body?.providers is null)
+            {
+                return Error(400, "validation_error", "Body must contain a 'providers' array.");
+            }
+
+            return Respond(svc.ApplyProviders(body.providers, Bearer(ctx)), ctx);
         });
 
         app.MapGet("/admin/api/v1/keys", (IDashboardFacade facade, KeyMetaStore metaStore, IOptionsMonitor<ProxyOptions> optsMonitor) =>
@@ -234,6 +260,67 @@ public static class MapAdminApiV1Extensions
 
         app.MapDelete("/admin/api/v1/detections", (IDashboardAdminService svc, HttpContext ctx) =>
             Respond(svc.ClearDetections(Bearer(ctx)), ctx));
+
+        // Transport/Endpoint Attestation (Phase 1 read model + Phase 2 policy/drift):
+        // who answered each TLS connection per route (metadata only - certificate
+        // fingerprints, TLS facts, drift episodes; never request content, never keys).
+        app.MapGet("/admin/api/v1/attestation/endpoints", (
+            IOptionsMonitor<ProxyOptions> optsMonitor,
+            TransportStore store,
+            BaselineStore baseline,
+            TransportPolicyProvider policies,
+            DriftStore drift,
+            LearnedPinStore learnedPins) =>
+        {
+            var opts = optsMonitor.CurrentValue;
+            return Results.Ok(new { routes = BuildAttestationRoutes(opts, store, baseline, policies, drift, learnedPins) });
+        });
+
+        // Phase 2 write actions (audited + admin key re-checked inside the service).
+        app.MapPost("/admin/api/v1/attestation/{routeName}/accept", async (IDashboardAdminService svc, HttpContext ctx, string routeName) =>
+        {
+            var (invalid, body) = await ReadAsync<AcceptPinBody>(ctx);
+            if (invalid)
+            {
+                return Error(400, "validation_error", "Invalid JSON body.");
+            }
+
+            return Respond(svc.AcceptAttestationPin(routeName, body?.spki, Bearer(ctx)), ctx);
+        });
+
+        app.MapPost("/admin/api/v1/attestation/{routeName}/learn", async (IDashboardAdminService svc, HttpContext ctx, string routeName) =>
+        {
+            var result = await svc.LearnAttestationNowAsync(routeName, Bearer(ctx));
+            return Respond(result, ctx);
+        });
+
+        app.MapDelete("/admin/api/v1/attestation/pins", (IDashboardAdminService svc, HttpContext ctx, string? routeName = null) =>
+            Respond(svc.ClearAttestationPins(string.IsNullOrWhiteSpace(routeName) ? null : routeName, Bearer(ctx)), ctx));
+
+        app.MapDelete("/admin/api/v1/attestation/drift", (IDashboardAdminService svc, HttpContext ctx) =>
+            Respond(svc.ClearAttestationDrift(Bearer(ctx)), ctx));
+
+        // Phase 3 provider attribution: resolves the origin of one generation through the
+        // aggregator route (server-side; the route's key never leaves the process). Only
+        // provider_name/model/upstream_id are returned - the payload is strictly filtered.
+        app.MapGet("/admin/api/v1/attestation/origin", async (IDashboardAdminService svc, HttpContext ctx, string generationId) =>
+        {
+            var result = await svc.LookupGenerationOriginAsync(generationId, Bearer(ctx));
+            if (result.Ok)
+            {
+                return Results.Json(result.Data ?? new JsonObject(), statusCode: StatusCodes.Status200OK);
+            }
+
+            // Aggregator-origin errors map to their own statuses (422 validation_error /
+            // 502 bad_gateway), still in the project's error envelope.
+            return result.ErrorType switch
+            {
+                AdminResult.TypeAuthentication => Error(StatusCodes.Status401Unauthorized, AdminResult.TypeAuthentication, result.Message),
+                AdminResult.TypeUnprocessable => Error(StatusCodes.Status422UnprocessableEntity, "validation_error", result.Message),
+                AdminResult.TypeBadGateway => Error(StatusCodes.Status502BadGateway, "bad_gateway", result.Message),
+                _ => Error(StatusCodes.Status500InternalServerError, AdminResult.TypeInternal, "Internal error."),
+            };
+        });
 
         app.MapPost("/admin/api/v1/keys/lookup", async (HttpContext ctx, IOptionsMonitor<ProxyOptions> optsMonitor, KeyMetaStore metaStore) =>
         {
@@ -483,4 +570,177 @@ public static class MapAdminApiV1Extensions
         maxBodySize = draft.MaxBodySize,
         headers = draft.SafeHeaders,
     };
+
+    /// <summary>Provider feed entry projection for the read API (metadata only, camelCase like the config).</summary>
+    private static object ToProviderJson(ProviderEntryOptions e) => new
+    {
+        id = e.Id,
+        name = e.Name,
+        hosts = e.Hosts ?? new List<string>(),
+        providerSlugs = e.ProviderSlugs ?? new List<string>(),
+        reason = e.Reason,
+        severity = e.Severity,
+        until = e.Until,
+        zdrOnly = e.ZdrOnly,
+        dataCollectionDeny = e.DataCollectionDeny,
+    };
+
+    // ----------------------------------------------------------
+    // Transport/Endpoint attestation read model (metadata only)
+    // ----------------------------------------------------------
+
+    /// <summary>
+    /// Per-route attestation rows: the route, its status ("observed" | "warn" | "blocked" |
+    /// "baseline" | "none"), the last seen time, the policy posture, the drift episodes and
+    /// the persistent baseline entries. Never request content/keys - only public fingerprints.
+    /// </summary>
+    private static object[] BuildAttestationRoutes(
+        ProxyOptions opts,
+        TransportStore store,
+        BaselineStore baseline,
+        TransportPolicyProvider policies,
+        DriftStore drift,
+        LearnedPinStore learnedPins)
+    {
+        var rows = new List<object>();
+        var recent = store.Recent(200);
+        var driftAll = drift.Recent(100);
+
+        if (opts.Routes is { Count: > 0 })
+        {
+            foreach (var r in opts.Routes)
+            {
+                var name = r.Name ?? string.Empty;
+                rows.Add(BuildRouteRow(name, SafeHost(r.Upstream), r.Upstream, recent, driftAll, baseline, policies, learnedPins));
+            }
+        }
+        else
+        {
+            // Legacy single-upstream mode: one implicit "default" route.
+            rows.Add(BuildRouteRow("default", SafeHost(opts.Upstream), opts.Upstream, recent, driftAll, baseline, policies, learnedPins));
+        }
+
+        return rows.ToArray();
+    }
+
+    private static object BuildRouteRow(
+        string name,
+        string host,
+        string upstream,
+        IReadOnlyList<TransportObservation> recent,
+        IReadOnlyList<DriftEpisode> driftAll,
+        BaselineStore baseline,
+        TransportPolicyProvider policies,
+        LearnedPinStore learnedPins)
+    {
+        var live = recent.Where(o => string.Equals(o.Route, name, StringComparison.Ordinal)).ToList();
+        var baseRoute = baseline.GetRoute(name);
+        var entries = baseRoute?.Entries ?? Array.Empty<EndpointIdentity>();
+
+        var lastLive = live.OrderByDescending(x => x.Timestamp).FirstOrDefault();
+        var status = lastLive is not null
+            ? (lastLive.Status is "warn" or "blocked" ? lastLive.Status : "observed")
+            : baseRoute is not null
+                ? "baseline"
+                : "none";
+
+        DateTimeOffset? lastSeen = null;
+        foreach (var e in entries)
+        {
+            if (lastSeen is null || e.LastSeen > lastSeen.Value)
+            {
+                lastSeen = e.LastSeen;
+            }
+        }
+
+        foreach (var o in live)
+        {
+            if (lastSeen is null || o.Timestamp > lastSeen.Value)
+            {
+                lastSeen = o.Timestamp;
+            }
+        }
+
+        return new
+        {
+            route = name,
+            host = string.IsNullOrWhiteSpace(host) ? SafeHost(upstream) : host,
+            status,
+            lastSeen,
+            entries = entries.Select(ToAttestationEntry),
+            policy = BuildPolicyNode(policies, learnedPins, name),
+            drift = driftAll
+                .Where(d => string.Equals(d.Route, name, StringComparison.Ordinal))
+                .Select(ToDriftNode)
+                .ToArray(),
+        };
+    }
+
+    private static object? BuildPolicyNode(TransportPolicyProvider policies, LearnedPinStore learnedPins, string name)
+    {
+        if (policies is null)
+        {
+            return null;
+        }
+
+        var p = policies.ForRoute(name);
+        if (p is null)
+        {
+            return null;
+        }
+
+        var configured = p.Pins ?? Array.Empty<string>();
+        var effective = AttestationRecorder.EffectivePins(p, name, learnedPins?.GetForRoute(name) ?? Array.Empty<string>());
+        return new
+        {
+            enabled = true,
+            enforce = p.Enforce,
+            graceDays = p.GraceDays,
+            probeHours = p.ProbeHours,
+            expectedIps = p.ExpectedIps ?? Array.Empty<string>(),
+            tlsFloor = p.TlsFloor,
+            pins = configured,
+            effectivePinCount = effective.Count,
+        };
+    }
+
+    private static object ToDriftNode(DriftEpisode d) => new
+    {
+        ip = d.Ip,
+        reason = d.Reason,
+        severity = d.Severity,
+        firstSeen = d.FirstSeen,
+        lastAlerted = d.LastAlerted,
+        alertCount = d.AlertCount,
+    };
+
+    private static object ToAttestationEntry(EndpointIdentity e) => new
+    {
+        ip = e.Ip,
+        port = e.Port,
+        spkiHash = e.SpkiHash,
+        spkiHashShort = e.SpkiHashShort,
+        certSha256 = e.CertSha256,
+        issuer = e.Issuer,
+        notBefore = e.NotBefore,
+        notAfter = e.NotAfter,
+        tlsVersion = e.TlsVersion,
+        cipherSuite = e.CipherSuite,
+        alpn = e.Alpn,
+        firstSeen = e.FirstSeen,
+        lastSeen = e.LastSeen,
+        source = e.Source,
+    };
+
+    private static string SafeHost(string? upstream)
+    {
+        try
+        {
+            return new Uri(upstream ?? string.Empty).Host;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
 }

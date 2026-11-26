@@ -22,6 +22,7 @@ public sealed class DashboardAdminService : IDashboardAdminService
     private const string ServerFile = "appsettings.Server.json";
     private const string RoutesFile = "routes.json";
     private const string RedactionFile = "redaction.json";
+    private const string ProvidersFile = "providers.json";
     private const string EventLogName = "AIRouterProxy";
 
     private static readonly JsonSerializerOptions JsonRead = new() { PropertyNameCaseInsensitive = true };
@@ -43,6 +44,11 @@ public sealed class DashboardAdminService : IDashboardAdminService
     private readonly ActivityStore _activity;
     private readonly IEventLogStore _eventLogs;
     private readonly IDetectionStore _detections;
+    private readonly DriftStore? _drift;
+    private readonly LearnedPinStore? _learnedPins;
+    private readonly EndpointProbe? _probe;
+    private readonly BaselineStore? _baseline;
+    private readonly IHttpClientFactory? _http;
     private readonly ILogger<DashboardAdminService> _logger;
 
     // Serializes every config write (backup -> write -> confirm -> audit) because the
@@ -62,7 +68,12 @@ public sealed class DashboardAdminService : IDashboardAdminService
         ActivityStore activity,
         IEventLogStore eventLogs,
         IDetectionStore detections,
-        ILogger<DashboardAdminService> logger)
+        ILogger<DashboardAdminService> logger,
+        DriftStore? drift = null,
+        LearnedPinStore? learnedPins = null,
+        EndpointProbe? probe = null,
+        BaselineStore? baseline = null,
+        IHttpClientFactory? httpClientFactory = null)
     {
         _options = options;
         _paths = paths;
@@ -73,6 +84,11 @@ public sealed class DashboardAdminService : IDashboardAdminService
         _activity = activity;
         _eventLogs = eventLogs;
         _detections = detections;
+        _drift = drift;
+        _learnedPins = learnedPins;
+        _probe = probe;
+        _baseline = baseline;
+        _http = httpClientFactory;
         _logger = logger;
     }
 
@@ -139,6 +155,211 @@ public sealed class DashboardAdminService : IDashboardAdminService
             return AdminResult.Failure("Could not write routes.json - the previous version was kept.", AdminResult.TypeInternal);
         }
     }
+
+    // ----------------------------------------------------------
+    // Provider blocklist feed (non-sensitive: providers.json, hot reload)
+    // ----------------------------------------------------------
+
+    public AdminResult ApplyProviders(IReadOnlyList<ProviderEntryDraft> providers, string? authKey = null)
+    {
+        lock (_writeLock)
+        {
+            return ApplyProvidersCore(providers, authKey);
+        }
+    }
+
+    private AdminResult ApplyProvidersCore(IReadOnlyList<ProviderEntryDraft> providers, string? authKey)
+    {
+        if (!string.IsNullOrEmpty(authKey) && !VerifyAdminKey(authKey))
+        {
+            return AdminResult.Failure("Invalid admin key.", AdminResult.TypeAuthentication);
+        }
+
+        var entries = (providers ?? new List<ProviderEntryDraft>())
+            .Select(ToProviderEntryOptions)
+            .ToList();
+
+        if (!ProviderFeedValidator.Validate(entries, out var errors))
+        {
+            return AdminResult.Failure("Provider feed is invalid - nothing was written.", AdminResult.TypeValidation, errors.ToArray());
+        }
+
+        try
+        {
+            _backups.Backup(_paths.ConfigDir, ProvidersFile);
+            var root = LoadOrCreateConfig(ProvidersFile);
+            var proxy = EnsureObject(root, "Proxy");
+            var feed = proxy["Providers"] as JsonObject ?? new JsonObject();
+            var array = new JsonArray();
+            foreach (var entry in entries)
+            {
+                array.Add(JsonSerializer.SerializeToNode(entry, JsonWrite));
+            }
+
+            feed["Entries"] = array;
+            proxy["Providers"] = feed;
+            AtomicJsonWriter.SaveAtomic(ConfigPaths.ResolveFile(ProvidersFile, _paths.ConfigDir), root);
+
+            var confirmed = _confirmer.Confirm(_paths.ConfigDir, ProvidersFile, ProvidersShape);
+            if (!confirmed)
+            {
+                RecoverAfterFailedConfirm(ProvidersFile);
+                _audit.Append("providers.update", ProvidersFile, "restored", Actor(authKey));
+                return AdminResult.Failure(
+                    "providers.json failed to reload after the write - the previous version was restored.",
+                    AdminResult.TypeInternal, restored: true);
+            }
+
+            _audit.Append("providers.update", ProvidersFile, "ok", Actor(authKey));
+            var message = entries.Count switch
+            {
+                0 => "Provider feed cleared and the engine reloaded.",
+                1 => "1 provider feed entry saved and the engine reloaded.",
+                _ => $"{entries.Count} provider feed entries saved and the engine reloaded.",
+            };
+            return AdminResult.Success(message);
+        }
+        catch (Exception)
+        {
+            _audit.Append("providers.update", ProvidersFile, "error", Actor(authKey));
+            return AdminResult.Failure("Could not write providers.json - the previous version was kept.", AdminResult.TypeInternal);
+        }
+    }
+
+    // ----------------------------------------------------------
+    // Provider attribution origin (Phase 3 read; the route's key never leaves the process)
+    // ----------------------------------------------------------
+
+    public async Task<AdminResult> LookupGenerationOriginAsync(string generationId, string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (string.IsNullOrWhiteSpace(generationId))
+        {
+            return AdminResult.Failure("The 'generationId' query parameter is required.", AdminResult.TypeUnprocessable);
+        }
+
+        if (generationId.Length > AttestationOrigin.MaxGenerationIdLength)
+        {
+            return AdminResult.Failure($"'generationId' must be at most {AttestationOrigin.MaxGenerationIdLength} characters.", AdminResult.TypeUnprocessable);
+        }
+
+        var opts = _options.CurrentValue;
+        (RouteOptions? Route, string? UpstreamBase, string? Key) aggregator = FindAggregator(opts);
+        if (aggregator.Route is null)
+        {
+            return AdminResult.Failure(
+                "No route is configured as an aggregator (transport.blocklist.aggregators) with an active key - nothing to ask.",
+                AdminResult.TypeUnprocessable);
+        }
+
+        if (string.IsNullOrWhiteSpace(aggregator.Key))
+        {
+            return AdminResult.Failure("The aggregator route has no configured key - cannot call the generation API.", AdminResult.TypeBadGateway);
+        }
+
+        var url = AttestationOrigin.BuildGenerationUrl(aggregator.UpstreamBase ?? string.Empty, generationId);
+        if (string.IsNullOrWhiteSpace(url) || !Uri.TryCreate(url, UriKind.Absolute, out _))
+        {
+            return AdminResult.Failure("The aggregator route's upstream is not a usable base URL.", AdminResult.TypeBadGateway);
+        }
+
+        try
+        {
+            // The key is used ONLY on the outbound Authorization header; it is never
+            // echoed back, logged or included in any result.
+            var client = _http?.CreateClient() ?? new HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(AttestationOrigin.TimeoutSeconds);
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + aggregator.Key);
+
+            using var response = await client.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, CancellationToken.None).ConfigureAwait(false);
+
+            var body = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+            var status = (int)response.StatusCode;
+            if (status is < 200 or >= 300)
+            {
+                return status is >= 400 and < 500
+                    ? AdminResult.Failure("The aggregator rejected the generation request.", AdminResult.TypeValidation)
+                    : AdminResult.Failure("The aggregator could not answer the generation request.", AdminResult.TypeBadGateway);
+            }
+
+            var view = AttestationOrigin.ParseResponse(body);
+            if (view is null)
+            {
+                return AdminResult.Failure("The aggregator response did not match the expected generation shape.", AdminResult.TypeBadGateway);
+            }
+
+            return AdminResult.Success(
+                "Generation origin resolved (provider_name/model/upstream_id only).",
+                data: JsonSerializer.SerializeToNode(new
+                {
+                    provider_name = view.ProviderName,
+                    model = view.Model,
+                    upstream_id = view.UpstreamId,
+                }));
+        }
+        catch (OperationCanceledException)
+        {
+            return AdminResult.Failure("The aggregator did not answer in time.", AdminResult.TypeBadGateway);
+        }
+        catch (Exception)
+        {
+            return AdminResult.Failure("Could not reach the aggregator's generation endpoint.", AdminResult.TypeBadGateway);
+        }
+    }
+
+    /// <summary>
+    /// Finds the aggregator route: the first route whose upstream host matches an
+    /// aggregator entry of its own blocklist section and has a resolvable key.
+    /// Returns the route, its upstream base and the (in-process only) key.
+    /// </summary>
+    private (RouteOptions? Route, string? UpstreamBase, string? Key) FindAggregator(ProxyOptions opts)
+    {
+        if (opts?.Routes is not { Count: > 0 })
+        {
+            return (null, null, null);
+        }
+
+        foreach (var route in opts.Routes)
+        {
+            var aggregators = route.Transport?.Blocklist?.Aggregators;
+            if (aggregators is not { Count: > 0 })
+            {
+                continue;
+            }
+
+            var host = ProviderBlocklist.HostOf(route.Upstream);
+            if (host.Length == 0 || !AttestationOrigin.IsAggregatorHost(host, aggregators))
+            {
+                continue;
+            }
+
+            var key = RouteResolver.GetRouteKey(route, opts.RouteKeys, opts.Keys?.UpstreamKey);
+            return (route, route.Upstream, key);
+        }
+
+        return (null, null, null);
+    }
+
+    private static ProviderEntryOptions ToProviderEntryOptions(ProviderEntryDraft d)
+        => new()
+        {
+            Id = d.Id ?? string.Empty,
+            Name = d.Name ?? string.Empty,
+            Hosts = new List<string>(d.SafeHosts),
+            ProviderSlugs = new List<string>(d.SafeProviderSlugs),
+            Reason = d.Reason ?? string.Empty,
+            Severity = string.IsNullOrWhiteSpace(d.Severity) ? "info" : d.Severity,
+            Until = d.Until,
+            ZdrOnly = d.ZdrOnly,
+            DataCollectionDeny = d.DataCollectionDeny,
+        };
 
     // ----------------------------------------------------------
     // Route key secrets (sensitive: writes appsettings.Server.json)
@@ -634,6 +855,140 @@ public sealed class DashboardAdminService : IDashboardAdminService
         return AdminResult.Success(message);
     }
 
+    // ----------------------------------------------------------
+    // Transport/Endpoint attestation write actions (Phase 2). Every action changes the
+    // security posture (pins) or is destructive (clears), so the same re-auth path as
+    // the destructive clears applies: primary local key + audit, no config write lock.
+    // ----------------------------------------------------------
+
+    public AdminResult AcceptAttestationPin(string routeName, string? spki, string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (string.IsNullOrWhiteSpace(routeName))
+        {
+            return AdminResult.Failure("Route name is required.", AdminResult.TypeValidation);
+        }
+
+        if (_learnedPins is null)
+        {
+            return AdminResult.Failure("The learned-pin store is unavailable.", AdminResult.TypeInternal);
+        }
+
+        var opts = _options.CurrentValue;
+        if (opts.Routes?.Any(r => string.Equals(r.Name, routeName, StringComparison.Ordinal)) is not true)
+        {
+            return AdminResult.Failure($"Route '{routeName}' does not exist.", AdminResult.TypeNotFound);
+        }
+
+        var pin = string.IsNullOrWhiteSpace(spki) ? LatestObservedSpki(routeName) : spki.Trim();
+        if (string.IsNullOrWhiteSpace(pin))
+        {
+            return AdminResult.Failure($"No endpoint observed for route '{routeName}' yet - nothing to accept.", AdminResult.TypeNotFound);
+        }
+
+        var canonical = TransportHashes.NormalizePin(pin);
+        if (canonical is null)
+        {
+            return AdminResult.Failure("The SPKI value is not a valid SHA-256 fingerprint (64 hex or base64url).", AdminResult.TypeValidation);
+        }
+
+        var added = _learnedPins.AddPin(routeName, canonical, DateTimeOffset.UtcNow);
+        var count = _learnedPins.GetForRoute(routeName).Count;
+        var message = added
+            ? $"SPKI {TransportHashes.ShortHex16(canonical)} pinned for route '{routeName}' ({count} learned pin{(count == 1 ? "" : "s")})."
+            : $"SPKI {TransportHashes.ShortHex16(canonical)} was already pinned for route '{routeName}'.";
+        TryAudit("attestation.pin.accept", routeName, "ok", authKey);
+        return AdminResult.Success(message);
+    }
+
+    public async Task<AdminResult> LearnAttestationNowAsync(string routeName, string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (string.IsNullOrWhiteSpace(routeName))
+        {
+            return AdminResult.Failure("Route name is required.", AdminResult.TypeValidation);
+        }
+
+        if (_probe is null)
+        {
+            return AdminResult.Failure("The endpoint probe is unavailable.", AdminResult.TypeInternal);
+        }
+
+        var ok = await _probe.ProbeRouteAsync(routeName, CancellationToken.None);
+        if (!ok)
+        {
+            return AdminResult.Failure($"The probe for route '{routeName}' could not complete (unknown route or unreachable upstream).", AdminResult.TypeInternal);
+        }
+
+        TryAudit("attestation.learn", routeName, "ok", authKey);
+        return AdminResult.Success($"Endpoint probe for route '{routeName}' completed - the observation is in the baseline and the drift feed.");
+    }
+
+    public AdminResult ClearAttestationPins(string? routeName, string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (_learnedPins is null)
+        {
+            return AdminResult.Failure("The learned-pin store is unavailable.", AdminResult.TypeInternal);
+        }
+
+        var removed = string.IsNullOrWhiteSpace(routeName)
+            ? _learnedPins.ClearAll()
+            : _learnedPins.RemoveRoute(routeName!);
+
+        var message = removed == 0
+            ? "No learned pins to clear."
+            : string.IsNullOrWhiteSpace(routeName)
+                ? $"Learned pins cleared ({removed} pin{(removed == 1 ? "" : "s")} removed)."
+                : $"Learned pins for route '{routeName}' cleared ({removed} pin{(removed == 1 ? "" : "s")} removed).";
+        TryAudit("attestation.pins.clear", string.IsNullOrWhiteSpace(routeName) ? "all" : routeName, "ok", authKey);
+        return AdminResult.Success(message);
+    }
+
+    public AdminResult ClearAttestationDrift(string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (_drift is null)
+        {
+            return AdminResult.Failure("The drift feed is unavailable.", AdminResult.TypeInternal);
+        }
+
+        var cleared = _drift.Clear();
+        var message = $"Attestation drift feed cleared ({cleared} {(cleared == 1 ? "episode" : "episodes")}).";
+        TryAudit("attestation.drift.clear", "drift feed", "ok", authKey);
+        return AdminResult.Success(message);
+    }
+
+    /// <summary>The most recent endpoint SPKI observed for a route (durable baseline; the ring only keeps the short display span).</summary>
+    private string? LatestObservedSpki(string routeName)
+    {
+        var group = _baseline?.GetRoute(routeName);
+        return group?.Entries
+            .OrderByDescending(e => e.LastSeen)
+            .FirstOrDefault(e => !string.IsNullOrWhiteSpace(e.SpkiHash))
+            ?.SpkiHash;
+    }
+
     public AdminResult ClearEventLog(string? authKey = null)
     {
         var auth = Authorize(authKey);
@@ -1062,6 +1417,7 @@ public sealed class DashboardAdminService : IDashboardAdminService
 
         CheckFile("routes.json", RoutesShape, problems, ref restoredAny, ref restoreFailedAny);
         CheckFile("redaction.json", RedactionShape, problems, ref restoredAny, ref restoreFailedAny);
+        CheckFile("providers.json", ProvidersShape, problems, ref restoredAny, ref restoreFailedAny);
         CheckFile(ServerFile, ServerShape, problems, ref restoredAny, ref restoreFailedAny);
 
         if (problems.Count > 0)
@@ -1301,6 +1657,12 @@ public sealed class DashboardAdminService : IDashboardAdminService
            && (root["Proxy"] is null || (root["Proxy"] is JsonObject proxy
                && (proxy["Redaction"] is null || proxy["Redaction"] is JsonObject)
                && (proxy["Inspection"] is null || proxy["Inspection"] is JsonObject)));
+
+    private static bool ProvidersShape(JsonNode node)
+        => node is JsonObject root
+           && (root["Proxy"] is null || (root["Proxy"] is JsonObject proxy
+               && (proxy["Providers"] is null || (proxy["Providers"] is JsonObject feed
+                   && (feed["Entries"] is null || feed["Entries"] is JsonArray)))));
 
     private static bool ServerShape(JsonNode node)
         => node is JsonObject root

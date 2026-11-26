@@ -56,7 +56,8 @@ public sealed record ActivityView(
     string ExpectedHash,
     string Owner,
     string UA,
-    string RedactionKinds);
+    string RedactionKinds,
+    string Transport = "-");
 
 public sealed record KeyMetaView(
     string KeyRef,
@@ -91,6 +92,10 @@ public sealed record AdminResult(
     public const string TypeNotFound = "not_found";
     public const string TypeInternal = "internal_error";
 
+    /// <summary>Aggregator-origin errors (Phase 3 origin endpoint only): the caller maps these to 422/502.</summary>
+    public const string TypeUnprocessable = "unprocessable";
+    public const string TypeBadGateway = "bad_gateway";
+
     public static AdminResult Success(string message, string[]? warnings = null, JsonNode? data = null)
         => new(true, message, false, null, warnings, TypeOk, data);
 
@@ -101,6 +106,7 @@ public sealed record AdminResult(
 /// <summary>
 /// A route as edited by the dashboard. A draft carries NO secret values - the key is
 /// referenced by name only (<see cref="KeyRef"/>), the value stays in the server config.
+/// <see cref="Transport"/> is the per-route attestation section (Phase 1: observe only).
 /// </summary>
 public sealed record RouteDraft(
     string Name,
@@ -110,11 +116,83 @@ public sealed record RouteDraft(
     List<string>? AllowedPaths = null,
     int RequestTimeoutMs = 0,
     long MaxBodySize = 0,
-    Dictionary<string, string>? Headers = null)
+    Dictionary<string, string>? Headers = null,
+    RouteTransportDraft? Transport = null)
 {
     public List<string> SafePaths => AllowedPaths ?? new List<string>();
     public Dictionary<string, string> SafeHeaders => Headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 }
+
+/// <summary>
+/// Per-route transport-attestation section (routes.json "transport") as edited through
+/// the API/config bundle. Mirrors the host's RouteTransportOptions; optional and
+/// validated by RouteValidator (Phase 2: enforce/pins/graceDays/probeHours are enforced
+/// by the proxy when the route opts in).
+/// </summary>
+public sealed record RouteTransportDraft(
+    bool? Enabled = null,
+    int? PoolLifetimeMinutes = null,
+    List<string>? ExpectedIps = null,
+    string? TlsFloor = null,
+    int GraceDays = 7,
+    string Enforce = "observe",
+    List<string>? Pins = null,
+    int ProbeHours = 0,
+    RouteBlocklistDraft? Blocklist = null)
+{
+    public List<string> SafeExpectedIps => ExpectedIps ?? new List<string>();
+    public List<string> SafePins => Pins ?? new List<string>();
+}
+
+/// <summary>
+/// Per-route provider-blocklist policy (Phase 3, routes.json "transport.blocklist") as
+/// edited through the API/config bundle. All off by default - a route without this
+/// section behaves exactly as before. Mirrors the host's RouteBlocklistOptions.
+/// </summary>
+public sealed record RouteBlocklistDraft(
+    bool Enabled = false,
+    bool AllowBlocked = false,
+    List<string>? Aggregators = null,
+    bool Attribution = false,
+    string ProviderPolicy = "merge")
+{
+    public List<string> SafeAggregators => Aggregators ?? new List<string>();
+}
+
+/// <summary>
+/// One provider-feed entry as edited through the API (Phase 3). Metadata only - human
+/// names/reasons, never content, never keys. Validated by ProviderFeedValidator and
+/// written into providers.json ("Proxy.Providers.Entries").
+/// </summary>
+public sealed record ProviderEntryDraft(
+    string Id,
+    string Name,
+    List<string>? Hosts = null,
+    List<string>? ProviderSlugs = null,
+    string Reason = "",
+    string Severity = "info",
+    DateTimeOffset? Until = null,
+    bool ZdrOnly = false,
+    bool DataCollectionDeny = false)
+{
+    public List<string> SafeHosts => Hosts ?? new List<string>();
+    public List<string> SafeProviderSlugs => ProviderSlugs ?? new List<string>();
+}
+
+/// <summary>
+/// One provider-feed entry as shown by the dashboard (Phase 3). Mirror of
+/// <see cref="ProviderEntryDraft"/> for reading - metadata only, never secrets.
+/// </summary>
+public sealed record ProviderEntryView(
+    string Id,
+    string Name,
+    IReadOnlyList<string> Hosts,
+    IReadOnlyList<string> ProviderSlugs,
+    string Reason,
+    string Severity,
+    DateTimeOffset? Until,
+    bool ZdrOnly,
+    bool DataCollectionDeny);
 
 /// <summary>Admin-only metadata for a route key reference. Never holds the secret value.</summary>
 public sealed record KeyMeta(string Owner, string Purpose);
@@ -263,4 +341,66 @@ public interface IDashboardFacade
     IReadOnlyList<RouteView>? GetRoutesFromDisk();
     SecurityOptionsView? GetSecurityOptionsFromDisk();
     KeysOverviewView? GetKeysOverviewFromDisk();
+
+    // Transport/Endpoint attestation (Phase 1 - read only): who answered each TLS
+    // connection, per route. Metadata only - never request content, never keys.
+    IReadOnlyList<AttestationRouteView> GetAttestation();
+
+    // Provider blocklist feed (Phase 3 - read only, metadata only): the entries edited
+    // through the Attestation page's Providers panel and written via ApplyProviders.
+    IReadOnlyList<ProviderEntryView> GetProviders();
+
+    /// <summary>Provider feed straight from providers.json (the post-save truth - the live
+    /// snapshot reloads with a debounce). Null when the file is absent or unreadable.</summary>
+    IReadOnlyList<ProviderEntryView>? GetProvidersFromDisk();
 }
+
+/// <summary>Per-route attestation card (read-only): status, policy posture, drift episodes + the persistent baseline entries.</summary>
+public sealed record AttestationRouteView(
+    string Route,
+    string Host,
+    /// <summary>"observed" / "warn" / "blocked" (recent live connection) | "baseline" (persisted only) | "none".</summary>
+    string Status,
+    DateTimeOffset? LastSeen,
+    IReadOnlyList<AttestationEntryView> Entries,
+    IReadOnlyList<DriftView>? Drift = null,
+    AttestationPolicyView? Policy = null,
+    /// <summary>Last attributed provider name on this route (Phase 3) or null when never recorded.</summary>
+    string? ServedBy = null);
+
+/// <summary>Policy posture of one route as the attestation page shows it (metadata only).</summary>
+public sealed record AttestationPolicyView(
+    string Enforce,
+    int GraceDays,
+    int ProbeHours,
+    IReadOnlyList<string> ExpectedIps,
+    string? TlsFloor,
+    IReadOnlyList<string> PinsConfigured,
+    int PinCount);
+
+/// <summary>One drift episode (metadata only): what drifted, how severe, alert cadence.</summary>
+public sealed record DriftView(
+    string Route,
+    string Ip,
+    string Reason,
+    string Severity,
+    DateTimeOffset FirstSeen,
+    DateTimeOffset LastAlerted,
+    int AlertCount);
+
+/// <summary>One baseline endpoint entry - metadata only (cert fingerprints, TLS facts).</summary>
+public sealed record AttestationEntryView(
+    string Ip,
+    int Port,
+    string SpkiHash,
+    string SpkiHashShort,
+    string CertSha256,
+    string Issuer,
+    DateTimeOffset NotBefore,
+    DateTimeOffset NotAfter,
+    string TlsVersion,
+    string? CipherSuite,
+    string? Alpn,
+    DateTimeOffset FirstSeen,
+    DateTimeOffset LastSeen,
+    string Source);

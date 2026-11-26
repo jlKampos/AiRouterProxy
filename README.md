@@ -5,10 +5,14 @@
 
 Local HTTPS proxy for the AI Router with a **multi-upstream router**: a per-path
 route table lets you forward to several OpenAI-compatible providers, each with its own key.
-**Current version:** 2.7.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases)) — the latest release, including the
+**Current version:** 2.8.0 ([releases](https://github.com/jlKampos/AiRouterProxy/releases)) — the latest release, including the
 admin dashboard and the admin REST API v1 described below, detection forensics (metadata only),
-and log maintenance from the dashboard — clear the in-memory activity buffer or the dedicated
-Windows Event Log, audited and re-authenticated with the primary local key.
+log maintenance from the dashboard — clear the in-memory activity buffer or the dedicated
+Windows Event Log, audited and re-authenticated with the primary local key — plus **transport /
+endpoint attestation** (pins the certificate that answers each TLS connection, per route, with
+observe / warn / block enforcement and optional periodic probes) and the **provider blocklist &
+attribution** (blocks known providers at the route level and inside aggregators, and records
+which provider actually served each response — metadata only, see the two v2.8.0 sections below).
 
 ☕ Found this useful? [**Support the project**](https://buymeacoffee.com/jlkampos) with a coffee — every cup keeps the redaction growing.
 
@@ -31,6 +35,8 @@ Windows Event Log, audited and re-authenticated with the primary local key.
   - [How to edit](#how-to-edit)
   - [Verify your changes](#verify-your-changes)
   - [Hot reload](#hot-reload)
+- [Transport & endpoint attestation (v2.8.0)](#transport--endpoint-attestation-v280)
+- [Provider blocklist & attribution (v2.8.0)](#provider-blocklist--attribution-v280)
 - [Local key](#local-key--genapikeyps1)
 - [Dashboard (admin UI)](#dashboard-admin-ui)
 - [Admin API (v1)](#admin-api-v1)
@@ -130,10 +136,15 @@ non-sensitive content passing through untouched:
 - **Multiple accepted local keys** (`Proxy:Keys:LocalKeys`) for auth rotation
 - **SSE protocol adapters** (`src/AiRouterProxy/Sse/SseProtocol/`) for streamed forwards (OpenAI chat/responses,
   Anthropic, generic)
+- **Transport / endpoint attestation** (`src/AiRouterProxy/Transport/`): pins the TLS endpoint that answers each
+  route — observed IP, SPKI fingerprint, cert SHA-256, issuer, TLS version/cipher/ALPN — with observe/warn/block
+  enforcement (526 + `X-AIRouterProxy-Attestation`) and a persisted baseline + learned pins in `data/` (metadata only)
+- **Provider blocklist & attribution**: host-tier 403 + provider-tier body merge inside aggregator routes
+  (`providers.json`, hot reload) and per-route "served by" attribution (names only), plus the aggregator origin lookup
 - Admin Blazor dashboard (`/admin/ui`) + admin REST API v1 (`/admin/api/v1/*`) - both protected by
   the primary local key only (`/admin/*`)
 - Windows Service (`AIRouterProxy`, port 4000)
-- Versioned via assembly info (SemVer, e.g. 2.7.0); reported by /admin/health
+- Versioned via assembly info (SemVer, e.g. 2.8.0); reported by /admin/health
 
 ## Structure
 
@@ -162,6 +173,12 @@ AiRouterProxy/
 |       |   |-- SseStreamProcessor.cs
 |       |   |-- SseParser.cs / SseEvent.cs # minimal SSE parse/emit
 |       |   `-- SseProtocol/                # SSE protocol adapters (OpenAI chat, OpenAI responses, Anthropic, generic) + registry
+|       |-- Transport/            # endpoint attestation + provider blocklist/attribution (phases 1-3)
+|       |   |-- TransportStore.cs / BaselineStore.cs           # TLS endpoint observations + durable baseline (data/)
+|       |   |-- PinValidator.cs / DriftEvaluator.cs / EnforcePolicy.cs  # pinning, drift scoring, observe/warn/block
+|       |   |-- LearnedPinStore.cs / DriftStore.cs / AttestationRecorder.cs / EndpointProbe.cs  # pins, drift, probes
+|       |   |-- ProviderBlocklist.cs / ProviderBodyPolicy.cs   # 2-tier blocklist decision + provider body merge/strict
+|       |   `-- AttributionExtractor.cs / AttributionStore.cs / AttestationOrigin.cs  # "served by" + aggregator origin lookup
 |       |-- Observability/         # activity log + response notices + detection forensics
 |       |   |-- ActivityStore.cs           # activity log (/admin/activity)
 |       |   |-- DetectionStore.cs          # in-memory detection forensics (ring buffer)
@@ -172,7 +189,8 @@ AiRouterProxy/
 |       |   |-- appsettings.Development.json
 |       |   |-- appsettings.Server.example.json  # TEMPLATE for the keys (copy to appsettings.Server.json)
 |       |   |-- redaction.json
-|       |   `-- routes.json
+|       |   |-- routes.json
+|       |   `-- providers.json            # provider blocklist feed (Phase 3, non-secret)
 |       |-- AdminUi/               # dashboard facade + read models (consumed by the Blazor pages)
 |       |   `-- HostDashboardFacade.cs
 |       |-- AdminApi/              # /admin/api/v1 REST endpoints (MapAdminApiV1.cs)
@@ -189,10 +207,10 @@ AiRouterProxy/
 |   `-- AiRouterProxy.Dashboard/   # Blazor Web App (admin UI): Components/Pages (Login, RoutesKeys, ActivityLog, Security, Settings, Home)
 |-- tests/
 |   |-- Unit/                      # offline unit harness (compiles the app sources directly)
-|   |   |-- Program.cs             #   no framework - 383 PASS
+|   |   |-- Program.cs             #   no framework - 562 PASS
 |   |   `-- RedactorTests.csproj
 |   |-- Dashboard.Tests/           # admin dashboard harness (compiles app sources directly)
-|   |   |-- Program.cs             #   no framework - 331 PASS
+|   |   |-- Program.cs             #   no framework - 370 PASS
 |   |   `-- DashboardTests.csproj
 |   `-- Integration/               # black-box integration harness against a REAL deployed proxy
 |-- scripts/
@@ -215,11 +233,14 @@ AiRouterProxy/
 | `appsettings.Development.json` | Development overrides (active when `ASPNETCORE_ENVIRONMENT=Development`) | Yes |
 | `routes.json` | Route table (upstreams, prefixes, key refs by name - no key values) | Yes |
 | `redaction.json` | Redaction flags, mask, allow-list + inspection & rate-limit policy (non-secret) | Yes |
+| `providers.json` | Provider blocklist feed — ids, hosts, providerSlugs, severities, reasons, until, zdr/data flags (no secrets) | Yes |
 | `proxy-cert.pem` / `proxy-key.pem` | TLS certificate + private key (SECRET) | **No** (gitignored). Generated on the server |
 | `LOCAL_KEY.txt` | Last local key generated (SECRET) | **No** (gitignored) |
 | `data/key-meta.json` | Dashboard metadata only: keyRef owner/purpose + labels of extra local keys (fingerprints, **never key values**) | **No** (generated at runtime) |
 | `data/audit.log` | JSONL audit trail of dashboard admin writes (never secrets) | **No** (generated at runtime) |
 | `data/backups/` | Timestamped config backups taken before each dashboard write | **No** (generated at runtime) |
+| `data/endpoint-baseline.json` | TLS endpoint fingerprints per route (IP, cert hashes, issuer, TLS facts — metadata only) | **No** (generated at runtime) |
+| `data/pins.json` | Learned endpoint pins per route (SPKI fingerprints — metadata only) | **No** (generated at runtime) |
 | `deploy/`, `publish-tmp/` | Local service install and build output | **No** (gitignored) |
 
 > At the installed service, all config files live in a config subfolder next to the exe (the server reads from there when present - see [Deploy (installed service)](#deploy-installed-service)).
@@ -239,6 +260,9 @@ AiRouterProxy/
 | Stop redacting image/base64 payloads | `redaction.json` | `Proxy:Redaction.Detect.ExemptBase64` | ✓ hot reload |
 | Tighten body inspection (fail closed) | `redaction.json` | `Proxy:Inspection.*` | ✓ hot reload |
 | Tighten rate limiting / lockout | `redaction.json` | `Proxy:RateLimit.*` | ✓ hot reload |
+| Add / block a provider (host or slug tier) | `providers.json` | `Proxy:Providers.Entries` | ✓ hot reload |
+| Enforce endpoint attestation per route (observe/warn/block, pins, grace) | `routes.json` | `Proxy:Routes[].Transport` | ✓ hot reload |
+| Provider policy inside an aggregator route | `routes.json` | `Proxy:Routes[].Transport.Blocklist` | ✓ hot reload |
 
 > This is the *dev point of view*. On the installed service the same files are read from the
 > `config\` subfolder next to the exe.
@@ -511,7 +535,7 @@ Per-client (by IP) request limiting and brute-force lockout.
 - **Keep valid JSON:** the examples here use `jsonc` (with comments) only for readability. The
   real files must be **strict JSON** - no comments, no trailing commas.
 - **Back up before editing:** keep a copy of the current file (the deploy scripts already
-  preserve `config\appsettings.*.json`, `redaction.json`, `routes.json` and the certs on update).
+  preserve `config\appsettings.*.json`, `redaction.json`, `routes.json`, `providers.json` and the certs on update).
 
 ### Verify your changes
 
@@ -570,9 +594,122 @@ Use the header and the notice to confirm a redaction rule behaves as expected.
 
 ### Hot reload
 
-`appsettings.Server.json`, `routes.json` and `redaction.json` are watched with `reloadOnChange` -
-edits apply **without a restart**. `Host`/`Port` and the TLS certificates are read at startup
-(the Kestrel listener binds once), so changing those still requires a restart.
+`appsettings.Server.json`, `routes.json`, `redaction.json` and `providers.json` are watched with
+`reloadOnChange` - edits apply **without a restart**. `Host`/`Port` and the TLS certificates are
+read at startup (the Kestrel listener binds once), so changing those still requires a restart.
+
+## Transport & endpoint attestation (v2.8.0)
+
+The proxy records **who actually answered each TLS connection**, per route, and can pin that
+identity. Built in three phases:
+
+- **Observe** — every request that flows through a route with an active `transport` policy
+  records TLS metadata of the endpoint that answered: the **observed IP:port**, the **SPKI
+  fingerprint** (SHA-256 of the server's SubjectPublicKeyInfo — the value used for pinning),
+  the **cert SHA-256**, the **issuer**, the **TLS version**, the **cipher suite** and the
+  **ALPN**. Nothing else — never request/response payloads, never keys. Recent observations
+  live in memory; up to 8 persisted endpoints per route land in `data/endpoint-baseline.json`.
+- **Pin & enforce** — per-route policy in `routes.json` (`Proxy:Routes[].Transport`):
+  - `pins`: SPKI fingerprints configured to always pass;
+  - **learned pins** (`data/pins.json`): when you **accept** the current endpoint (dashboard
+    or admin API) it stops tripping drift — effective pins = union of both, max 5 per route;
+  - `tlsFloor` / `expectedIps`: extra identity constraints (TLS floor version, allowed IPs);
+  - `graceDays`: how long a new-but-valid endpoint may drift before it counts as a violation;
+  - `enforce: "observe" | "warn" | "block"` — `warn` tags responses with the header
+    `X-AIRouterProxy-Attestation: route:severity`; `block` rejects with **HTTP 526** plus the
+    same header (`...: block`);
+  - `probeHours`: optional periodic **probes** — a plain TCP+TLS connect (no request is sent)
+    that refreshes the baseline and the drift feed without waiting for real traffic.
+- **Attribution** — see the next section (aggregator "served by" + origin lookup).
+
+The **Attestation** dashboard page (`/admin/ui/attestation`) and the admin API expose the
+baseline, the drift feed and the per-route policy, with `Learn now` / `Accept (pin)` / `Clear
+pins` / `Clear drift` actions — every write is audited and requires the primary local key.
+
+### Limitations (read before relying on it)
+
+1. **It cannot see the physical path of the packets.** TCP/IP does not expose the route
+   packets take — there is no "route tracing". The proxy sees only the IP that answered at
+   TLS-termination time (usually a CDN edge), not the path to it.
+2. **It does NOT detect internal provider re-forwarding.** Re-forwarding happens *after* TLS
+   termination, inside the provider: from the proxy's point of view the connection lands on a
+   perfectly valid endpoint. An OpenRouter-style "your prompt was forwarded to an undeclared
+   model" incident is **invisible at the transport level**. The practical answer is the
+   **provider blocklist / ZDR policy** (next section) — a manual, provider-level policy.
+3. **The baseline is TOFU** (trust on first use): the first observed endpoint is what the
+   baseline learns — an attacker present at that moment would be trusted.
+4. **Certificate / CDN rotation** looks like drift. Mitigated with multi-pin (configured +
+   learned), the `graceDays` window and an explicit `accept`.
+5. **Aggregator cache hits** (e.g. OpenRouter serving a cached response) do not carry
+   `openrouter_metadata`, so no endpoint attribution is recorded for them.
+6. **Attribution buffers responses on aggregator routes** (the whole body must be read to
+   extract the "served by" field) — those routes trade byte-for-byte streaming for
+   attribution; a documented cost of the feature.
+
+## Provider blocklist & attribution (v2.8.0)
+
+Two related features around the AI-**aggregator** problem: *which provider actually serves your
+request when you go through an aggregator like OpenRouter*, and how to block/constrain the
+ones you do not trust.
+
+### Provider blocklist (`providers.json`)
+
+A non-secret, hot-reloaded feed of known-bad / policy-constrained providers under
+`Proxy:Providers.Entries`:
+
+```jsonc
+{
+  "Proxy": {
+    "Providers": {
+      "Entries": [
+        {
+          "id": "blocked-provider",
+          "name": "Provider violating policy",
+          "severity": "block",                  // info | warn | block
+          "hosts": ["bad.example.com"],         // tier 1: matched against the route upstream host
+          "providerSlugs": ["openrouter/auto"], // tier 2: matched inside aggregator routes
+          "reason": "re-forwarding detected",
+          "until": "2026-12-31",                // optional expiry (entry ignored after it)
+          "zdrOnly": false,                     // flag: route this slug only to ZDR endpoints
+          "dataCollectionDeny": true            // flag: force data_collection: "deny"
+        }
+      ]
+    }
+  }
+}
+```
+
+- **Tier 1 — hosts:** entries whose `hosts` match the route's upstream host (exact match or
+  `*.domain` wildcard — including the apex) set a severity; the strongest severity wins.
+  A **block** rejects the request with **403** `provider_blocked` (unless the route opts out
+  with `transport.blocklist.allowBlocked`). Warn/info tiers do not block; they add the
+  response header `X-AIRouterProxy-Blocklist: <tier>` for observability.
+- **Tier 2 — providerSlugs:** applies only to **aggregator routes** (the route declares
+  `transport.blocklist.aggregators`, e.g. `["openrouter.ai"]`). Entries with severity
+  `>= warn` contribute their slugs to the forwarded request's `provider.ignore` list;
+  `zdrOnly` / `dataCollectionDeny` entries force `provider.zdr: true` and
+  `provider.data_collection: "deny"` on the body the proxy forwards. Expired entries
+  (`until`) are ignored.
+- **Per-route policy** (`routes.json` → `Proxy:Routes[].Transport.blocklist`):
+  `enabled`, `allowBlocked`, `aggregators`, `attribution`, and `providerPolicy`
+  (`"merge"` — merge the policy into the body; `"strict"` — a conflicting
+  `provider.only` / `provider.zdr: false` is rejected with **400**
+  `provider_policy_conflict`).
+- Manage the feed on the dashboard's **Attestation → Providers** panel (inline add/edit/remove,
+  saved as a whole set with admin-key re-auth) or with `GET / PUT /admin/api/v1/providers`.
+
+### Attribution ("served by")
+
+- **Non-streaming responses** carry the aggregator's `provider` field — the proxy records it
+  (normalized, bounded to 120 chars, names only) into an in-memory per-route store.
+- **Streaming responses:** on routes with `attribution: true` the proxy sends the request
+  header `X-OpenRouter-Metadata: enabled` and passively parses the **last SSE metadata chunk**
+  (`openrouter_metadata.endpoints[].provider_name`, of the selected endpoint).
+- The last attributed provider per route is shown on the Attestation page (**served by**) and
+  in the activity transport summary — metadata only, in memory, reset on restart.
+- For deeper forensics, `GET /admin/api/v1/attestation/origin?generationId=...` asks the
+  aggregator route server-side (the route's key never leaves the process) and returns **only**
+  `provider_name`, `model` and `upstream_id`.
 
 ## Local key / `genApiKey.ps1`
 
@@ -637,6 +774,14 @@ proxy works fully without the dashboard and the JSON files remain the source of 
   Redaction/Inspection/Forensics cards add `· unsaved` while the form differs from the file.
 - **Settings** (`/admin/ui/settings`) - export / validate / import the whole config bundle
   (validation first, apply after) and reload with automatic rollback when reload fails.
+- **Attestation** (`/admin/ui/attestation`) - per-route endpoint cards (observed IP, SPKI, cert
+  SHA-256, issuer, TLS version/cipher/ALPN, validity), the drift feed, the policy posture and
+  the destructive actions (`Accept (pin)`, `Learn now`, `Clear pins`, `Clear drift` — each
+  audited and re-authenticated with the primary local key). The page also shows the route's
+  last **served by** attribution and hosts the **Providers (blocklist & ZDR)** panel: edit the
+  `providers.json` feed inline (severity info/warn/block, hosts, provider slugs, `zdrOnly` /
+  `dataCollectionDeny`, `until`), with light validation in the form and the same confirm +
+  admin-key re-auth on save.
 
 ## Admin API (v1)
 
@@ -666,6 +811,14 @@ key>` (same key as `/admin`/UI) and protected by the same rate limiter. Errors a
 | `DELETE` | `/admin/api/v1/logs/eventlog` | Clears the dedicated "AIRouterProxy" Windows Event Log (admin key required). |
 | `GET` | `/admin/api/v1/detections?limit=50` | Recent detection forensics (metadata only: path/layer/kind/length/`name`/`sep`/`quote`/fingerprint; limit 1..200) |
 | `DELETE` | `/admin/api/v1/detections` | Clears the in-memory detection forensics buffer (admin key required) |
+| `GET` | `/admin/api/v1/providers` | Current provider blocklist feed (metadata only) |
+| `PUT` | `/admin/api/v1/providers` | Replace the provider blocklist feed (stored in `providers.json`, hot-reloaded) |
+| `GET` | `/admin/api/v1/attestation/endpoints` | Per-route endpoint attestation: baseline entries, drift, policy (metadata only) |
+| `POST` | `/admin/api/v1/attestation/{route}/accept` | Pin the route's latest observed endpoint (SPKI) — admin key required |
+| `POST` | `/admin/api/v1/attestation/{route}/learn` | Probe the upstream now and record the current endpoint — admin key required |
+| `DELETE` | `/admin/api/v1/attestation/pins?routeName=` | Clear the learned pins of a route (all routes when omitted) — admin key required |
+| `DELETE` | `/admin/api/v1/attestation/drift` | Clear the in-memory drift feed — admin key required |
+| `GET` | `/admin/api/v1/attestation/origin?generationId=` | Aggregator origin lookup — returns only `provider_name`/`model`/`upstream_id` (key never leaves the process); 422 `validation_error` / 502 `bad_gateway` on failure |
 
 In a detection row, `quote` is `"` or `'` when the matched context used that quote, `""` for a
 `context` finding without quotes (and a `format` that inherits its shape from such an unquoted
@@ -1036,11 +1189,12 @@ Links the proxy's real sources in isolation and asserts them with the in-repo `C
 helpers (no xUnit). Covers redaction (4 layers), the one-line redaction notice, detection
 forensics (JSON path/layer/kind/fingerprint, zero cost when off), fail-closed inspection policy,
 route resolution/allowed-path enumeration (traversal, case, `%2f`), auth edges + multi-key, rate
-limiter/lockout (including exact concurrency via `Parallel.For`) and the SSE protocol adapters.
+limiter/lockout (including exact concurrency via `Parallel.For`), the SSE protocol adapters, the
+attestation stores/pinning/drift logic and the Phase 3 blocklist+attribution helpers.
 
 ```powershell
 dotnet run --project tests/Unit/RedactorTests.csproj -c Release
-# -> RESULT: 383 PASS, 0 FAIL
+# -> RESULT: 562 PASS, 0 FAIL
 ```
 
 ### Dashboard harness (offline, no framework, no packages)
@@ -1051,11 +1205,12 @@ write path (validate -> backup -> atomic write -> re-read/confirm -> audit), rou
 operations, KeyMetaStore persistence (owner/purpose + local-key labels), config export/
 validate/import/reload, the security validator + forensics round-trip, the UI session token
 rules (restart, key rotation, multi-key) and the `/admin/ui` middleware (`/_blazor` 401),
-plus the runtime dashboard state:
+the attestation admin actions, the route-validator transport/blocklist rules and the Phase 3
+provider feed (validation + `providers.json` write path), plus the runtime dashboard state:
 
 ```powershell
 dotnet run --project tests/Dashboard.Tests/DashboardTests.csproj -c Release
-# -> RESULT: 331 PASS, 0 FAIL
+# -> RESULT: 370 PASS, 0 FAIL
 ```
 
 ### Integration harness (black box, against the REAL deployed proxy + AI Router)
@@ -1141,7 +1296,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\proxy-menu.ps1 -Action Verify
 
 The service runs as a Windows Service (`AIRouterProxy`) whose executable is deployed to a service
 folder. The recommended layout puts it under `C:\Services` (outside any repo), e.g.
-`C:\Services\AiRouterProxy\`. All config files (appsettings.*.json, redaction.json, routes.json and the TLS certs) live in a **`config`** subfolder next to the exe, so the deploy root only has the executable and the configs are easy to find (the server auto-detects `config/`; a flat install without it keeps working).
+`C:\Services\AiRouterProxy\`. All config files (appsettings.*.json, redaction.json, routes.json, providers.json and the TLS certs) live in a **`config`** subfolder next to the exe, so the deploy root only has the executable and the configs are easy to find (the server auto-detects `config/`; a flat install without it keeps working).
 
 **First install is automatic:** when the service is not registered on the destination, the deploy
 engine registers it itself (`New-Service`, auto-start, LocalSystem) pointing at the freshly
@@ -1170,7 +1325,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir 
 powershell -ExecutionPolicy Bypass -File .\scripts\deploy-update.ps1 -DeployDir "C:\Services\AiRouterProxy-TEST" -ServiceName "AiRouterProxy-TEST"
 ```
 
-`deploy-update.ps1` preserves config/certs (keeping them in the destination `config/` folder and migrating an older flat install automatically), registers the service when it is missing (**first install**, see above) and restarts it (when installed as a Windows Service). If the deploy carries inspection/rate-limit changes, refresh the destination `redaction.json` from the repo copy afterwards (the deploy script preserves the destination file by design).
+`deploy-update.ps1` preserves config/certs (keeping them in the destination `config/` folder and migrating an older flat install automatically), registers the service when it is missing (**first install**, see above) and restarts it (when installed as a Windows Service). `providers.json` is preserved exactly like `routes.json`/`redaction.json` (the dashboard-written feed survives updates); runtime data under `data\` (endpoint baseline, pins, audit log, key-meta, backups) is never part of the publish output and is never touched by the update. If the deploy carries inspection/rate-limit changes, refresh the destination `redaction.json` from the repo copy afterwards (the deploy script preserves the destination file by design).
 
 ### Moving the deployed service to a new folder (generic)
 

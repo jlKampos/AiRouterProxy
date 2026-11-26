@@ -21,6 +21,12 @@ public sealed class HostDashboardFacade : IDashboardFacade
     private readonly DashboardPaths _paths;
     private readonly KeyMetaStore _keyMeta;
     private readonly IDetectionStore _detections;
+    private readonly TransportStore? _transportStore;
+    private readonly BaselineStore? _baseline;
+    private readonly DriftStore? _drift;
+    private readonly LearnedPinStore? _learnedPins;
+    private readonly TransportPolicyProvider? _policies;
+    private readonly AttributionStore? _attribution;
     private readonly DateTimeOffset _started;
     private readonly string _version;
 
@@ -29,13 +35,25 @@ public sealed class HostDashboardFacade : IDashboardFacade
         ActivityStore activity,
         DashboardPaths paths,
         KeyMetaStore keyMeta,
-        IDetectionStore detections)
+        IDetectionStore detections,
+        TransportStore? transportStore = null,
+        BaselineStore? baseline = null,
+        DriftStore? drift = null,
+        LearnedPinStore? learnedPins = null,
+        TransportPolicyProvider? policies = null,
+        AttributionStore? attribution = null)
     {
         _options = options;
         _activity = activity;
         _paths = paths;
         _keyMeta = keyMeta;
         _detections = detections;
+        _transportStore = transportStore;
+        _baseline = baseline;
+        _drift = drift;
+        _learnedPins = learnedPins;
+        _policies = policies;
+        _attribution = attribution;
 
         try
         {
@@ -175,7 +193,8 @@ public sealed class HostDashboardFacade : IDashboardFacade
             e.ExpectedHash ?? "-",
             e.Route ?? "-",
             e.UA ?? "-",
-            e.RedactionKinds ?? "-")).ToList();
+            e.RedactionKinds ?? "-",
+            e.Transport ?? "-")).ToList();
     }
 
     public int LocalKeyCount() => AuthenticationPolicy.LocalKeyCount(_options.CurrentValue.Keys);
@@ -424,4 +443,153 @@ public sealed class HostDashboardFacade : IDashboardFacade
 
         return MapKeysOverview(usageRoutes, routeKeys, keys, meta, localLabels);
     }
+
+    // ----------------------------------------------------------
+    // Transport/Endpoint attestation: per-route status built from the live ring buffer
+    // (recent connections), the durable baseline, the learned pins and the drift feed
+    // (Phase 2). Metadata only. Null stores (instances constructed without the transport
+    // singletons) yield an empty list; the production DI always injects them.
+    // ----------------------------------------------------------
+
+    public IReadOnlyList<AttestationRouteView> GetAttestation()
+    {
+        var o = _options.CurrentValue;
+        var recent = _transportStore?.Recent(200) ?? Array.Empty<TransportObservation>();
+        var driftAll = _drift?.Recent(100) ?? Array.Empty<DriftEpisode>();
+
+        var names = o.Routes is { Count: > 0 }
+            ? o.Routes.Select(r => (Name: r.Name ?? string.Empty, Host: SafeHost(r.Upstream))).ToList()
+            : new List<(string Name, string Host)> { ("default", SafeHost(o.Upstream)) };
+
+        var rows = new List<AttestationRouteView>(names.Count);
+        foreach (var (name, host) in names)
+        {
+            var live = recent.Where(x => string.Equals(x.Route, name, StringComparison.Ordinal)).ToList();
+            var baseline = _baseline?.GetRoute(name);
+            var entries = baseline?.Entries ?? Array.Empty<EndpointIdentity>();
+
+            // Latest live observation wins; warn/blocked statuses are preserved so the
+            // page surfaces the enforcement state even while drift is active.
+            var lastLive = live.OrderByDescending(x => x.Timestamp).FirstOrDefault();
+            var status = lastLive is not null
+                ? (lastLive.Status is "warn" or "blocked" ? lastLive.Status : "observed")
+                : entries.Count > 0
+                    ? "baseline"
+                    : "none";
+
+            DateTimeOffset? lastSeen = null;
+            foreach (var e in entries)
+            {
+                if (lastSeen is null || e.LastSeen > lastSeen.Value)
+                {
+                    lastSeen = e.LastSeen;
+                }
+            }
+
+            foreach (var x in live)
+            {
+                if (lastSeen is null || x.Timestamp > lastSeen.Value)
+                {
+                    lastSeen = x.Timestamp;
+                }
+            }
+
+            var drift = driftAll
+                .Where(d => string.Equals(d.Route, name, StringComparison.Ordinal))
+                .Select(d => new DriftView(d.Route, d.Ip, d.Reason, d.Severity, d.FirstSeen, d.LastAlerted, d.AlertCount))
+                .ToList();
+
+            rows.Add(new AttestationRouteView(
+                name,
+                string.IsNullOrWhiteSpace(host) ? "-" : host,
+                status,
+                lastSeen,
+                entries.Select(e => new AttestationEntryView(
+                    e.Ip,
+                    e.Port,
+                    e.SpkiHash,
+                    e.SpkiHashShort,
+                    e.CertSha256,
+                    e.Issuer,
+                    e.NotBefore,
+                    e.NotAfter,
+                    e.TlsVersion,
+                    e.CipherSuite,
+                    e.Alpn,
+                    e.FirstSeen,
+                    e.LastSeen,
+                    e.Source)).ToList(),
+                drift,
+                BuildPolicyView(name),
+                ServedBy: _attribution?.Get(name)));
+        }
+
+        return rows;
+    }
+
+    private AttestationPolicyView? BuildPolicyView(string routeName)
+    {
+        if (_policies is null)
+        {
+            return null;
+        }
+
+        var p = _policies.ForRoute(routeName);
+        if (p is null)
+        {
+            return null;
+        }
+
+        var configured = p.Pins ?? Array.Empty<string>();
+        var effectiveCount = AttestationRecorder.EffectivePins(
+            p, routeName, _learnedPins?.GetForRoute(routeName) ?? Array.Empty<string>()).Count;
+
+        return new AttestationPolicyView(
+            p.Enforce,
+            p.GraceDays,
+            p.ProbeHours,
+            p.ExpectedIps ?? Array.Empty<string>(),
+            p.TlsFloor,
+            configured.ToList(),
+            effectiveCount);
+    }
+
+    private static string SafeHost(string? upstream)
+    {
+        try
+        {
+            return new Uri(upstream ?? string.Empty).Host;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    // ----------------------------------------------------------
+    // Provider blocklist feed (Phase 3): reads the entries from the live monitor or
+    // straight from providers.json (the post-save truth, same pattern as the routes
+    // panel). Metadata only - ids/hosts/slugs/reasons, never content, never keys.
+    // ----------------------------------------------------------
+
+    public IReadOnlyList<ProviderEntryView> GetProviders()
+        => MapProviders(_options.CurrentValue.Providers?.Entries ?? new List<ProviderEntryOptions>());
+
+    public IReadOnlyList<ProviderEntryView>? GetProvidersFromDisk()
+    {
+        var disk = ConfigFileReader.ReadProviders(_paths.ConfigDir);
+        return disk is null ? null : MapProviders(disk);
+    }
+
+    private static IReadOnlyList<ProviderEntryView> MapProviders(IReadOnlyList<ProviderEntryOptions> entries)
+        => entries.Select(e => new ProviderEntryView(
+            e.Id ?? string.Empty,
+            e.Name ?? string.Empty,
+            e.Hosts ?? new List<string>(),
+            e.ProviderSlugs ?? new List<string>(),
+            e.Reason ?? string.Empty,
+            e.Severity ?? "info",
+            e.Until,
+            e.ZdrOnly,
+            e.DataCollectionDeny)).ToList();
 }

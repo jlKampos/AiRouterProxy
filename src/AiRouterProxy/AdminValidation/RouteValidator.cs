@@ -97,6 +97,8 @@ public static class RouteValidator
                     warnings.Add($"Route '{NameOf(route)}' (keyRef '{keyRef}') is inactive until the key is set.");
                 }
             }
+
+            ValidateTransport(route, errors);
         }
 
         // At most one default ("") prefix.
@@ -136,6 +138,126 @@ public static class RouteValidator
         "content-type",
         "accept",
     };
+
+    // ----------------------------------------------------------
+    // Per-route transport section (Phase 2 - pinning + drift). Stricter than the
+    // startup validation on purpose: the dashboard must not persist a section the
+    // proxy would silently ignore.
+    // ----------------------------------------------------------
+
+    private static void ValidateTransport(RouteDraft route, List<string> errors)
+    {
+        var t = route.Transport;
+        if (t is null)
+        {
+            return;
+        }
+
+        var name = NameOf(route);
+
+        if (!string.IsNullOrWhiteSpace(t.Enforce) && t.Enforce is not ("observe" or "warn" or "block"))
+        {
+            errors.Add($"Route '{name}': transport.enforce must be one of observe|warn|block.");
+        }
+
+        if (t.GraceDays is < 0 or > 365)
+        {
+            errors.Add($"Route '{name}': transport.graceDays must be between 0 and 365.");
+        }
+
+        if (t.ProbeHours is < 0 or > 720)
+        {
+            errors.Add($"Route '{name}': transport.probeHours must be between 0 and 720.");
+        }
+
+        if (t.TlsFloor is not null && !string.IsNullOrWhiteSpace(t.TlsFloor) && t.TlsFloor is not ("1.2" or "1.3"))
+        {
+            errors.Add($"Route '{name}': transport.tlsFloor must be one of 1.2|1.3.");
+        }
+
+        foreach (var pin in t.SafePins)
+        {
+            if (!LooksLikePin(pin))
+            {
+                errors.Add($"Route '{name}': transport pin '{pin}' must be a 64-hex or base64/base64url SHA-256 fingerprint.");
+            }
+        }
+
+        foreach (var ip in t.SafeExpectedIps)
+        {
+            if (!LooksLikeCidrOrIp(ip))
+            {
+                errors.Add($"Route '{name}': expected IP '{ip}' must be an IP or CIDR (e.g. 10.0.0.0/8).");
+            }
+        }
+
+        // Per-route provider-blocklist policy (Phase 3): light checks only - the feed
+        // itself is validated by ProviderFeedValidator. Values that do not parse must
+        // never take the route table down (the proxy ignores invalid sections anyway).
+        var b = t.Blocklist;
+        if (b is null)
+        {
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(b.ProviderPolicy) && b.ProviderPolicy is not ("merge" or "strict"))
+        {
+            errors.Add($"Route '{name}': transport.blocklist.providerPolicy must be one of merge|strict.");
+        }
+
+        foreach (var aggregator in b.SafeAggregators)
+        {
+            if (string.IsNullOrWhiteSpace(aggregator))
+            {
+                errors.Add($"Route '{name}': transport.blocklist.aggregators must not contain empty entries.");
+            }
+        }
+
+        if (b.Attribution && b.SafeAggregators.Count == 0)
+        {
+            errors.Add($"Route '{name}': transport.blocklist.attribution requires at least one 'aggregators' entry.");
+        }
+    }
+
+    private static bool LooksLikePin(string pin)
+    {
+        if (string.IsNullOrWhiteSpace(pin))
+        {
+            return false;
+        }
+
+        var value = pin.Trim();
+        var isHex64 = value.Length == 64
+                      && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F');
+        var isB64 = value.Length is 43 or 44
+                    && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '+' or '/' or '-' or '_' or '=');
+        return isHex64 || isB64;
+    }
+
+    private static bool LooksLikeCidrOrIp(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var value = text.Trim();
+        var slash = value.IndexOf('/');
+        var host = slash >= 0 ? value[..slash] : value;
+        if (!System.Net.IPAddress.TryParse(host, out var parsed))
+        {
+            return false;
+        }
+
+        if (slash < 0)
+        {
+            return true;
+        }
+
+        var prefix = value[(slash + 1)..];
+        var bits = parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? 32 : 128;
+        return int.TryParse(prefix, out var prefixBits) && prefixBits >= 0 && prefixBits <= bits;
+    }
 
     private static string NameOf(RouteDraft route) => string.IsNullOrWhiteSpace(route.Name) ? "(unnamed)" : route.Name;
 

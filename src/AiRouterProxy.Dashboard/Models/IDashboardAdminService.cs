@@ -74,6 +74,29 @@ public interface IDashboardAdminService
     /// <summary>Clears the in-memory detection forensics buffer. Admin key REQUIRED (destructive).</summary>
     AdminResult ClearDetections(string? authKey = null);
 
+    // Transport/Endpoint attestation (Phase 2 - write actions). Every action is audited
+    // and requires the primary local key: pinning changes the security posture.
+    /// <summary>Pins an SPKI fingerprint (default: the route's latest observed one) into the learned pins. authKey REQUIRED.</summary>
+    AdminResult AcceptAttestationPin(string routeName, string? spki, string? authKey = null);
+
+    /// <summary>Runs an on-demand endpoint probe ("learn now") that records the current upstream endpoint. authKey REQUIRED.</summary>
+    Task<AdminResult> LearnAttestationNowAsync(string routeName, string? authKey = null);
+
+    /// <summary>Removes the learned pins of one route (null = all routes). authKey REQUIRED.</summary>
+    AdminResult ClearAttestationPins(string? routeName, string? authKey = null);
+
+    /// <summary>Clears the in-memory drift feed. Admin key REQUIRED (destructive).</summary>
+    AdminResult ClearAttestationDrift(string? authKey = null);
+
     /// <summary>Re-reads the config files from disk and confirms they reload; restores from backup when broken.</summary>
     AdminResult ReloadConfirm();
+
+    // Provider blocklist feed (Phase 3, non-secret providers.json) + the aggregator
+    // origin read. The feed carries metadata only (names/reasons); the origin lookup
+    // returns ONLY provider_name/model/upstream_id - the route's key never leaves the process.
+    /// <summary>Replaces the whole provider blocklist feed in providers.json (hot-reloaded). authKey optional (no secrets).</summary>
+    AdminResult ApplyProviders(IReadOnlyList<ProviderEntryDraft> providers, string? authKey = null);
+
+    /// <summary>Resolves the origin of one generation via the aggregator route (GET /api/v1/generation?id=). Returns ONLY provider_name/model/upstream_id. authKey REQUIRED.</summary>
+    Task<AdminResult> LookupGenerationOriginAsync(string generationId, string? authKey = null);
 }

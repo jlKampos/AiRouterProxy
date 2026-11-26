@@ -7,7 +7,7 @@
     <RootNamespace>AIRouterProxy</RootNamespace>
     <AssemblyName>AIRouterProxy</AssemblyName>
     <NoWarn>$(NoWarn);CA1416</NoWarn>
-    <Version>2.7.0</Version>
+    <Version>2.8.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
@@ -39,6 +39,11 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <TargetPath>config\routes.json</TargetPath>
+    </Content>
+    <Content Update="Config\providers.json" Condition="Exists('Config\providers.json')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      <TargetPath>config\providers.json</TargetPath>
     </Content>
     <!-- Default app config + dev overrides + server template all land in config/. -->
     <Content Update="Config\appsettings.json" Condition="Exists('Config\appsettings.json')">

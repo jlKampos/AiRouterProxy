@@ -18,10 +18,24 @@ public sealed class ProxyOptions
     public RedactionOptions Redaction { get; set; } = new();
 
     /// <summary>
+    /// Global transport-attestation defaults (see <see cref="TransportOptions"/>). The
+    /// feature is OFF by default (Enabled = false) so existing installs behave exactly
+    /// as before; enabling it only OBSERVES endpoints (Phase 1), it never blocks.
+    /// </summary>
+    public TransportOptions Transport { get; set; } = new();
+
+    /// <summary>
     /// Fail-closed body inspection policy: decides what to do with each Content-Type
     /// before anything is forwarded (see <see cref="InspectionOptions"/>).
     /// </summary>
     public InspectionOptions Inspection { get; set; } = new();
+
+    /// <summary>
+    /// Provider blocklist feed (Phase 3, non-secret, hot-reloaded from providers.json).
+    /// Metadata only: names of blocked hosts/provider slugs + a human reason + severity.
+    /// Per-route application is controlled by <see cref="RouteTransportOptions.Blocklist"/>.
+    /// </summary>
+    public ProviderFeedOptions Providers { get; set; } = new();
 
     /// <summary>
     /// Per-client rate limiting and brute-force protection (see <see cref="RateLimitOptions"/>).
@@ -84,6 +98,12 @@ public sealed class RouteOptions
     /// (Authorization / Content-Type / Accept) are never overridden.
     /// </summary>
     public Dictionary<string, string> Headers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Optional per-route transport-attestation section (routes.json "transport").
+    /// Null = the route inherits the global <see cref="ProxyOptions.Transport"/>.
+    /// </summary>
+    public RouteTransportOptions? Transport { get; set; }
 }
 
 /// <summary>
@@ -256,4 +276,144 @@ public sealed class KeyOptions
     /// Values live only in appsettings.Server.json / environment (never in non-secret files).
     /// </summary>
     public List<string> LocalKeys { get; set; } = new();
+}
+
+/// <summary>
+/// Global transport-attestation settings (Proxy.Transport). Phase 1 = observe only:
+/// enabling it captures who answered each TLS connection (metadata only) into the
+/// in-memory ring and the data/endpoint-baseline.json baseline; it never blocks.
+/// Phase 2 (pin/expected-IP enforcement) and Phase 3 (blocklist) build on the same
+/// per-route policy resolved by TransportPolicyProvider.
+/// </summary>
+public sealed class TransportOptions
+{
+    /// <summary>Master switch (default off - full compatibility).</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>In-memory ring buffer size (clamped 10..1000 at use; default 200).</summary>
+    public int BufferCapacity { get; set; } = TransportStore.DefaultCapacity;
+}
+
+/// <summary>
+/// Per-route transport-attestation section (routes.json "transport"). Every field is
+/// optional; null/empty inherits the global defaults. Light validation happens in
+/// RouteValidator / startup (invalid values are ignored, never crash the proxy).
+/// </summary>
+public sealed class RouteTransportOptions
+{
+    /// <summary>null inherits the global Proxy.Transport.Enabled.</summary>
+    public bool? Enabled { get; set; }
+
+    /// <summary>Pooled-connection lifetime for the route's HttpClient (Connection: close after N minutes).</summary>
+    public int? PoolLifetimeMinutes { get; set; }
+
+    /// <summary>Expected upstream IPs (CIDRs). Reserved for Phase 2 - not enforced in Phase 1.</summary>
+    public List<string> ExpectedIps { get; set; } = new();
+
+    /// <summary>Minimum accepted TLS version ("1.2" | "1.3"). Reserved for Phase 2.</summary>
+    public string? TlsFloor { get; set; }
+
+    /// <summary>Grace period (days) before a changed endpoint is considered suspect. Reserved for Phase 2/3.</summary>
+    public int GraceDays { get; set; } = 7;
+
+    /// <summary>"observe" (Phase 1) | "warn" | "block" (reserved for Phase 2).</summary>
+    public string Enforce { get; set; } = "observe";
+
+    /// <summary>Expected SPKI fingerprints (hex/base64url). Reserved for Phase 2 - not enforced in Phase 1.</summary>
+    public List<string> Pins { get; set; } = new();
+
+    /// <summary>
+    /// How often (hours) the endpoint probe re-connects to keep the baseline and drift
+    /// feed fresh for this route; 0 = probing disabled. Phase 2.
+    /// </summary>
+    public int ProbeHours { get; set; }
+
+    /// <summary>
+    /// Per-route provider-blocklist policy (Phase 3, routes.json "transport.blocklist").
+    /// Null/disabled = the feature is off for the route (zero cost on the hot path).
+    /// See <see cref="RouteBlocklistOptions"/> for the fields.
+    /// </summary>
+    public RouteBlocklistOptions? Blocklist { get; set; }
+}
+
+/// <summary>
+/// Provider blocklist feed (Phase 3): the list of blocked/flagged providers, hosts and
+/// provider slugs. Non-secret, hot-reloaded (providers.json, "Proxy.Providers"). Values
+/// are human names/reasons - NEVER content or keys.
+/// </summary>
+public sealed class ProviderFeedOptions
+{
+    /// <summary>Feed entries; empty array = no policy from the feed.</summary>
+    public List<ProviderEntryOptions> Entries { get; set; } = new();
+}
+
+/// <summary>
+/// One provider-feed entry (metadata only). A host-tier entry matches by upstream host;
+/// a provider-tier entry contributes provider slugs (ignore list) and flags when the
+/// route is an aggregator and opts in via <see cref="RouteBlocklistOptions"/>.
+/// </summary>
+public sealed class ProviderEntryOptions
+{
+    /// <summary>Unique feed id (<= 64 chars).</summary>
+    public string Id { get; set; } = string.Empty;
+
+    /// <summary>Display name of the provider/entry (<= 128 chars; optional).</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Upstream hosts this entry applies to (exact match, "*.domain" suffix wildcard supported).</summary>
+    public List<string> Hosts { get; set; } = new();
+
+    /// <summary>Provider slugs to add to the request's provider.ignore (e.g. "openrouter/auto").</summary>
+    public List<string> ProviderSlugs { get; set; } = new();
+
+    /// <summary>Human reason for the entry (<= 500 chars).</summary>
+    public string Reason { get; set; } = string.Empty;
+
+    /// <summary>"info" | "warn" | "block".</summary>
+    public string Severity { get; set; } = "info";
+
+    /// <summary>Optional expiry: the entry stops applying after this instant (null = never expires).</summary>
+    public DateTimeOffset? Until { get; set; }
+
+    /// <summary>Provider-tier flag: send "provider.zdr": true on aggregator routes.</summary>
+    public bool ZdrOnly { get; set; }
+
+    /// <summary>Provider-tier flag: send "provider.data_collection": "deny" on aggregator routes.</summary>
+    public bool DataCollectionDeny { get; set; }
+}
+
+/// <summary>
+/// Per-route provider-blocklist policy (Phase 3, routes.json "transport.blocklist").
+/// All disabled by default: a route without this section behaves exactly as before.
+/// The host tier (blocked upstream) and the provider tier (ignore/zdr/data_collection)
+/// only run when <see cref="Enabled"/> is true.
+/// </summary>
+public sealed class RouteBlocklistOptions
+{
+    /// <summary>Master switch for the route's provider-blocklist policy (default off).</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>When true, a "block" host-tier verdict is NOT rejected - the request is forwarded (operator override).</summary>
+    public bool AllowBlocked { get; set; }
+
+    /// <summary>
+    /// Aggregator hosts this route fronts (e.g. "openrouter.ai"). The provider tier only
+    /// applies when the route's upstream host matches one of these (exact or "*.domain").
+    /// Values may be bare hosts or full URLs (the host is extracted).
+    /// </summary>
+    public List<string> Aggregators { get; set; } = new();
+
+    /// <summary>
+    /// When true and the route is an aggregator: the proxy sends "X-OpenRouter-Metadata:
+    /// enabled" upstream and records the provider that actually served each response
+    /// (metadata only: names, in-memory + activity).
+    /// </summary>
+    public bool Attribution { get; set; }
+
+    /// <summary>
+    /// How provider conflicts are handled: "merge" (apply the policy and continue) or
+    /// "strict" (a client request that explicitly overrides the policy with
+    /// provider.only/order or zdr:false is rejected with 400).
+    /// </summary>
+    public string ProviderPolicy { get; set; } = "merge";
 }

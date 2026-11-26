@@ -54,6 +54,42 @@ public static class ConfigFileReader
     }
 
     // ----------------------------------------------------------
+    // Providers (providers.json -> Proxy.Providers.Entries)
+    // ----------------------------------------------------------
+
+    /// <summary>Provider blocklist feed from providers.json (Proxy.Providers.Entries). Null when the file is absent, unreadable or corrupt.</summary>
+    public static IReadOnlyList<ProviderEntryOptions>? ReadProviders(string configDir)
+    {
+        try
+        {
+            var node = AtomicJsonWriter.Load(Path.Combine(configDir, "providers.json"));
+            return node is JsonObject root ? ReadProvidersFromNode(root["Proxy"]) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Pure helper: deserializes proxyNode["Providers"]["Entries"]; null when absent or not an array.</summary>
+    public static IReadOnlyList<ProviderEntryOptions>? ReadProvidersFromNode(JsonNode? proxyNode)
+    {
+        if (proxyNode?["Providers"] is not JsonObject section || section["Entries"] is not JsonArray entries)
+        {
+            return null;
+        }
+
+        try
+        {
+            return entries.Deserialize<List<ProviderEntryOptions>>(Options);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // ----------------------------------------------------------
     // Security (redaction.json -> Proxy.Redaction/Inspection/RateLimit)
     // ----------------------------------------------------------
 

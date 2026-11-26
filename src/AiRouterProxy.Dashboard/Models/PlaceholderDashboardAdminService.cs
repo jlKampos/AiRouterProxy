@@ -63,5 +63,25 @@ public sealed class PlaceholderDashboardAdminService : IDashboardAdminService
     public AdminResult ClearDetections(string? authKey = null)
         => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
 
+    // Transport/Endpoint attestation write actions (Phase 2) - unavailable in standalone mode.
+    public AdminResult AcceptAttestationPin(string routeName, string? spki, string? authKey = null)
+        => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
+
+    public Task<AdminResult> LearnAttestationNowAsync(string routeName, string? authKey = null)
+        => Task.FromResult(AdminResult.Failure(Unavailable, AdminResult.TypeInternal));
+
+    public AdminResult ClearAttestationPins(string? routeName, string? authKey = null)
+        => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
+
+    public AdminResult ClearAttestationDrift(string? authKey = null)
+        => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
+
     public AdminResult ReloadConfirm() => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
+
+    // Phase 3: provider feed + aggregator-origin reads - unavailable in standalone mode.
+    public AdminResult ApplyProviders(IReadOnlyList<ProviderEntryDraft> providers, string? authKey = null)
+        => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
+
+    public Task<AdminResult> LookupGenerationOriginAsync(string generationId, string? authKey = null)
+        => Task.FromResult(AdminResult.Failure(Unavailable, AdminResult.TypeInternal));
 }

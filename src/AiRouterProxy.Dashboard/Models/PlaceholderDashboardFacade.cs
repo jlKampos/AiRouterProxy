@@ -59,7 +59,8 @@ public sealed class PlaceholderDashboardFacade : IDashboardFacade
                 "sh_" + Guid.NewGuid().ToString("N")[..10],
                 Routes[rnd.Next(Routes.Length)],
                 "dev/standalone",
-                "OpenAI key \u00d7 " + rnd.Next(1, 4)));
+                "OpenAI key \u00d7 " + rnd.Next(1, 4),
+                rnd.Next(3) == 0 ? "ip=104.21.55.1 cert=sha256:abcd1234 tls=TLS 1.3" : "-"));
         }
         return rows;
     }
@@ -124,4 +125,80 @@ public sealed class PlaceholderDashboardFacade : IDashboardFacade
     public IReadOnlyList<RouteView>? GetRoutesFromDisk() => GetRoutes();
     public SecurityOptionsView? GetSecurityOptionsFromDisk() => GetSecurityOptions();
     public KeysOverviewView? GetKeysOverviewFromDisk() => GetKeysOverview();
+
+    public IReadOnlyList<AttestationRouteView> GetAttestation() => new[]
+    {
+        new AttestationRouteView(
+            "default",
+            "api.airrouter.ch",
+            "observed",
+            DateTimeOffset.UtcNow.AddMinutes(-2),
+            new[] { DemoEntry("104.21.55.1") }),
+        new AttestationRouteView(
+            "openrouter",
+            "openrouter.ai",
+            "baseline",
+            DateTimeOffset.UtcNow.AddDays(-1),
+            new[] { DemoEntry("104.26.8.132") },
+            ServedBy: "OpenRouter (primary)"),
+        new AttestationRouteView(
+            "anthropic",
+            "api.anthropic.com",
+            "none",
+            null,
+            Array.Empty<AttestationEntryView>()),
+    };
+
+    // Provider blocklist feed (Phase 3): demo entries so the Providers panel renders in
+    // standalone dev - one warn (host tier), one block (provider slugs) and one ZDR-only sink.
+    public IReadOnlyList<ProviderEntryView> GetProviders() => new[]
+    {
+        new ProviderEntryView(
+            "laggy-core",
+            "Core latency provider",
+            new[] { "laggy.test" },
+            Array.Empty<string>(),
+            "Measured 2.4s median TTFT over the last 7 days",
+            "warn",
+            null,
+            false,
+            false),
+        new ProviderEntryView(
+            "banned-reforward",
+            "Provider violating re-forward policy",
+            new[] { "broken.test" },
+            new[] { "openrouter/auto", "openrouter/auto-52b" },
+            "Internal re-forwarding detected via attribution",
+            "block",
+            null,
+            false,
+            true),
+        new ProviderEntryView(
+            "zdr-sink",
+            "Zero-data-retention sink",
+            Array.Empty<string>(),
+            new[] { "openrouter/zdr" },
+            "Only routes traffic to ZDR endpoints",
+            "info",
+            null,
+            true,
+            false),
+    };
+
+    public IReadOnlyList<ProviderEntryView>? GetProvidersFromDisk() => GetProviders();
+
+    private static AttestationEntryView DemoEntry(string ip) => new(
+        ip, 443,
+        "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_ABCDEFGH",
+        "a1b2c3d4e5f60718",
+        "A1B2C3D4E5F60718A1B2C3D4E5F60718",
+        "CN=Example Demo CA",
+        DateTimeOffset.UtcNow.AddDays(-90),
+        DateTimeOffset.UtcNow.AddDays(275),
+        "TLS 1.3",
+        "TLS_AES_128_GCM_SHA256",
+        "h2",
+        DateTimeOffset.UtcNow.AddDays(-30),
+        DateTimeOffset.UtcNow.AddDays(-2),
+        "learn");
 }

@@ -71,6 +71,7 @@ class Program
     static void Main()
     {
         TestRouteValidator();
+        TestRouteValidatorTransport();
         TestKeyValidator();
         TestSecurityValidator();
         TestSecurityValidatorForensics();
@@ -99,6 +100,9 @@ class Program
         TestConfigFileReader();
         TestLogClearing();
         TestClearDetections();
+        TestAttestationAdmin();
+        TestProviderFeedValidator();
+        TestProvidersUpdate();
         TestForensicsRoundTrip();
         TestForensicsPersistence();
         TestForensicsPurgeScope();
@@ -2128,6 +2132,215 @@ class Program
             Inspection = new InspectionOptions { Enabled = true },
             RateLimit = new RateLimitOptions { Enabled = false },
         };
+
+    static string B64UrlOfHex(string hex)
+        => Convert.ToBase64String(Convert.FromHexString(hex)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    // --------------------------------------------------------------
+    // Transport/Endpoint attestation (Phase 2) - route validator + admin actions.
+    // --------------------------------------------------------------
+
+    static void TestRouteValidatorTransport()
+    {
+        RouteDraft Make(RouteTransportDraft t) => new("rt", "/rt", "https://api.example.com", "", null, 0, 0, null, t);
+        var known = new HashSet<string>(StringComparer.Ordinal);
+
+        // Null transport: no transport errors.
+        RouteValidator.Validate(new[] { Make(null!) }, known, out var errors0, out _);
+        CheckTrue("transport-val: null transport passes", () => errors0.Count == 0);
+
+        // Default section passes.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft()) }, known, out var clean, out _);
+        CheckTrue("transport-val: default section passes", () => clean.Count == 0);
+
+        // Bad enforce.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(Enforce: "kill")) }, known, out var badEnforce, out _);
+        CheckTrue("transport-val: bad enforce rejected", () => badEnforce.Any(e => e.Contains("enforce", StringComparison.Ordinal)));
+
+        // Bad graceDays / probeHours.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(GraceDays: -1)) }, known, out var badGrace, out _);
+        CheckTrue("transport-val: negative graceDays rejected", () => badGrace.Any(e => e.Contains("graceDays", StringComparison.Ordinal)));
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(ProbeHours: 9999)) }, known, out var badProbe, out _);
+        CheckTrue("transport-val: probeHours out of range rejected", () => badProbe.Any(e => e.Contains("probeHours", StringComparison.Ordinal)));
+
+        // Bad / valid tlsFloor.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(TlsFloor: "1.1")) }, known, out var badFloor, out _);
+        CheckTrue("transport-val: bad tlsFloor rejected", () => badFloor.Any(e => e.Contains("tlsFloor", StringComparison.Ordinal)));
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(Enforce: "block", TlsFloor: "1.3", GraceDays: 14, ProbeHours: 24)) }, known, out var good, out _);
+        CheckTrue("transport-val: valid section passes", () => good.Count == 0);
+
+        // Pins: hex + base64url pass; junk rejected.
+        var hexPin = string.Concat(Enumerable.Repeat("ab", 32));
+        var okPins = new List<string> { hexPin, B64UrlOfHex(hexPin) };
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(Pins: okPins)) }, known, out var goodPins, out _);
+        CheckTrue("transport-val: valid pins pass", () => goodPins.Count == 0);
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(Pins: new List<string> { "short-pin" })) }, known, out var badPin, out _);
+        CheckTrue("transport-val: invalid pin rejected", () => badPin.Any(e => e.Contains("pin", StringComparison.Ordinal)));
+
+        // Expected IPs: ip + cidr (v4/v6) pass; garbage rejected.
+        var okIps = new List<string> { "10.0.0.5", "192.168.0.0/16", "2001:db8::/32" };
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(ExpectedIps: okIps)) }, known, out var goodIps, out _);
+        CheckTrue("transport-val: valid ips pass", () => goodIps.Count == 0);
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(ExpectedIps: new List<string> { "not-an-ip", "10.0.0.0/33" })) }, known, out var badIps, out _);
+        CheckTrue("transport-val: invalid ips rejected", () => badIps.Any(e => e.Contains("expected IP", StringComparison.Ordinal)));
+    }
+
+    static void TestAttestationAdmin()
+    {
+        var adminKey = "admin-primary-key";
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var opts = NewOptions();
+        var store = new TransportStore();
+        var baseline = new BaselineStore(paths);
+        var monitor = new TestOptionsMonitor<ProxyOptions>(opts);
+        var provider = new TransportPolicyProvider(monitor);
+        var drift = new DriftStore();
+        var learned = new LearnedPinStore(paths);
+        var recorder = new AttestationRecorder(provider, learned, drift, store, baseline,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AttestationRecorder>.Instance);
+        var probe = new EndpointProbe(provider, recorder,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<EndpointProbe>.Instance);
+        var svc = new DashboardAdminService(
+            monitor, paths, backups, new ReloadConfirmer(backups),
+            new KeyMetaStore(paths), new AuditLog(paths), new ActivityStore(),
+            new FakeEventLogStore(), new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance,
+            drift, learned, probe, baseline);
+
+        var hex = string.Concat(Enumerable.Repeat("ab", 32));
+        var b64 = B64UrlOfHex(hex);
+
+        // Every write action re-checks the primary local key.
+        var noAuth = svc.AcceptAttestationPin("openai", b64, null);
+        CheckTrue("attestation-admin: accept requires admin key", () => !noAuth.Ok && noAuth.ErrorType == AdminResult.TypeAuthentication);
+        var wrong = svc.AcceptAttestationPin("openai", b64, "wrong-key");
+        CheckTrue("attestation-admin: accept wrong key rejected", () => !wrong.Ok && wrong.ErrorType == AdminResult.TypeAuthentication);
+
+        // Unknown route -> not found; bad SPKI -> validation.
+        var unknown = svc.AcceptAttestationPin("no-such-route", b64, adminKey);
+        CheckTrue("attestation-admin: unknown route not found", () => !unknown.Ok && unknown.ErrorType == AdminResult.TypeNotFound);
+        var badSpki = svc.AcceptAttestationPin("openai", "not-a-pin", adminKey);
+        CheckTrue("attestation-admin: bad spki rejected", () => !badSpki.Ok && badSpki.ErrorType == AdminResult.TypeValidation);
+
+        // Valid accept persists (pins.json) and audits.
+        var accepted = svc.AcceptAttestationPin("openai", b64, adminKey);
+        CheckTrue("attestation-admin: accept ok", () => accepted.Ok
+            && learned.GetForRoute("openai") is { Count: 1 } p && p[0] == b64);
+        CheckTrue("attestation-admin: accept audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("attestation.pin.accept", StringComparison.Ordinal));
+        var dup = svc.AcceptAttestationPin("openai", b64, adminKey);
+        CheckTrue("attestation-admin: duplicate accept reported", () => dup.Ok && dup.Message.Contains("already pinned", StringComparison.Ordinal));
+
+        // Accept with no SPKI = the latest observed endpoint from the durable baseline.
+        var second = B64UrlOfHex(string.Concat(Enumerable.Repeat("cd", 32)));
+        baseline.Record(new EndpointIdentity(
+            "openai", "api.openai.com", "93.184.216.34", 443, second, "certshatest",
+            "CN=api.openai.com", DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow.AddDays(30),
+            "TLS 1.3", "TLS_AES_128_GCM_SHA256", null, DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddHours(-1), "learn"));
+        var acceptedDefault = svc.AcceptAttestationPin("openai", null, adminKey);
+        CheckTrue("attestation-admin: default pin from baseline", () => acceptedDefault.Ok && learned.GetForRoute("openai").Contains(second));
+
+        // Learn now: an unknown route cannot be probed.
+        var learnUnknown = svc.LearnAttestationNowAsync("no-such-route", adminKey).GetAwaiter().GetResult();
+        CheckTrue("attestation-admin: learn unknown route fails", () => !learnUnknown.Ok && learnUnknown.ErrorType == AdminResult.TypeInternal);
+
+        // Clear pins: route-scoped then global.
+        var clearedRoute = svc.ClearAttestationPins("openai", adminKey);
+        CheckTrue("attestation-admin: clear route pins ok", () => clearedRoute.Ok && learned.GetForRoute("openai").Count == 0);
+        var clearedAll = svc.ClearAttestationPins(null, adminKey);
+        CheckTrue("attestation-admin: clear all pins ok", () => clearedAll.Ok && learned.GetRoutes().Count == 0);
+
+        // Clear drift (destructive, audited).
+        drift.TryAlert("openai", "10.0.0.1", "spki-mismatch", "high", DateTimeOffset.UtcNow);
+        CheckTrue("attestation-admin: drift seeded", () => drift.Count == 1);
+        var clearedDrift = svc.ClearAttestationDrift(adminKey);
+        CheckTrue("attestation-admin: clear drift ok", () => clearedDrift.Ok && drift.Count == 0);
+        CheckTrue("attestation-admin: clear drift audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("attestation.drift.clear", StringComparison.Ordinal));
+    }
+
+    // --------------------------------------------------------------
+    // Phase 3: provider feed validation + providers.json write path (metadata only).
+    // --------------------------------------------------------------
+    static void TestProviderFeedValidator()
+    {
+        // Valid feed passes (the write path validates ProviderEntryOptions).
+        var okEntries = new List<ProviderEntryOptions>
+        {
+            new()
+            {
+                Id = "a",
+                Name = "pv",
+                Hosts = new List<string> { "bad.test" },
+                ProviderSlugs = new List<string> { "openrouter/x" },
+                Severity = "warn",
+            },
+        };
+        CheckTrue("provider-val: valid feed passes", () => ProviderFeedValidator.Validate(okEntries, out _));
+
+        // Schema violation: missing id + no hosts/slugs + bad severity -> all reported.
+        var bad = new List<ProviderEntryOptions> { new() { Id = "", Name = "no shape", Severity = "nuclear" } };
+        CheckTrue("provider-val: invalid feed rejected with problems", () =>
+            !ProviderFeedValidator.Validate(bad, out var errors) && errors.Count >= 3);
+
+        // Duplicate ids and overlong lists are caught too.
+        var dup = new List<ProviderEntryOptions> { okEntries[0], okEntries[0] };
+        CheckTrue("provider-val: duplicate id rejected", () => !ProviderFeedValidator.Validate(dup, out _));
+
+        // Draft <-> options <-> json round-trips.
+        var draft = new ProviderEntryDraft(
+            "id-1", "pv", new List<string> { "h.test" }, new List<string> { "s/1" },
+            "why", "block", null, ZdrOnly: true, DataCollectionDeny: true);
+        var optsRound = ProviderEntryDraftJson.ToOptions(draft);
+        CheckTrue("provider-val: draft -> options", () => optsRound.Id == "id-1"
+            && optsRound.Hosts[0] == "h.test" && optsRound.ProviderSlugs[0] == "s/1"
+            && optsRound.ZdrOnly && optsRound.DataCollectionDeny && optsRound.Severity == "block");
+        var back = ProviderEntryDraftJson.FromOptions(optsRound);
+        CheckTrue("provider-val: options -> draft", () => back.Id == "id-1"
+            && back.Severity == "block" && back.SafeHosts.SequenceEqual(new[] { "h.test" }) && back.Until is null);
+        var json = ProviderEntryDraftJson.ToJson(draft);
+        CheckTrue("provider-val: draft -> camelCase json", () => json["id"]!.GetValue<string>() == "id-1"
+            && json["providerSlugs"] is JsonArray && json["severity"]!.GetValue<string>() == "block");
+    }
+
+    static void TestProvidersUpdate()
+    {
+        var (svc, root, cfg) = MakeService(NewOptions());
+        var providers = new List<ProviderEntryDraft>
+        {
+            new("bad-perf", "Provider with issues", new List<string> { "laggy.test" },
+                new List<string> { "openrouter/laggy" }, "Measured slowness", "warn", null, ZdrOnly: true),
+            new("blocked", "Blocked provider", new List<string> { "blocked.test" }, null, "Policy", "block"),
+        };
+
+        var applied = svc.ApplyProviders(providers);
+        CheckTrue("providers: apply ok", () => applied.Ok);
+        var file = Path.Combine(cfg, "providers.json");
+        CheckTrue("providers: file written with entries", () =>
+            AtomicJsonWriter.Load(file) is JsonObject o
+            && o["Proxy"] is JsonObject p
+            && p["Providers"] is JsonObject feed
+            && feed["Entries"] is JsonArray arr
+            && arr.Count == 2);
+        CheckTrue("providers: camelCase persisted", () =>
+            File.ReadAllText(file).Contains("\"providerSlugs\"", StringComparison.Ordinal));
+        CheckTrue("providers: update audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("providers.update", StringComparison.Ordinal));
+
+        // Validation failure writes nothing (the previous feed survives).
+        var invalid = svc.ApplyProviders(new List<ProviderEntryDraft> { new("", "no id") });
+        CheckTrue("providers: invalid feed rejected", () => !invalid.Ok && invalid.ErrorType == AdminResult.TypeValidation);
+        CheckTrue("providers: invalid feed writes nothing", () =>
+            (AtomicJsonWriter.Load(file)!["Proxy"]!["Providers"]!["Entries"] as JsonArray)!.Count == 2);
+
+        // Empty list clears the feed.
+        var cleared = svc.ApplyProviders(new List<ProviderEntryDraft>());
+        CheckTrue("providers: clear ok", () => cleared.Ok && cleared.Message.Contains("cleared", StringComparison.Ordinal));
+        CheckTrue("providers: file cleared", () =>
+            (AtomicJsonWriter.Load(file)!["Proxy"]!["Providers"]!["Entries"] as JsonArray)!.Count == 0);
+    }
 }
 
 /// <summary>Minimal IOptionsMonitor implementation for the harness (no host DI).</summary>

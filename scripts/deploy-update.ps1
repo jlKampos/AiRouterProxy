@@ -22,7 +22,10 @@ $svc = Get-Service $ServiceName -EA SilentlyContinue
 
 # Config files that keep their values across updates (preserved at the destination).
 # Priority: destination config\ (new layout), then the legacy deploy root (migrated to config\).
-$keep = @('appsettings.json','appsettings.Server.json','redaction.json','routes.json','proxy-cert.pem','proxy-key.pem')
+# providers.json (Phase 3 blocklist feed) is non-secret and preserved like routes/redaction.
+# data\ (endpoint baseline, pins, drift, key-meta, audit log, backups) is runtime-only data
+# next to the exe - it is never in publish-tmp, so this update NEVER touches it.
+$keep = @('appsettings.json','appsettings.Server.json','redaction.json','routes.json','providers.json','proxy-cert.pem','proxy-key.pem')
 
 W "stopping service..."
 if ($svc) {

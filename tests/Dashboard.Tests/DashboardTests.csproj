@@ -52,6 +52,33 @@
     <Compile Include="..\..\src\AiRouterProxy.Dashboard\Models\IDashboardAdminService.cs" Link="Models\IDashboardAdminService.cs" />
     <!-- Real host facade: the security round-trip test asserts the view the UI reads. -->
     <Compile Include="..\..\src\AiRouterProxy\AdminUi\HostDashboardFacade.cs" Link="AdminUi\HostDashboardFacade.cs" />
+    <!-- Transport/Endpoint attestation types used by the host facade (GetAttestation). -->
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportModels.cs" Link="Transport\TransportModels.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportStore.cs" Link="Transport\TransportStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\BaselineStore.cs" Link="Transport\BaselineStore.cs" />
+    <!-- Transport/Endpoint attestation (Phase 2): policy provider + pinning/drift chain,
+         the shared recorder and the probe (all reachable from the admin service/facade). -->
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportPolicyProvider.cs" Link="Transport\TransportPolicyProvider.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\PinValidator.cs" Link="Transport\PinValidator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\DriftEvaluator.cs" Link="Transport\DriftEvaluator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\DriftStore.cs" Link="Transport\DriftStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\EnforcePolicy.cs" Link="Transport\EnforcePolicy.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\LearnedPinStore.cs" Link="Transport\LearnedPinStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportCapture.cs" Link="Transport\TransportCapture.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\AttestationRecorder.cs" Link="Transport\AttestationRecorder.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\EndpointProbe.cs" Link="Transport\EndpointProbe.cs" />
+    <!-- Phase 3: provider feed validation + draft conversions, and the origin-read
+         helpers the admin service calls (providers.json write + aggregator origin). -->
+    <Compile Include="..\..\src\AiRouterProxy\Transport\ProviderBlocklist.cs" Link="Transport\ProviderBlocklist.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\AttestationOrigin.cs" Link="Transport\AttestationOrigin.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\AttributionStore.cs" Link="Transport\AttributionStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\AttributionExtractor.cs" Link="Transport\AttributionExtractor.cs" />
+    <!-- AttributionExtractor's SSE overloads parse raw chunks with the core Sse parser
+         (self-contained - no SseProtocol adapters needed by the dashboard harness). -->
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseEvent.cs" Link="Sse\SseEvent.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Sse\SseParser.cs" Link="Sse\SseParser.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\ProviderFeedValidator.cs" Link="AdminValidation\ProviderFeedValidator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\ProviderEntryDraftJson.cs" Link="AdminValidation\ProviderEntryDraftJson.cs" />
   </ItemGroup>
 
   <ItemGroup>
