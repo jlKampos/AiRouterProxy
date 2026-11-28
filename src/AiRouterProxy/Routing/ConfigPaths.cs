@@ -18,9 +18,27 @@ public static class ConfigPaths
     /// <summary>
     /// Returns the folder configuration is read from: "&lt;base&gt;/config" when that folder
     /// exists (deploy layout), otherwise <paramref name="baseDir"/> itself (dev/legacy layout).
+    /// See <see cref="ResolveConfigDir(string, string?)"/> for the environment override.
     /// </summary>
-    public static string ResolveConfigDir(string baseDir)
+    public static string ResolveConfigDir(string baseDir) => ResolveConfigDir(baseDir, envOverride: null);
+
+    /// <summary>
+    /// Resolves the configuration folder. When <paramref name="envOverride"/> (env var
+    /// <c>AIROUTER_CONFIG_DIR</c>, e.g. "/config" in the Docker image) is not empty it takes
+    /// precedence over the auto-detected layout. The value is normalized with
+    /// <see cref="Path.GetFullPath(string)"/>: relative values resolve against the process
+    /// working directory and ".", ".." and separators are normalized. Empty/whitespace
+    /// overrides are ignored, so omitting the env var keeps the existing auto-detect: "&lt;base&gt;/config"
+    /// when that folder exists (deploy layout), otherwise <paramref name="baseDir"/> itself
+    /// (dev/legacy layout) - full compatibility when the env var is absent.
+    /// </summary>
+    public static string ResolveConfigDir(string baseDir, string? envOverride)
     {
+        if (!string.IsNullOrWhiteSpace(envOverride))
+        {
+            return Path.GetFullPath(envOverride.Trim());
+        }
+
         var configDir = Path.Combine(baseDir, ConfigFolderName);
         return Directory.Exists(configDir) ? configDir : (string.IsNullOrEmpty(baseDir) ? "." : baseDir);
     }

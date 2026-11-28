@@ -16,7 +16,16 @@ public interface IDashboardAdminService
     /// <summary>True when the presented value equals the primary local key (admin privilege).</summary>
     bool VerifyAdminKey(string key);
 
-    /// <summary>Replaces the whole route table in routes.json (hot-reloaded). authKey optional (routes carry no secrets).</summary>
+    /// <summary>
+    /// Replaces the route table in routes.json (hot-reloaded). authKey optional (routes carry no secrets).
+    /// Optional sections are preserved, not erased: when a draft has <c>Headers</c> or
+    /// <c>Transport</c> = null the section currently stored for the same route name is kept
+    /// (an explicit <c>Headers</c> = empty dictionary clears the stored headers; a supplied
+    /// <c>Transport</c> replaces the stored section as a whole - there is no field-by-field
+    /// merge inside it). A route name with no stored entry starts without either section.
+    /// <c>GET /admin/api/v1/routes</c> returns the complete table (headers + transport) so it
+    /// can be edited and sent back as-is.
+    /// </summary>
     AdminResult ApplyRoutes(IReadOnlyList<RouteDraft> routes, string? authKey = null);
 
     /// <summary>Writes/rotates one RouteKeys secret in appsettings.Server.json. authKey REQUIRED (sensitive).</summary>
@@ -48,11 +57,13 @@ public interface IDashboardAdminService
 
     /// <summary>
     /// Ensures a keyRef is declared in appsettings.Server.json (Proxy.RouteKeys) with an
-    /// EMPTY value - fixes the dashboard dead-end of a fresh install: routes cannot
-    /// reference a keyRef that is not declared yet. Writes into the sensitive server
+    /// EMPTY value - avoids the dashboard dead-end of a fresh install, where the route
+    /// editor offers no keyRef to pick. Writes into the sensitive server
     /// config, so the same protected flow (backup/confirm/audit, authKey REQUIRED)
     /// applies. Existing refs are a no-op; routes using the new ref stay inactive until
-    /// a secret is set.
+    /// a secret is set. Routes may also reference a keyRef that is not declared at all -
+    /// those save with an "inactive until declared" warning - so this is a convenience,
+    /// not a prerequisite.
     /// </summary>
     AdminResult EnsureRouteKeyRef(string keyRef, string? authKey = null);
 
@@ -73,6 +84,20 @@ public interface IDashboardAdminService
 
     /// <summary>Clears the in-memory detection forensics buffer. Admin key REQUIRED (destructive).</summary>
     AdminResult ClearDetections(string? authKey = null);
+
+    // Transport/Endpoint attestation (Phase 2 - write actions). Every action is audited
+    // and requires the primary local key: pinning changes the security posture.
+    /// <summary>Pins an SPKI fingerprint (default: the route's latest observed one) into the learned pins. authKey REQUIRED.</summary>
+    AdminResult AcceptAttestationPin(string routeName, string? spki, string? authKey = null);
+
+    /// <summary>Runs an on-demand endpoint probe ("learn now") that records the current upstream endpoint. authKey REQUIRED.</summary>
+    Task<AdminResult> LearnAttestationNowAsync(string routeName, string? authKey = null);
+
+    /// <summary>Removes the learned pins of one route (null = all routes). authKey REQUIRED.</summary>
+    AdminResult ClearAttestationPins(string? routeName, string? authKey = null);
+
+    /// <summary>Clears the in-memory drift feed. Admin key REQUIRED (destructive).</summary>
+    AdminResult ClearAttestationDrift(string? authKey = null);
 
     /// <summary>Re-reads the config files from disk and confirms they reload; restores from backup when broken.</summary>
     AdminResult ReloadConfirm();

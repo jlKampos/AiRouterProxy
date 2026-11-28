@@ -7,6 +7,7 @@ using AiRouterProxy.AdminApi;
 using AiRouterProxy.AdminPersistence;
 using AiRouterProxy.AdminServices;
 using AiRouterProxy.AdminUi;
+using AiRouterProxy.AdminValidation;
 using AiRouterProxy.Dashboard;
 using AiRouterProxy.Dashboard.Models;
 using Microsoft.Extensions.Hosting.WindowsServices;
@@ -14,8 +15,10 @@ using Microsoft.Extensions.Options;
 using Microsoft.OpenApi;
 
 var baseDir = AppContext.BaseDirectory;
-var configDir = ConfigPaths.ResolveConfigDir(baseDir);
-var dataDir = DashboardPaths.ResolveDataDir(configDir, baseDir);
+// AIROUTER_CONFIG_DIR / AIROUTER_DATA_DIR let the Docker image redirect the layouts
+// (env vars take precedence over the auto-detect; absent = full compatibility).
+var configDir = ConfigPaths.ResolveConfigDir(baseDir, Environment.GetEnvironmentVariable("AIROUTER_CONFIG_DIR"));
+var dataDir = DashboardPaths.ResolveDataDir(configDir, baseDir, Environment.GetEnvironmentVariable("AIROUTER_DATA_DIR"));
 var dashboardPaths = new DashboardPaths(baseDir, configDir, dataDir);
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
@@ -34,19 +37,37 @@ var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 // Server-specific config (keys/certificates) - lives only on the target machine.
 builder.Configuration.AddJsonFile("appsettings.Server.json", optional: true, reloadOnChange: true);
 
-// Non-secret config (redaction and routes) - editable without restart (hot reload).
+// Non-secret config (redaction, routes) - editable without restart (hot reload).
 // No keys here: values live in appsettings.Server.json or env vars.
 builder.Configuration.AddJsonFile("redaction.json", optional: true, reloadOnChange: true);
 builder.Configuration.AddJsonFile("routes.json", optional: true, reloadOnChange: true);
 
 builder.Services.Configure<ProxyOptions>(builder.Configuration.GetSection(ProxyOptions.SectionName));
-builder.Services.AddHttpClient();
 builder.Services.AddWindowsService(options => options.ServiceName = "AIRouterProxy");
 
 builder.Services.AddSingleton<ActivityStore>();
 builder.Services.AddSingleton<DetectionStore>();
 builder.Services.AddSingleton<IDetectionStore>(sp => sp.GetRequiredService<DetectionStore>());
-builder.Services.AddSingleton<IEventLogStore, WindowsEventLogStore>();
+builder.Services.AddSingleton<IEventLogStore>(_ => OperatingSystem.IsWindows()
+    ? new WindowsEventLogStore()
+    : new UnavailableEventLogStore());
+
+// Transport/Endpoint Attestation (Phase 1: capture/observation, metadata only).
+// The baseline writes into data\ at runtime; nothing is persisted unless a route
+// has an active transport policy and actually completes a TLS connection.
+builder.Services.AddSingleton<TransportStore>();
+builder.Services.AddSingleton<BaselineStore>();
+builder.Services.AddSingleton<TransportPolicyProvider>();
+
+// Phase 2 (pinning + drift): per-connect enforcement pipeline + the periodic endpoint
+// probe (hosted background service; routes opt in via transport.probeHours).
+builder.Services.AddSingleton<DriftStore>();
+builder.Services.AddSingleton<LearnedPinStore>();
+builder.Services.AddSingleton<AttestationRecorder>();
+builder.Services.AddSingleton<EndpointProbe>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<EndpointProbe>());
+
+builder.Services.AddSingleton<TransportClientFactory>();
 
 // Admin dashboard UI - Blazor Web App served under /admin/ui in the same process.
 builder.Services.AddDashboard(DashboardExtensions.BasePath);
@@ -128,7 +149,11 @@ builder.WebHost.ConfigureKestrel(kestrel =>
 
 var app = builder.Build();
 
-EnsureEventLogExists();
+// Windows-only: on Linux/macOS there is no Event Log (docker/console captures stdout).
+if (OperatingSystem.IsWindows())
+{
+    EnsureEventLogExists();
+}
 
 // Admin UI (Blazor) lives under /admin/ui: the path base is stripped here so the Blazor
 // router sees relative paths inside the subtree. UsePathBase only touches /admin/ui requests.
@@ -263,6 +288,17 @@ app.MapGet("/admin/refusals", (ActivityStore store, int hours = 6, int limit = 5
 
 app.MapGet("/admin/logs", (ILoggerFactory loggerFactory, int hours = 6, int limit = 50) =>
 {
+    // Windows-only: the container has no Event Log - logs go to stdout (`docker logs`).
+    if (!OperatingSystem.IsWindows())
+    {
+        return Results.Ok(new
+        {
+            count = 0,
+            entries = Array.Empty<object>(),
+            note = "Event Log is Windows-only; use 'docker logs'.",
+        });
+    }
+
     limit = Math.Clamp(limit, 1, 200);
     hours = Math.Clamp(hours, 1, 24 * 30);
 
@@ -330,6 +366,12 @@ app.Run();
 
 static void EnsureEventLogExists()
 {
+    // Defense-in-depth: callers gate on OperatingSystem.IsWindows() already.
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
     const string source = "AIRouterProxy";
     const string log = "AIRouterProxy";
 
@@ -436,7 +478,77 @@ static void ValidateRoutes(ProxyOptions options)
             Console.WriteLine(
                 $"[WARNING] Route '{route.Name}' has no key (keyRef '{route.KeyRef}') - inactive until the key is set.");
         }
+
+        // Transport section (attestation, Phase 1 = observe only): light validation only.
+        // Invalid values are ignored with a warning - a bad section must never crash the
+        // proxy or fail the route table (the transport feature is off by default anyway).
+        ValidateRouteTransport(route);
     }
+}
+
+/// <summary>
+/// Light validation of the optional per-route "transport" section. Values that do not
+/// parse are ignored (warning only), so a hand-edited routes.json can never take the
+/// proxy down. The dashboard-side validation (RouteValidator) is stricter.
+/// </summary>
+static void ValidateRouteTransport(AIRouterProxy.RouteOptions route)
+{
+    var t = route.Transport;
+    if (t is null)
+    {
+        return;
+    }
+
+    if (!string.IsNullOrWhiteSpace(t.Enforce)
+        && t.Enforce is not ("observe" or "warn" or "block"))
+    {
+        Console.WriteLine($"[WARNING] Route '{route.Name}': transport.enforce '{t.Enforce}' is invalid (observe|warn|block) - ignored.");
+    }
+
+    if (!string.IsNullOrWhiteSpace(t.TlsFloor)
+        && t.TlsFloor is not ("1.2" or "1.3"))
+    {
+        Console.WriteLine($"[WARNING] Route '{route.Name}': transport.tlsFloor '{t.TlsFloor}' is invalid (1.2|1.3) - ignored.");
+    }
+
+    if (t.PoolLifetimeMinutes is < 0)
+    {
+        Console.WriteLine($"[WARNING] Route '{route.Name}': transport.poolLifetimeMinutes must be >= 0 - ignored.");
+    }
+
+    if (t.ProbeHours < 0)
+    {
+        Console.WriteLine($"[WARNING] Route '{route.Name}': transport.probeHours must be >= 0 - ignored.");
+    }
+
+    if (t.GraceDays is < 0 or > 365)
+    {
+        Console.WriteLine($"[WARNING] Route '{route.Name}': transport.graceDays must be 0..365 - ignored.");
+    }
+
+    foreach (var pin in t.Pins ?? new List<string>())
+    {
+        if (!IsPinLike(pin))
+        {
+            Console.WriteLine($"[WARNING] Route '{route.Name}': transport.pin '{pin}' is not a hex/base64url hash - ignored.");
+        }
+    }
+}
+
+/// <summary>True when the value looks like a full SHA-256 fingerprint (64 hex chars) or a base64url/base64 hash.</summary>
+static bool IsPinLike(string pin)
+{
+    if (string.IsNullOrWhiteSpace(pin))
+    {
+        return false;
+    }
+
+    var value = pin.Trim();
+    var isHex64 = value.Length == 64
+                  && value.All(c => c is >= '0' and <= '9' or >= 'a' and <= 'f' or >= 'A' and <= 'F');
+    var isB64 = value.Length is 43 or 44
+                && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '+' or '/' or '-' or '_' or '=');
+    return isHex64 || isB64;
 }
 
 static X509Certificate2 LoadServerCertificate(ProxyOptions options, string configDir)

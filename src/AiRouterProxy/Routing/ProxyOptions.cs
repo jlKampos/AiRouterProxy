@@ -18,6 +18,15 @@ public sealed class ProxyOptions
     public RedactionOptions Redaction { get; set; } = new();
 
     /// <summary>
+    /// Global transport-attestation defaults (see <see cref="TransportOptions"/>). The
+    /// feature is OFF by default (Enabled = false) so existing installs behave exactly
+    /// as before; enabling it captures who answered each TLS connection. Per-route policy
+    /// (pins, expected IPs, TLS floor, enforce) decides whether drift is only observed,
+    /// warned about or blocked.
+    /// </summary>
+    public TransportOptions Transport { get; set; } = new();
+
+    /// <summary>
     /// Fail-closed body inspection policy: decides what to do with each Content-Type
     /// before anything is forwarded (see <see cref="InspectionOptions"/>).
     /// </summary>
@@ -84,6 +93,12 @@ public sealed class RouteOptions
     /// (Authorization / Content-Type / Accept) are never overridden.
     /// </summary>
     public Dictionary<string, string> Headers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Optional per-route transport-attestation section (routes.json "transport").
+    /// Null = the route inherits the global <see cref="ProxyOptions.Transport"/>.
+    /// </summary>
+    public RouteTransportOptions? Transport { get; set; }
 }
 
 /// <summary>
@@ -256,4 +271,54 @@ public sealed class KeyOptions
     /// Values live only in appsettings.Server.json / environment (never in non-secret files).
     /// </summary>
     public List<string> LocalKeys { get; set; } = new();
+}
+
+/// <summary>
+/// Global transport-attestation settings (Proxy.Transport). Enabling it captures who
+/// answered each TLS connection (metadata only) into the in-memory ring and the
+/// data/endpoint-baseline.json baseline. Per-route policy (pins, expected IPs, TLS floor,
+/// enforce) is resolved by TransportPolicyProvider and can warn about or block drift.
+/// </summary>
+public sealed class TransportOptions
+{
+    /// <summary>Master switch (default off - full compatibility).</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>In-memory ring buffer size (clamped 10..1000 at use; default 200).</summary>
+    public int BufferCapacity { get; set; } = TransportStore.DefaultCapacity;
+}
+
+/// <summary>
+/// Per-route transport-attestation section (routes.json "transport"). Every field is
+/// optional; null/empty inherits the global defaults. Light validation happens in
+/// RouteValidator / startup (invalid values are ignored, never crash the proxy).
+/// </summary>
+public sealed class RouteTransportOptions
+{
+    /// <summary>null inherits the global Proxy.Transport.Enabled.</summary>
+    public bool? Enabled { get; set; }
+
+    /// <summary>Pooled-connection lifetime for the route's HttpClient (Connection: close after N minutes).</summary>
+    public int? PoolLifetimeMinutes { get; set; }
+
+    /// <summary>Expected upstream IPs (CIDRs) for this route's endpoint policy.</summary>
+    public List<string> ExpectedIps { get; set; } = new();
+
+    /// <summary>Minimum accepted TLS version ("1.2" | "1.3").</summary>
+    public string? TlsFloor { get; set; }
+
+    /// <summary>Grace period (days) before a changed endpoint is considered suspect.</summary>
+    public int GraceDays { get; set; } = 7;
+
+    /// <summary>"observe" | "warn" (tags the response) | "block" (rejects with HTTP 526).</summary>
+    public string Enforce { get; set; } = "observe";
+
+    /// <summary>Expected SPKI fingerprints (hex/base64url) that always pass.</summary>
+    public List<string> Pins { get; set; } = new();
+
+    /// <summary>
+    /// How often (hours) the endpoint probe re-connects to keep the baseline and drift
+    /// feed fresh for this route; 0 = probing disabled.
+    /// </summary>
+    public int ProbeHours { get; set; }
 }

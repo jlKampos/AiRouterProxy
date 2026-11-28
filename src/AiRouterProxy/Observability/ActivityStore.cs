@@ -19,6 +19,14 @@ public sealed class ActivityEntry
     public string? PresentedHash { get; init; }
     public string? ExpectedHash { get; init; }
     public string? UA { get; init; }
+
+    /// <summary>
+    /// One-line transport summary of the last attested endpoint on the route
+    /// (e.g. "ip=104.21.55.1 cert=sha256:abcd1234 tls=TLS 1.3 alpn=h2").
+    /// Metadata only; null when the route has no active attestation policy
+    /// (or nothing was observed yet). Bounded to 200 chars by the caller.
+    /// </summary>
+    public string? Transport { get; init; }
 }
 
 /// <summary>

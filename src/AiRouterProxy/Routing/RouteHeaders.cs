@@ -7,7 +7,7 @@ namespace AIRouterProxy;
 /// </summary>
 public static class RouteHeaders
 {
-    private static readonly HashSet<string> Reserved = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> ReservedSet = new(StringComparer.OrdinalIgnoreCase)
     {
         "authorization",
         "content-type",
@@ -17,6 +17,13 @@ public static class RouteHeaders
         "host",
         "connection",
     };
+
+    /// <summary>
+    /// Header names the proxy injects itself and that a per-route static header must never
+    /// override. Single source of truth: <c>RouteValidator</c> rejects exactly this list on
+    /// save. Case-insensitive.
+    /// </summary>
+    public static IReadOnlySet<string> Reserved => ReservedSet;
 
     public static void Apply(HttpRequestMessage request, IReadOnlyDictionary<string, string>? headers)
     {
@@ -29,7 +36,7 @@ public static class RouteHeaders
         {
             if (string.IsNullOrWhiteSpace(name)
                 || string.IsNullOrWhiteSpace(value)
-                || Reserved.Contains(name))
+                || ReservedSet.Contains(name))
             {
                 continue;
             }

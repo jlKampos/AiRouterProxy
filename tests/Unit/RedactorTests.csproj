@@ -7,6 +7,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>RedactorTests</RootNamespace>
     <AssemblyName>RedactorTests</AssemblyName>
+    <!-- The harness compiles Observability\IEventLogStore.cs (Windows-only EventLog API);
+         same suppression as the host (the store is replaced by UnavailableEventLogStore
+         on non-Windows). -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,6 +18,8 @@
     <Compile Include="..\..\src\AiRouterProxy\Detection\SecretRedactor.cs" Link="SecretRedactor.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Detection\DetectionFingerprint.cs" Link="Detection\DetectionFingerprint.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\DetectionStore.cs" Link="Observability\DetectionStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\IEventLogStore.cs" Link="Observability\IEventLogStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\UnavailableEventLogStore.cs" Link="Observability\UnavailableEventLogStore.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\RedactionNotice.cs" Link="Observability\RedactionNotice.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\NoticeInjector.cs" Link="NoticeInjector.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\RouteResolver.cs" Link="RouteResolver.cs" />
@@ -37,6 +43,35 @@
     <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\AnthropicAdapter.cs" Link="SseProtocol\AnthropicAdapter.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Sse\SseProtocol\GenericSseAdapter.cs" Link="SseProtocol\GenericSseAdapter.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Sse\SseStreamProcessor.cs" Link="SseStreamProcessor.cs" />
+    <!-- Transport/Endpoint Attestation (Phase 1): stores, policy resolution, manual
+         TLS connect + the client factory. BaselineStore needs DashboardPaths +
+         AtomicJsonWriter, linked here too. -->
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportModels.cs" Link="Transport\TransportModels.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportStore.cs" Link="Transport\TransportStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\BaselineStore.cs" Link="Transport\BaselineStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportPolicyProvider.cs" Link="Transport\TransportPolicyProvider.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\ConnectTelemetry.cs" Link="Transport\ConnectTelemetry.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportClientFactory.cs" Link="Transport\TransportClientFactory.cs" />
+    <!-- Transport/Endpoint Attestation (Phase 2): pinning + drift - pure logic, the
+         shared recording pipeline, the durable learned-pin store and the probe. -->
+    <Compile Include="..\..\src\AiRouterProxy\Transport\PinValidator.cs" Link="Transport\PinValidator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\DriftEvaluator.cs" Link="Transport\DriftEvaluator.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\DriftStore.cs" Link="Transport\DriftStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\EnforcePolicy.cs" Link="Transport\EnforcePolicy.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportErrorMapper.cs" Link="Transport\TransportErrorMapper.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\LearnedPinStore.cs" Link="Transport\LearnedPinStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\TransportCapture.cs" Link="Transport\TransportCapture.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\AttestationRecorder.cs" Link="Transport\AttestationRecorder.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Transport\EndpointProbe.cs" Link="Transport\EndpointProbe.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AdminPaths.cs" Link="AdminPersistence\AdminPaths.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AtomicJsonWriter.cs" Link="AdminPersistence\AtomicJsonWriter.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- TransportPolicyProvider uses IOptionsMonitor and the TLS path uses
+         SslClientAuthenticationOptions/SocketsHttpHandler: the ASP.NET Core shared
+         framework provides them (same pattern as Dashboard.Tests). -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
 </Project>

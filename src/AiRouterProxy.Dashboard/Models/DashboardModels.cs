@@ -26,7 +26,9 @@ public sealed record RouteView(
     bool Active,
     IReadOnlyList<string> AllowedPaths,
     int RequestTimeoutMs,
-    long MaxBodySize);
+    long MaxBodySize,
+    IReadOnlyDictionary<string, string>? Headers = null,
+    RouteTransportDraft? Transport = null);
 
 /// <summary>Proxy-level route defaults: values inherited by routes whose own timeout/max body is 0.</summary>
 public sealed record RouteDefaultsView(
@@ -56,7 +58,8 @@ public sealed record ActivityView(
     string ExpectedHash,
     string Owner,
     string UA,
-    string RedactionKinds);
+    string RedactionKinds,
+    string Transport = "-");
 
 public sealed record KeyMetaView(
     string KeyRef,
@@ -101,6 +104,9 @@ public sealed record AdminResult(
 /// <summary>
 /// A route as edited by the dashboard. A draft carries NO secret values - the key is
 /// referenced by name only (<see cref="KeyRef"/>), the value stays in the server config.
+/// <see cref="Headers"/> null means "not supplied" (the server preserves the existing
+/// routes.json node); an empty dictionary is an explicit "remove every header".
+/// <see cref="Transport"/> null means "no per-route section supplied" (also preserved).
 /// </summary>
 public sealed record RouteDraft(
     string Name,
@@ -110,10 +116,52 @@ public sealed record RouteDraft(
     List<string>? AllowedPaths = null,
     int RequestTimeoutMs = 0,
     long MaxBodySize = 0,
-    Dictionary<string, string>? Headers = null)
+    Dictionary<string, string>? Headers = null,
+    RouteTransportDraft? Transport = null)
 {
     public List<string> SafePaths => AllowedPaths ?? new List<string>();
     public Dictionary<string, string> SafeHeaders => Headers ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// Per-route transport-attestation section (routes.json "transport") as edited through
+/// the API/config bundle. Mirrors the host's RouteTransportOptions; optional and
+/// validated by RouteValidator (Phase 2: enforce/pins/graceDays/probeHours are enforced
+/// by the proxy when the route opts in).
+/// </summary>
+public sealed record RouteTransportDraft(
+    bool? Enabled = null,
+    int? PoolLifetimeMinutes = null,
+    List<string>? ExpectedIps = null,
+    string? TlsFloor = null,
+    int GraceDays = 7,
+    string Enforce = "observe",
+    List<string>? Pins = null,
+    int ProbeHours = 0)
+{
+    public List<string> SafeExpectedIps => ExpectedIps ?? new List<string>();
+    public List<string> SafePins => Pins ?? new List<string>();
+}
+
+/// <summary>
+/// Edit-state rules for the routes table, kept out of the Razor page so they can be
+/// unit-tested. The server preserves the optional "headers"/"transport" sections by
+/// route NAME (<c>DashboardAdminService.MergePreservedRouteNodes</c>): a route that is
+/// renamed must therefore resend every section it already has, otherwise the merge finds
+/// no match and the section is dropped from routes.json.
+/// </summary>
+public static class RouteEditRules
+{
+    /// <summary>
+    /// True when the operator actually changed the route name (Ordinal, surrounding
+    /// whitespace ignored - the draft trims the name before saving). A new row (no
+    /// original name) counts as a rename once it receives a name.
+    /// </summary>
+    public static bool NameChanged(string? originalName, string? currentName)
+        => !string.Equals(
+            (originalName ?? string.Empty).Trim(),
+            (currentName ?? string.Empty).Trim(),
+            StringComparison.Ordinal);
 }
 
 /// <summary>Admin-only metadata for a route key reference. Never holds the secret value.</summary>
@@ -263,4 +311,56 @@ public interface IDashboardFacade
     IReadOnlyList<RouteView>? GetRoutesFromDisk();
     SecurityOptionsView? GetSecurityOptionsFromDisk();
     KeysOverviewView? GetKeysOverviewFromDisk();
+
+    // Transport/Endpoint attestation (Phase 1 - read only): who answered each TLS
+    // connection, per route. Metadata only - never request content, never keys.
+    IReadOnlyList<AttestationRouteView> GetAttestation();
 }
+
+/// <summary>Per-route attestation card (read-only): status, policy posture, drift episodes + the persistent baseline entries.</summary>
+public sealed record AttestationRouteView(
+    string Route,
+    string Host,
+    /// <summary>"observed" / "warn" / "blocked" (recent live connection) | "baseline" (persisted only) | "none".</summary>
+    string Status,
+    DateTimeOffset? LastSeen,
+    IReadOnlyList<AttestationEntryView> Entries,
+    IReadOnlyList<DriftView>? Drift = null,
+    AttestationPolicyView? Policy = null);
+
+/// <summary>Policy posture of one route as the attestation page shows it (metadata only).</summary>
+public sealed record AttestationPolicyView(
+    string Enforce,
+    int GraceDays,
+    int ProbeHours,
+    IReadOnlyList<string> ExpectedIps,
+    string? TlsFloor,
+    IReadOnlyList<string> PinsConfigured,
+    int PinCount);
+
+/// <summary>One drift episode (metadata only): what drifted, how severe, alert cadence.</summary>
+public sealed record DriftView(
+    string Route,
+    string Ip,
+    string Reason,
+    string Severity,
+    DateTimeOffset FirstSeen,
+    DateTimeOffset LastAlerted,
+    int AlertCount);
+
+/// <summary>One baseline endpoint entry - metadata only (cert fingerprints, TLS facts).</summary>
+public sealed record AttestationEntryView(
+    string Ip,
+    int Port,
+    string SpkiHash,
+    string SpkiHashShort,
+    string CertSha256,
+    string Issuer,
+    DateTimeOffset NotBefore,
+    DateTimeOffset NotAfter,
+    string TlsVersion,
+    string? CipherSuite,
+    string? Alpn,
+    DateTimeOffset FirstSeen,
+    DateTimeOffset LastSeen,
+    string Source);

@@ -1,0 +1,37 @@
+# Build artifacts / tooling
+**/bin/
+**/obj/
+publish-tmp/
+tests/
+deploy/
+artifacts/
+.vs/
+.vscode/
+
+# Host-mounted runtime dirs (mounted at runtime, never baked into the image)
+data/
+config/
+
+# Secrets - must never enter the build context
+**/appsettings.Server.json
+**/appsettings.Server.example.json
+**/appsettings.Production.json
+**/proxy-cert.pem
+**/proxy-key.pem
+**/*.pfx
+**/*.p12
+**/*.pem
+**/*.key
+**/*.crt
+LOCAL_KEY.txt
+.env
+.env.*
+
+# Repo/docs/IDE noise
+.git/
+.gitignore
+.github/
+images/
+opencode_configs/
+*.log
+deploy-update.log

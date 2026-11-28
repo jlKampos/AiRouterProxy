@@ -43,6 +43,10 @@ public sealed class DashboardAdminService : IDashboardAdminService
     private readonly ActivityStore _activity;
     private readonly IEventLogStore _eventLogs;
     private readonly IDetectionStore _detections;
+    private readonly DriftStore? _drift;
+    private readonly LearnedPinStore? _learnedPins;
+    private readonly EndpointProbe? _probe;
+    private readonly BaselineStore? _baseline;
     private readonly ILogger<DashboardAdminService> _logger;
 
     // Serializes every config write (backup -> write -> confirm -> audit) because the
@@ -62,7 +66,11 @@ public sealed class DashboardAdminService : IDashboardAdminService
         ActivityStore activity,
         IEventLogStore eventLogs,
         IDetectionStore detections,
-        ILogger<DashboardAdminService> logger)
+        ILogger<DashboardAdminService> logger,
+        DriftStore? drift = null,
+        LearnedPinStore? learnedPins = null,
+        EndpointProbe? probe = null,
+        BaselineStore? baseline = null)
     {
         _options = options;
         _paths = paths;
@@ -73,6 +81,10 @@ public sealed class DashboardAdminService : IDashboardAdminService
         _activity = activity;
         _eventLogs = eventLogs;
         _detections = detections;
+        _drift = drift;
+        _learnedPins = learnedPins;
+        _probe = probe;
+        _baseline = baseline;
         _logger = logger;
     }
 
@@ -111,7 +123,9 @@ public sealed class DashboardAdminService : IDashboardAdminService
             _backups.Backup(_paths.ConfigDir, RoutesFile);
             var root = LoadOrCreateConfig(RoutesFile);
             var proxy = EnsureObject(root, "Proxy");
-            proxy["Routes"] = RouteDraftJson.ToArray(routes);
+            var newRoutes = RouteDraftJson.ToArray(routes);
+            MergePreservedRouteNodes(proxy["Routes"] as JsonArray, newRoutes, routes);
+            proxy["Routes"] = newRoutes;
             AtomicJsonWriter.SaveAtomic(ConfigPaths.ResolveFile(RoutesFile, _paths.ConfigDir), root);
 
             var confirmed = _confirmer.Confirm(_paths.ConfigDir, RoutesFile, RoutesShape);
@@ -137,6 +151,67 @@ public sealed class DashboardAdminService : IDashboardAdminService
         {
             _audit.Append("routes.apply", RoutesFile, "error", Actor(authKey));
             return AdminResult.Failure("Could not write routes.json - the previous version was kept.", AdminResult.TypeInternal);
+        }
+    }
+
+    /// <summary>
+    /// Carries over the route fields a draft did not supply. The dashboard edits only a
+    /// subset of each route: a partial/older client may send Headers=null or Transport=null
+    /// because it never loaded them, and the UI sends null for a section the operator did
+    /// not touch. Writing the draft as-is would erase those nodes from routes.json, so this
+    /// merge is the server-side safety net. A supplied Transport section replaces the stored
+    /// one as a whole - there is no field-by-field merge inside it (GET returns the full
+    /// section for a round-trip). Match is by route name, Ordinal, with surrounding
+    /// whitespace ignored on both sides: routes.json is hand-editable, so a stored
+    /// " anthropic " must still match the draft's trimmed "anthropic" (the UI trims the
+    /// name before saving) instead of losing its headers/transport. Names are the stable
+    /// identifier used by the logs and attestation, and RouteValidator already rejects
+    /// duplicates case-sensitively. An explicit empty Headers object is not null and
+    /// therefore replaces the old node - that is how the operator clears every header.
+    /// </summary>
+    private static void MergePreservedRouteNodes(JsonArray? existingRoutes, JsonArray newRoutes, IReadOnlyList<RouteDraft> drafts)
+    {
+        if (existingRoutes is null || existingRoutes.Count == 0)
+        {
+            return;
+        }
+
+        var byName = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
+        foreach (var entry in existingRoutes)
+        {
+            if (entry is not JsonObject old
+                || SectionProp(old, "name") is not JsonValue nameValue
+                || !nameValue.TryGetValue<string>(out var oldName))
+            {
+                continue;
+            }
+
+            var key = oldName.Trim();
+            if (byName.ContainsKey(key))
+            {
+                continue;
+            }
+
+            byName[key] = old;
+        }
+
+        for (var i = 0; i < newRoutes.Count && i < drafts.Count; i++)
+        {
+            if (newRoutes[i] is not JsonObject target
+                || !byName.TryGetValue((drafts[i].Name ?? string.Empty).Trim(), out var old))
+            {
+                continue;
+            }
+
+            if (drafts[i].Transport is null && SectionProp(old, "transport") is { } transport)
+            {
+                target["transport"] = transport.DeepClone();
+            }
+
+            if (drafts[i].Headers is null && SectionProp(old, "headers") is { } headers)
+            {
+                target["headers"] = headers.DeepClone();
+            }
         }
     }
 
@@ -634,6 +709,140 @@ public sealed class DashboardAdminService : IDashboardAdminService
         return AdminResult.Success(message);
     }
 
+    // ----------------------------------------------------------
+    // Transport/Endpoint attestation write actions (Phase 2). Every action changes the
+    // security posture (pins) or is destructive (clears), so the same re-auth path as
+    // the destructive clears applies: primary local key + audit, no config write lock.
+    // ----------------------------------------------------------
+
+    public AdminResult AcceptAttestationPin(string routeName, string? spki, string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (string.IsNullOrWhiteSpace(routeName))
+        {
+            return AdminResult.Failure("Route name is required.", AdminResult.TypeValidation);
+        }
+
+        if (_learnedPins is null)
+        {
+            return AdminResult.Failure("The learned-pin store is unavailable.", AdminResult.TypeInternal);
+        }
+
+        var opts = _options.CurrentValue;
+        if (opts.Routes?.Any(r => string.Equals(r.Name, routeName, StringComparison.Ordinal)) is not true)
+        {
+            return AdminResult.Failure($"Route '{routeName}' does not exist.", AdminResult.TypeNotFound);
+        }
+
+        var pin = string.IsNullOrWhiteSpace(spki) ? LatestObservedSpki(routeName) : spki.Trim();
+        if (string.IsNullOrWhiteSpace(pin))
+        {
+            return AdminResult.Failure($"No endpoint observed for route '{routeName}' yet - nothing to accept.", AdminResult.TypeNotFound);
+        }
+
+        var canonical = TransportHashes.NormalizePin(pin);
+        if (canonical is null)
+        {
+            return AdminResult.Failure("The SPKI value is not a valid SHA-256 fingerprint (64 hex or base64url).", AdminResult.TypeValidation);
+        }
+
+        var added = _learnedPins.AddPin(routeName, canonical, DateTimeOffset.UtcNow);
+        var count = _learnedPins.GetForRoute(routeName).Count;
+        var message = added
+            ? $"SPKI {TransportHashes.ShortHex16(canonical)} pinned for route '{routeName}' ({count} learned pin{(count == 1 ? "" : "s")})."
+            : $"SPKI {TransportHashes.ShortHex16(canonical)} was already pinned for route '{routeName}'.";
+        TryAudit("attestation.pin.accept", routeName, "ok", authKey);
+        return AdminResult.Success(message);
+    }
+
+    public async Task<AdminResult> LearnAttestationNowAsync(string routeName, string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (string.IsNullOrWhiteSpace(routeName))
+        {
+            return AdminResult.Failure("Route name is required.", AdminResult.TypeValidation);
+        }
+
+        if (_probe is null)
+        {
+            return AdminResult.Failure("The endpoint probe is unavailable.", AdminResult.TypeInternal);
+        }
+
+        var ok = await _probe.ProbeRouteAsync(routeName, CancellationToken.None);
+        if (!ok)
+        {
+            return AdminResult.Failure($"The probe for route '{routeName}' could not complete (unknown route or unreachable upstream).", AdminResult.TypeInternal);
+        }
+
+        TryAudit("attestation.learn", routeName, "ok", authKey);
+        return AdminResult.Success($"Endpoint probe for route '{routeName}' completed - the observation is in the baseline and the drift feed.");
+    }
+
+    public AdminResult ClearAttestationPins(string? routeName, string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (_learnedPins is null)
+        {
+            return AdminResult.Failure("The learned-pin store is unavailable.", AdminResult.TypeInternal);
+        }
+
+        var removed = string.IsNullOrWhiteSpace(routeName)
+            ? _learnedPins.ClearAll()
+            : _learnedPins.RemoveRoute(routeName!);
+
+        var message = removed == 0
+            ? "No learned pins to clear."
+            : string.IsNullOrWhiteSpace(routeName)
+                ? $"Learned pins cleared ({removed} pin{(removed == 1 ? "" : "s")} removed)."
+                : $"Learned pins for route '{routeName}' cleared ({removed} pin{(removed == 1 ? "" : "s")} removed).";
+        TryAudit("attestation.pins.clear", string.IsNullOrWhiteSpace(routeName) ? "all" : routeName, "ok", authKey);
+        return AdminResult.Success(message);
+    }
+
+    public AdminResult ClearAttestationDrift(string? authKey = null)
+    {
+        var auth = Authorize(authKey);
+        if (auth is not null)
+        {
+            return auth;
+        }
+
+        if (_drift is null)
+        {
+            return AdminResult.Failure("The drift feed is unavailable.", AdminResult.TypeInternal);
+        }
+
+        var cleared = _drift.Clear();
+        var message = $"Attestation drift feed cleared ({cleared} {(cleared == 1 ? "episode" : "episodes")}).";
+        TryAudit("attestation.drift.clear", "drift feed", "ok", authKey);
+        return AdminResult.Success(message);
+    }
+
+    /// <summary>The most recent endpoint SPKI observed for a route (durable baseline; the ring only keeps the short display span).</summary>
+    private string? LatestObservedSpki(string routeName)
+    {
+        var group = _baseline?.GetRoute(routeName);
+        return group?.Entries
+            .OrderByDescending(e => e.LastSeen)
+            .FirstOrDefault(e => !string.IsNullOrWhiteSpace(e.SpkiHash))
+            ?.SpkiHash;
+    }
+
     public AdminResult ClearEventLog(string? authKey = null)
     {
         var auth = Authorize(authKey);
@@ -881,11 +1090,10 @@ public sealed class DashboardAdminService : IDashboardAdminService
 
             if (problems.Count == 0)
             {
-                var opts = _options.CurrentValue;
-                var declared = new HashSet<string>(DeclaredKeyRefs(opts), StringComparer.Ordinal);
-                var configured = new HashSet<string>(
-                    declared.Where(k => opts.RouteKeys is not null && !string.IsNullOrWhiteSpace(opts.RouteKeys[k])),
-                    StringComparer.Ordinal);
+                // Known keyRefs = live snapshot UNION appsettings.Server.json on disk, the same
+                // set ApplyRoutes validates against - otherwise a ref just declared (write ahead
+                // of the watcher reload) would warn here but not on save.
+                var (declared, configured) = KnownKeyRefs(_options.CurrentValue);
                 RouteValidator.Validate(drafts, declared, out var routeErrors, out var routeWarnings, configured);
                 problems.AddRange(routeErrors);
                 warnings.AddRange(routeWarnings);
@@ -1013,7 +1221,9 @@ public sealed class DashboardAdminService : IDashboardAdminService
                 parts.Add("redaction/inspection");
             }
 
-            return AdminResult.Success($"Import applied: {string.Join(" + ", parts)} written and the engine reloaded.");
+            return AdminResult.Success(
+                $"Import applied: {string.Join(" + ", parts)} written and the engine reloaded.",
+                check.Warnings is { Length: > 0 } ? check.Warnings : null);
         }
         catch (InvalidOperationException)
         {
@@ -1107,10 +1317,11 @@ public sealed class DashboardAdminService : IDashboardAdminService
     /// currently on disk in appsettings.Server.json. The monitor reloads through a
     /// FileSystemWatcher debounce, so right after EnsureRouteKeyRef/SetRouteKeySecret wrote
     /// the file the live snapshot does not yet contain the new ref - validating against the
-    /// live snapshot alone would reject with "keyRef does not exist" a route that was just
-    /// made saveable (Add keyRef -> Add route -> Save immediately). Only key NAMES and the
-    /// empty/non-empty classification of the on-disk values are consulted; secret values
-    /// never leave the process (never in results, warnings or the audit log).
+    /// live snapshot alone would emit a false "not declared in the Keys panel" warning for a
+    /// route that was just made saveable (Add keyRef -> Add route -> Save immediately).
+    /// Only key NAMES and the empty/non-empty classification of the on-disk values are
+    /// consulted; secret values never leave the process (never in results, warnings or the
+    /// audit log).
     /// </summary>
     private (HashSet<string> Declared, HashSet<string> Configured) KnownKeyRefs(ProxyOptions opts)
     {

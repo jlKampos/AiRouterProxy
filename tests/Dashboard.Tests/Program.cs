@@ -71,6 +71,10 @@ class Program
     static void Main()
     {
         TestRouteValidator();
+        TestRouteValidatorTransport();
+        TestRouteDraftProjection();
+        TestRouteRenamePreservesSections();
+        TestRouteSavePreserves();
         TestKeyValidator();
         TestSecurityValidator();
         TestSecurityValidatorForensics();
@@ -89,7 +93,10 @@ class Program
         TestApplySecurityNullSections();
         TestReloadConfirmRestoreSignaling();
         TestEnsureRouteKeyRef();
+        TestRouteKeyRefCatalog();
         TestFreshKeyRefUsableBeforeWatcherReload();
+        TestImportSurfacesKeyRefWarnings();
+        TestValidateImportSeesDiskKeyRefs();
         TestImportSanitizesSecurity();
         TestEmptyImportBundle();
         TestSecurityWrongTypesAndCaseInsensitive();
@@ -99,6 +106,7 @@ class Program
         TestConfigFileReader();
         TestLogClearing();
         TestClearDetections();
+        TestAttestationAdmin();
         TestForensicsRoundTrip();
         TestForensicsPersistence();
         TestForensicsPurgeScope();
@@ -151,14 +159,38 @@ class Program
         RouteValidator.Validate(oneDefault, known, out var oneErrors, out _, configured);
         CheckTrue("route: default coexists", () => oneErrors.Count == 0);
 
-        // keyRef must exist (declared); declared-but-unset is a warning, not an error.
-        var missingRef = new List<RouteDraft> { Make("a", "/x", keyRef: "ref-ghost") };
-        RouteValidator.Validate(missingRef, known, out var ghostErrors, out _, configured);
-        CheckTrue("route: keyRef missing is an error", () => ghostErrors.Any(e => e.Contains("does not exist", StringComparison.OrdinalIgnoreCase)));
+        // keyRef must be declared; an undeclared ref is a WARNING (route saved but inactive),
+        // never an error - the startup validation only warns and the proxy keeps running.
+        var missingRef = new List<RouteDraft> { Make("a", "/x", keyRef: "OPENROUTER") };
+        RouteValidator.Validate(missingRef, known, out var ghostErrors, out var ghostWarnings, configured);
+        CheckTrue("route: keyRef missing is not an error", () => ghostErrors.Count == 0);
+        CheckTrue("route: keyRef missing warns inactive + Keys panel", () => ghostWarnings.Count == 1
+            && ghostWarnings[0].Contains("inactive", StringComparison.OrdinalIgnoreCase)
+            && ghostWarnings[0].Contains("declared in the Keys panel", StringComparison.Ordinal));
 
         var inactive = new List<RouteDraft> { Make("a", "/x", keyRef: "ref-a") };
         RouteValidator.Validate(inactive, known, out _, out var warnList, new HashSet<string>(StringComparer.Ordinal)); // declared but NOT configured
         CheckTrue("route: declared-but-unset keyRef warns", () => warnList.Count == 1 && warnList[0].Contains("inactive until the key is set", StringComparison.OrdinalIgnoreCase));
+
+        // Empty keyRef (default route) is always clean: no error, no warning.
+        var emptyRef = new List<RouteDraft> { Make("a", "/x", keyRef: "") };
+        RouteValidator.Validate(emptyRef, known, out var emptyErrors, out var emptyWarnings, configured);
+        CheckTrue("route: empty keyRef has no error/warning", () => emptyErrors.Count == 0 && emptyWarnings.Count == 0);
+
+        // A whitespace-only keyRef is NOT the empty (global) key: the kernel would look up a
+        // RouteKeys name that can never exist and the route would never resolve a key.
+        // Reject the shape with one clear error - and no "not declared" warning on top.
+        var blankRef = new List<RouteDraft> { Make("a", "/x", keyRef: " ") };
+        RouteValidator.Validate(blankRef, known, out var blankErrors, out var blankWarnings, configured);
+        CheckTrue("route: whitespace-only keyRef is an error", () => blankErrors.Count == 1
+            && blankErrors[0].Contains("is invalid", StringComparison.Ordinal)
+            && blankErrors[0].Contains("global key", StringComparison.Ordinal));
+        CheckTrue("route: whitespace-only keyRef does not warn too", () => blankWarnings.Count == 0);
+
+        var innerSpaceRef = new List<RouteDraft> { Make("a", "/x", keyRef: "OPEN ROUTER") };
+        RouteValidator.Validate(innerSpaceRef, known, out var innerSpaceErrors, out var innerSpaceWarnings, configured);
+        CheckTrue("route: keyRef with inner space is an error", () => innerSpaceErrors.Count == 1
+            && innerSpaceWarnings.Count == 0);
 
         // Reserved headers are refused.
         var badHeader = new List<RouteDraft> { Make("a", "/x", headers: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["Authorization"] = "Bearer x" }) };
@@ -177,6 +209,15 @@ class Program
         var badUpstream = new List<RouteDraft> { new("a", "/x", "not-a-url", "") };
         RouteValidator.Validate(badUpstream, known, out var upErrors, out _, configured);
         CheckTrue("route: upstream must be absolute http(s)", () => upErrors.Any(e => e.Contains("upstream", StringComparison.OrdinalIgnoreCase)));
+
+        // Names that only differ in surrounding whitespace collide in the trimmed merge.
+        var paddedNames = new List<RouteDraft> { Make("a", "/x"), Make(" a ", "/y") };
+        RouteValidator.Validate(paddedNames, known, out var paddedErrors, out _, configured);
+        CheckTrue("route: whitespace-only name difference rejected", () => paddedErrors.Any(e => e.Contains("ignoring surrounding whitespace", StringComparison.OrdinalIgnoreCase)));
+
+        var distinctNames = new List<RouteDraft> { Make("a", "/x"), Make("b", "/y") };
+        RouteValidator.Validate(distinctNames, known, out var distinctErrors, out _, configured);
+        CheckTrue("route: distinct names accepted", () => distinctErrors.Count == 0);
     }
 
     // --------------------------------------------------------------
@@ -572,6 +613,28 @@ class Program
             && warned.Warnings[0].Contains("inactive until the key is set", StringComparison.OrdinalIgnoreCase));
         _ = cfg3;
 
+        // --- ApplyRoutes: undeclared keyRef (B1) is saved as an inactive route, not rejected.
+        // The startup validation only warns, so the save must not be blocked by a keyRef the
+        // operator plans to declare next (Add keyRef -> Add route -> Save order). ---
+        var (svcUndeclared, _, cfgUndeclared) = MakeService(NewOptions()); // no OPENROUTER in RouteKeys
+        var undeclaredRoutes = new List<RouteDraft>
+        {
+            new("openrouter", "/openrouter", "https://openrouter.ai/api", "OPENROUTER"),
+            new("default", "", "https://api.airouter.ch", ""),
+        };
+        var savedUndeclared = svcUndeclared.ApplyRoutes(undeclaredRoutes);
+        CheckTrue("svc: undeclared keyRef saved ok (not blocked)", () => savedUndeclared.Ok);
+        CheckTrue("svc: undeclared keyRef warns inactive", () => savedUndeclared.Warnings is { Length: > 0 }
+            && savedUndeclared.Warnings.Any(w => w.Contains("inactive", StringComparison.OrdinalIgnoreCase)
+                && w.Contains("declared in the Keys panel", StringComparison.Ordinal)));
+        CheckTrue("svc: undeclared keyRef route persisted (inactive)", () =>
+            AtomicJsonWriter.Load(Path.Combine(cfgUndeclared, "routes.json")) is JsonObject uo
+            && uo["Proxy"] is JsonObject up
+            && up["Routes"] is JsonArray uarr
+            && uarr.Any(r => r is JsonObject ro
+                && ro["name"]!.GetValue<string>() == "openrouter"
+                && ro["keyRef"]!.GetValue<string>() == "OPENROUTER"));
+
         // --- SetRouteKeySecret: writes into server config. ---
         var secret = "sk-SuperSecret123";
         var set = svc.SetRouteKeySecret("openai-main", secret, adminKey);
@@ -958,6 +1021,71 @@ class Program
     }
 
     // --------------------------------------------------------------
+    // KeyRef dropdown catalog (Routes page): a key reference configured on the Keys
+    // screen must be selectable even when no route uses it yet. Configured refs come
+    // first (Ordinal), then refs only referenced by routes; never duplicated, and a
+    // route-only ref is shown as not configured.
+    // --------------------------------------------------------------
+    static void TestRouteKeyRefCatalog()
+    {
+        static IReadOnlyList<RouteKeyRefSource> Sources(params (string Name, string? KeyRef)[] routes)
+            => routes.Select(r => new RouteKeyRefSource(r.KeyRef, r.Name)).ToList();
+
+        static Dictionary<string, string> Keys(params (string Name, string Value)[] keys)
+        {
+            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var (name, value) in keys)
+            {
+                map[name] = value;
+            }
+
+            return map;
+        }
+
+        // (a) RouteKeys only, zero routes: both refs listed with the right configured state.
+        var configuredOnly = RouteKeyRefCatalog.Build(
+            Sources(),
+            Keys(("OPENROUTER", "sk-test"), ("ANTHROPIC", string.Empty)));
+        CheckTrue("route-keyrefs: configured refs listed without routes", () => configuredOnly.Count == 2
+            && configuredOnly.All(k => k.UsageCount == 0 && k.Owner.Length == 0)
+            && configuredOnly.Single(k => k.KeyRef == "OPENROUTER").Configured
+            && !configuredOnly.Single(k => k.KeyRef == "ANTHROPIC").Configured);
+
+        // (b) A route using a configured ref: usage counted, owner = route name, no duplicate.
+        var used = RouteKeyRefCatalog.Build(
+            Sources(("claude", "OPENROUTER")),
+            Keys(("OPENROUTER", "sk-test")));
+        CheckTrue("route-keyrefs: usage and owner from a route", () => used.Count == 1
+            && used[0].KeyRef == "OPENROUTER"
+            && used[0].Configured
+            && used[0].UsageCount == 1
+            && used[0].Owner == "claude");
+
+        // (c) A route-only ref (unknown key) still appears, marked as not configured.
+        var unknown = RouteKeyRefCatalog.Build(
+            Sources(("mistral", "MISTRAL")),
+            Keys(("OPENROUTER", "sk-test")));
+        CheckTrue("route-keyrefs: route-only ref listed as not configured", () => unknown.Count == 2
+            && unknown.Single(k => k.KeyRef == "MISTRAL") is { Configured: false, UsageCount: 1, Owner: "mistral" }
+            && unknown.Single(k => k.KeyRef == "OPENROUTER") is { Configured: true, UsageCount: 0 });
+
+        // (d) Nothing configured and no routes -> empty catalog (nulls tolerated too).
+        CheckTrue("route-keyrefs: empty catalog", () =>
+            RouteKeyRefCatalog.Build(Sources(), Keys()).Count == 0
+            && RouteKeyRefCatalog.Build(null, null).Count == 0);
+
+        // (e) Stable order: configured first, then Ordinal (case-sensitive: ALPHA != Alpha).
+        var ordered = RouteKeyRefCatalog.Build(
+            Sources(("r1", "zeta"), ("r2", "ALPHA"), ("r3", "beta")),
+            Keys(("beta", "sk-b"), ("Alpha", "sk-a"), ("zeta", string.Empty)));
+        CheckTrue("route-keyrefs: configured first then Ordinal", () =>
+            string.Join(",", ordered.Select(k => k.KeyRef)) == "Alpha,beta,ALPHA,zeta");
+        CheckTrue("route-keyrefs: case-sensitive refs are distinct", () => ordered.Count == 4
+            && ordered.Count(k => string.Equals(k.KeyRef, "ALPHA", StringComparison.Ordinal)) == 1
+            && ordered.Count(k => string.Equals(k.KeyRef, "Alpha", StringComparison.Ordinal)) == 1);
+    }
+
+    // --------------------------------------------------------------
     // Debounce fix: a keyRef just written to appsettings.Server.json must be
     // recognized by ApplyRoutes IMMEDIATELY (Add keyRef -> Add route -> Save),
     // without waiting for the FileSystemWatcher reload. TestOptionsMonitor is
@@ -986,6 +1114,45 @@ class Program
             && p["Routes"] is JsonArray a
             && a.Count == 1
             && a[0]!["keyRef"]!.GetValue<string>() == "FRESH");
+    }
+
+    // --------------------------------------------------------------
+    // Import warns like ApplyRoutes does: an undeclared keyRef is applied (inactive)
+    // and the warning must reach the caller - Import used to drop check.Warnings.
+    // --------------------------------------------------------------
+    static void TestImportSurfacesKeyRefWarnings()
+    {
+        var adminKey = "admin-primary-key";
+        var (svc, _, cfg) = MakeService(NewOptions()); // OPENROUTER is not declared anywhere
+
+        var bundle = JsonNode.Parse(
+            "{\"routes\":[{\"name\":\"or\",\"prefix\":\"/or\",\"upstream\":\"https://openrouter.ai/api\",\"keyRef\":\"OPENROUTER\"}]}")!;
+        var applied = svc.Import(bundle, adminKey);
+        CheckTrue("import: undeclared keyRef applied ok", () => applied.Ok);
+        CheckTrue("import: undeclared keyRef warning surfaced", () => applied.Warnings is { Length: > 0 }
+            && applied.Warnings.Any(w => w.Contains("inactive", StringComparison.OrdinalIgnoreCase)
+                && w.Contains("declared in the Keys panel", StringComparison.Ordinal)));
+        CheckTrue("import: undeclared keyRef route written", () => File.Exists(Path.Combine(cfg, "routes.json")));
+    }
+
+    // --------------------------------------------------------------
+    // ValidateImport must validate against the union of live and on-disk keyRefs (same as
+    // ApplyRoutes). A ref written to appsettings.Server.json that the watcher has
+    // not reloaded yet must not produce the "not declared" warning.
+    // --------------------------------------------------------------
+    static void TestValidateImportSeesDiskKeyRefs()
+    {
+        var (svc, root, _) = MakeService(NewOptions()); // live RouteKeys: openai-main only
+
+        File.WriteAllText(
+            Path.Combine(root, "appsettings.Server.json"),
+            "{\"Proxy\":{\"RouteKeys\":{\"openai-main\":\"sk-aaaaaaaaaaaaaaaaaaaa\",\"ONDISK\":\"sk-ondisk-test\"}}}");
+
+        var bundle = JsonNode.Parse(
+            "{\"routes\":[{\"name\":\"disk\",\"prefix\":\"/disk\",\"upstream\":\"https://api.example.com\",\"keyRef\":\"ONDISK\"}]}")!;
+        var check = svc.ValidateImport(bundle);
+        CheckTrue("import-val: on-disk keyRef is valid", () => check.Ok);
+        CheckTrue("import-val: on-disk keyRef does not warn", () => check.Warnings is null or { Length: 0 });
     }
 
     // --------------------------------------------------------------
@@ -2128,6 +2295,516 @@ class Program
             Inspection = new InspectionOptions { Enabled = true },
             RateLimit = new RateLimitOptions { Enabled = false },
         };
+
+    static string B64UrlOfHex(string hex)
+        => Convert.ToBase64String(Convert.FromHexString(hex)).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    // --------------------------------------------------------------
+    // Transport/Endpoint attestation (Phase 2) - route validator + admin actions.
+    // --------------------------------------------------------------
+
+    static void TestRouteValidatorTransport()
+    {
+        RouteDraft Make(RouteTransportDraft t) => new("rt", "/rt", "https://api.example.com", "", null, 0, 0, null, t);
+        var known = new HashSet<string>(StringComparer.Ordinal);
+
+        // Null transport: no transport errors.
+        RouteValidator.Validate(new[] { Make(null!) }, known, out var errors0, out _);
+        CheckTrue("transport-val: null transport passes", () => errors0.Count == 0);
+
+        // Default section passes.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft()) }, known, out var clean, out _);
+        CheckTrue("transport-val: default section passes", () => clean.Count == 0);
+
+        // Bad enforce.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(Enforce: "kill")) }, known, out var badEnforce, out _);
+        CheckTrue("transport-val: bad enforce rejected", () => badEnforce.Any(e => e.Contains("enforce", StringComparison.Ordinal)));
+
+        // Bad graceDays / probeHours.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(GraceDays: -1)) }, known, out var badGrace, out _);
+        CheckTrue("transport-val: negative graceDays rejected", () => badGrace.Any(e => e.Contains("graceDays", StringComparison.Ordinal)));
+
+        // 0 is accepted by the model but the kernel would apply the 7-day default - reject it.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(GraceDays: 0)) }, known, out var zeroGrace, out _);
+        CheckTrue("transport-val: graceDays 0 rejected (kernel would apply 7)", () =>
+            zeroGrace.Any(e => e.Contains("graceDays", StringComparison.Ordinal)));
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(GraceDays: 1)) }, known, out var oneGrace, out _);
+        CheckTrue("transport-val: graceDays 1 accepted", () => oneGrace.Count == 0);
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(GraceDays: 365)) }, known, out var maxGrace, out _);
+        CheckTrue("transport-val: graceDays 365 accepted", () => maxGrace.Count == 0);
+
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(ProbeHours: 9999)) }, known, out var badProbe, out _);
+        CheckTrue("transport-val: probeHours out of range rejected", () => badProbe.Any(e => e.Contains("probeHours", StringComparison.Ordinal)));
+
+        // Bad / valid tlsFloor.
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(TlsFloor: "1.1")) }, known, out var badFloor, out _);
+        CheckTrue("transport-val: bad tlsFloor rejected", () => badFloor.Any(e => e.Contains("tlsFloor", StringComparison.Ordinal)));
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(Enforce: "block", TlsFloor: "1.3", GraceDays: 14, ProbeHours: 24)) }, known, out var good, out _);
+        CheckTrue("transport-val: valid section passes", () => good.Count == 0);
+
+        // Pins: hex + base64url pass; junk rejected.
+        var hexPin = string.Concat(Enumerable.Repeat("ab", 32));
+        var okPins = new List<string> { hexPin, B64UrlOfHex(hexPin) };
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(Pins: okPins)) }, known, out var goodPins, out _);
+        CheckTrue("transport-val: valid pins pass", () => goodPins.Count == 0);
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(Pins: new List<string> { "short-pin" })) }, known, out var badPin, out _);
+        CheckTrue("transport-val: invalid pin rejected", () => badPin.Any(e => e.Contains("pin", StringComparison.Ordinal)));
+
+        // Expected IPs: ip + cidr (v4/v6) pass; garbage rejected.
+        var okIps = new List<string> { "10.0.0.5", "192.168.0.0/16", "2001:db8::/32" };
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(ExpectedIps: okIps)) }, known, out var goodIps, out _);
+        CheckTrue("transport-val: valid ips pass", () => goodIps.Count == 0);
+        RouteValidator.Validate(new[] { Make(new RouteTransportDraft(ExpectedIps: new List<string> { "not-an-ip", "10.0.0.0/33" })) }, known, out var badIps, out _);
+        CheckTrue("transport-val: invalid ips rejected", () => badIps.Any(e => e.Contains("expected IP", StringComparison.Ordinal)));
+    }
+
+    // --------------------------------------------------------------
+    // GET projection (RouteDraftJson.ToAdminJson) and the read-side normalization of the
+    // values the kernel coerces (graceDays <= 0 -> 7, probeHours <= 0 -> 0). A hand-edited
+    // 0 must surface as the effective 7 and survive a table save as 7 (never 1).
+    // --------------------------------------------------------------
+    static void TestRouteDraftProjection()
+    {
+        static RouteDraft Draft(RouteTransportDraft? transport, Dictionary<string, string>? headers = null)
+            => new("rt", "/rt", "https://api.example.com", "", null, 0, 0, headers, transport);
+
+        // Read side: the effective value the kernel applies is projected.
+        var coerced = RouteDraftJson.FromTransportOptions(new RouteTransportOptions { GraceDays = 0, ProbeHours = -5 });
+        CheckTrue("transport-read: graceDays 0 projects the kernel's 7", () => coerced?.GraceDays == 7);
+        CheckTrue("transport-read: negative probeHours projects 0", () => coerced?.ProbeHours == 0);
+        var inRange = RouteDraftJson.FromTransportOptions(new RouteTransportOptions { GraceDays = 14, ProbeHours = 24 });
+        CheckTrue("transport-read: in-range values are untouched", () => inRange?.GraceDays == 14 && inRange?.ProbeHours == 24);
+
+        // poolLifetimeMinutes is not editable in the UI, so the read side projects the
+        // effective value (the kernel ignores <= 0) and a hand-edited value cannot block
+        // the save of a field the operator never sees.
+        var negativePool = RouteDraftJson.FromTransportOptions(new RouteTransportOptions { PoolLifetimeMinutes = -5 });
+        CheckTrue("transport-read: negative poolLifetimeMinutes projects null", () => negativePool?.PoolLifetimeMinutes is null);
+        var zeroPoolRead = RouteDraftJson.FromTransportOptions(new RouteTransportOptions { PoolLifetimeMinutes = 0 });
+        CheckTrue("transport-read: zero poolLifetimeMinutes projects null", () => zeroPoolRead?.PoolLifetimeMinutes is null);
+        var positivePool = RouteDraftJson.FromTransportOptions(new RouteTransportOptions { PoolLifetimeMinutes = 30 });
+        CheckTrue("transport-read: positive poolLifetimeMinutes is untouched", () => positivePool?.PoolLifetimeMinutes == 30);
+
+        // GET: a route without a section still carries the key, as null.
+        var plain = RouteDraftJson.ToAdminJson(Draft(null));
+        CheckTrue("routes-get: transport is null without a section", () =>
+            plain.ContainsKey("transport") && plain["transport"] is null);
+        CheckTrue("routes-get: headers are projected", () => plain["headers"] is JsonObject h && h.Count == 0);
+
+        // GET: a full section keeps every field.
+        var pin = string.Concat(Enumerable.Repeat("ab", 32));
+        var full = RouteDraftJson.ToAdminJson(Draft(new RouteTransportDraft(
+            Enabled: true,
+            PoolLifetimeMinutes: 30,
+            ExpectedIps: new List<string> { "10.0.0.0/8" },
+            TlsFloor: "1.3",
+            GraceDays: 14,
+            Enforce: "block",
+            Pins: new List<string> { pin },
+            ProbeHours: 24)));
+        var ft = full["transport"] as JsonObject;
+        CheckTrue("routes-get: section fields are projected", () =>
+            ft?["enabled"]?.GetValue<bool>() == true
+            && ft["enforce"]?.GetValue<string>() == "block"
+            && ft["graceDays"]?.GetValue<int>() == 14
+            && ft["probeHours"]?.GetValue<int>() == 24
+            && ft["tlsFloor"]?.GetValue<string>() == "1.3"
+            && ft["poolLifetimeMinutes"]?.GetValue<int>() == 30
+            && ft["pins"] is JsonArray p && p.Count == 1 && p[0]?.GetValue<string>() == pin
+            && ft["expectedIps"] is JsonArray ips && ips.Count == 1 && ips[0]?.GetValue<string>() == "10.0.0.0/8");
+
+        // GET: enabled=null writes no "enabled" key (the route inherits the global switch).
+        var inherited = RouteDraftJson.ToAdminJson(Draft(new RouteTransportDraft(Enabled: null, GraceDays: 7)));
+        CheckTrue("routes-get: enabled null omits the key", () =>
+            inherited["transport"] is JsonObject it && !it.ContainsKey("enabled"));
+
+        // GET: graceDays 0 in routes.json is projected as 7; saving that table keeps 7.
+        var seeded = RouteDraftJson.FromRouteOptions(new RouteOptions
+        {
+            Name = "anthropic",
+            Prefix = "/anthropic",
+            Upstream = "https://api.anthropic.com",
+            KeyRef = "",
+            Transport = new RouteTransportOptions { GraceDays = 0 },
+        });
+        CheckTrue("routes-get: graceDays 0 in routes.json projects 7", () =>
+            RouteDraftJson.ToAdminJson(seeded)["transport"]?["graceDays"]?.GetValue<int>() == 7);
+
+        var (svc, _, cfg) = MakeService(NewOptions());
+        File.WriteAllText(Path.Combine(cfg, "routes.json"),
+            "{\"Proxy\":{\"Routes\":[{\"name\":\"anthropic\",\"prefix\":\"/anthropic\"," +
+            "\"upstream\":\"https://api.anthropic.com\",\"keyRef\":\"\",\"allowedPaths\":[]," +
+            "\"transport\":{\"graceDays\":0}}]}}");
+        var saved = svc.ApplyRoutes(new List<RouteDraft> { seeded });
+        var savedRoute = AtomicJsonWriter.Load(Path.Combine(cfg, "routes.json")) is JsonObject root
+                         && root["Proxy"]?["Routes"] is JsonArray arr
+                         && arr[0] is JsonObject first
+            ? first
+            : null;
+        CheckTrue("routes-get: saving the projected table keeps 7 (never 1)", () =>
+            saved.Ok && savedRoute?["transport"]?["graceDays"]?.GetValue<int>() == 7);
+
+        // Out-of-range values the kernel applies as-is are NOT clamped on read: a
+        // hand-edited 400 surfaces as 400 and the save is rejected with the validator's
+        // message (the UI no longer rewrites it to 365 behind the operator's back).
+        var outOfRange = RouteDraftJson.FromTransportOptions(new RouteTransportOptions { GraceDays = 400 });
+        CheckTrue("transport-read: graceDays 400 is not clamped", () => outOfRange?.GraceDays == 400);
+
+        var (svcOut, _, cfgOut) = MakeService(NewOptions());
+        File.WriteAllText(Path.Combine(cfgOut, "routes.json"),
+            "{\"Proxy\":{\"Routes\":[{\"name\":\"anthropic\",\"prefix\":\"/anthropic\"," +
+            "\"upstream\":\"https://api.anthropic.com\",\"keyRef\":\"\",\"allowedPaths\":[]," +
+            "\"transport\":{\"graceDays\":400}}]}}");
+        var rejected = svcOut.ApplyRoutes(new List<RouteDraft>
+        {
+            RouteDraftJson.FromRouteOptions(new RouteOptions
+            {
+                Name = "anthropic",
+                Prefix = "/anthropic",
+                Upstream = "https://api.anthropic.com",
+                KeyRef = "",
+                Transport = new RouteTransportOptions { GraceDays = 400 },
+            }),
+        });
+        CheckTrue("routes-get: graceDays 400 save is rejected by the validator", () =>
+            !rejected.Ok
+            && rejected.Errors?.Any(e => e.Contains("between 1 and 365", StringComparison.Ordinal)) == true);
+
+        // Reserved header names stay case-insensitive (Host/HOST both rejected).
+        var known = new HashSet<string>(StringComparer.Ordinal);
+        RouteValidator.Validate(
+            new[] { Draft(null, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["Host"] = "x" }) },
+            known, out var hostErr, out _);
+        CheckTrue("route-val: header 'Host' rejected", () => hostErr.Any(e => e.Contains("reserved", StringComparison.Ordinal)));
+        RouteValidator.Validate(
+            new[] { Draft(null, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["HOST"] = "x" }) },
+            known, out var upperErr, out _);
+        CheckTrue("route-val: header 'HOST' rejected (case-insensitive)", () => upperErr.Any(e => e.Contains("reserved", StringComparison.Ordinal)));
+
+        // poolLifetimeMinutes: negatives are rejected, 0 is fine.
+        RouteValidator.Validate(new[] { Draft(new RouteTransportDraft(PoolLifetimeMinutes: -1)) }, known, out var badPool, out _);
+        CheckTrue("transport-val: negative poolLifetimeMinutes rejected", () =>
+            badPool.Any(e => e.Contains("poolLifetimeMinutes", StringComparison.Ordinal)));
+        RouteValidator.Validate(new[] { Draft(new RouteTransportDraft(PoolLifetimeMinutes: 0)) }, known, out var zeroPool, out _);
+        CheckTrue("transport-val: poolLifetimeMinutes 0 accepted", () => zeroPool.Count == 0);
+    }
+
+    // --------------------------------------------------------------
+    // Rename semantics: the server preserves headers/transport by route NAME, so the UI
+    // marks the existing sections touched when the name changes and the draft carries them.
+    // RouteEditRules.NameChanged is the testable half of that rule (the Razor row calls it).
+    // --------------------------------------------------------------
+    static void TestRouteRenamePreservesSections()
+    {
+        CheckTrue("route-rename: changed name detected", () => RouteEditRules.NameChanged("anthropic", "claude"));
+        CheckTrue("route-rename: same name is not a rename", () => !RouteEditRules.NameChanged("anthropic", "anthropic"));
+        CheckTrue("route-rename: surrounding whitespace is not a rename", () => !RouteEditRules.NameChanged("anthropic", " anthropic "));
+        CheckTrue("route-rename: naming a new row is a rename", () => RouteEditRules.NameChanged("", "claude"));
+
+        var seed =
+            "{\"Proxy\":{\"Routes\":[{\"name\":\"anthropic\",\"prefix\":\"/anthropic\"," +
+            "\"upstream\":\"https://api.anthropic.com\",\"keyRef\":\"\",\"allowedPaths\":[]," +
+            "\"headers\":{\"anthropic-version\":\"2023-06-01\"}," +
+            "\"transport\":{\"enabled\":true,\"enforce\":\"observe\",\"graceDays\":7}}]}}";
+
+        static JsonObject? RouteAt(string cfg)
+            => AtomicJsonWriter.Load(Path.Combine(cfg, "routes.json")) is JsonObject root
+               && root["Proxy"] is JsonObject proxy
+               && proxy["Routes"] is JsonArray array
+               && array[0] is JsonObject route
+                ? route
+                : null;
+
+        var loadedHeaders = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["anthropic-version"] = "2023-06-01",
+        };
+
+        // Rename + sections carried (what the UI sends after OnNameChanged): preserved.
+        var (svc, _, cfg) = MakeService(NewOptions());
+        File.WriteAllText(Path.Combine(cfg, "routes.json"), seed);
+        var renamed = svc.ApplyRoutes(new List<RouteDraft>
+        {
+            new("claude", "/anthropic", "https://api.anthropic.com", "", null, 0, 0,
+                loadedHeaders,
+                new RouteTransportDraft(Enabled: true, Enforce: "observe", GraceDays: 7)),
+        });
+        var renamedRoute = RouteAt(cfg);
+        CheckTrue("route-rename: rename saves", () => renamed.Ok);
+        CheckTrue("route-rename: headers survive when the draft carries them", () =>
+            renamedRoute?["name"]?.GetValue<string>() == "claude"
+            && renamedRoute?["headers"] is JsonObject h
+            && h["anthropic-version"]?.GetValue<string>() == "2023-06-01");
+        CheckTrue("route-rename: transport survives when the draft carries it", () =>
+            renamedRoute?["transport"] is JsonObject t && t["enabled"]?.GetValue<bool>() == true);
+
+        // Control: the same rename WITHOUT the sections (the bug the UI flag prevents)
+        // loses them - documenting why OnNameChanged marks them touched.
+        var (svcPlain, _, cfgPlain) = MakeService(NewOptions());
+        File.WriteAllText(Path.Combine(cfgPlain, "routes.json"), seed);
+        var lost = svcPlain.ApplyRoutes(new List<RouteDraft>
+        {
+            new("claude", "/anthropic", "https://api.anthropic.com", "", null, 0, 0, null, null),
+        });
+        var lostRoute = RouteAt(cfgPlain);
+        CheckTrue("route-rename: without the sections the rename drops them (control)", () =>
+            lost.Ok && lostRoute?["headers"] is null && lostRoute?["transport"] is null);
+
+        // Hand-edited routes.json with a padded name: the draft trims the name on save,
+        // so the merge must trim the stored name too or the sections would be dropped.
+        var (svcPad, _, cfgPad) = MakeService(NewOptions());
+        File.WriteAllText(Path.Combine(cfgPad, "routes.json"),
+            "{\"Proxy\":{\"Routes\":[{\"name\":\" anthropic \",\"prefix\":\"/anthropic\"," +
+            "\"upstream\":\"https://api.anthropic.com\",\"keyRef\":\"\",\"allowedPaths\":[]," +
+            "\"headers\":{\"anthropic-version\":\"2023-06-01\"}," +
+            "\"transport\":{\"enabled\":true,\"enforce\":\"observe\",\"graceDays\":7}}]}}");
+        var padded = svcPad.ApplyRoutes(new List<RouteDraft>
+        {
+            new("anthropic", "/anthropic", "https://api.anthropic.com", "", null, 0, 0, null, null),
+        });
+        var paddedRoute = RouteAt(cfgPad);
+        CheckTrue("route-rename: padded stored name keeps headers when draft omits them", () =>
+            padded.Ok
+            && paddedRoute?["name"]?.GetValue<string>() == "anthropic"
+            && paddedRoute?["headers"]?["anthropic-version"]?.GetValue<string>() == "2023-06-01");
+        CheckTrue("route-rename: padded stored name keeps transport when draft omits it", () =>
+            paddedRoute?["transport"] is JsonObject pt && pt["enabled"]?.GetValue<bool>() == true);
+    }
+
+    // --------------------------------------------------------------
+    // Route save preservation: a draft that omits optional sections must not erase
+    // them from routes.json (the UI may not carry them; the server is the safety net).
+    // --------------------------------------------------------------
+    static void TestRouteSavePreserves()
+    {
+        var pin = string.Concat(Enumerable.Repeat("ab", 32));
+        var seed =
+            "{\"Proxy\":{\"Routes\":[{\"name\":\"anthropic\",\"prefix\":\"/anthropic\"," +
+            "\"upstream\":\"https://api.anthropic.com\",\"keyRef\":\"\",\"allowedPaths\":[]," +
+            "\"headers\":{\"anthropic-version\":\"2023-06-01\"}," +
+            "\"transport\":{\"enabled\":true,\"enforce\":\"block\",\"graceDays\":14,\"probeHours\":24," +
+            "\"pins\":[\"" + pin + "\"]}}]}}";
+
+        static RouteDraft Draft(RouteTransportDraft? transport = null, Dictionary<string, string>? headers = null)
+            => new("anthropic", "/anthropic", "https://api.anthropic.com", "", null, 0, 0, headers, transport);
+
+        static JsonObject? RouteAt(string cfg)
+            => AtomicJsonWriter.Load(Path.Combine(cfg, "routes.json")) is JsonObject root
+               && root["Proxy"] is JsonObject proxy
+               && proxy["Routes"] is JsonArray array
+               && array.Count > 0
+               && array[0] is JsonObject route
+                ? route
+                : null;
+
+        void Seed(string cfg) => File.WriteAllText(Path.Combine(cfg, "routes.json"), seed);
+
+        // 1) Draft without transport/headers: both nodes survive the save.
+        var (svc, _, cfg) = MakeService(NewOptions());
+        Seed(cfg);
+        var saved = svc.ApplyRoutes(new List<RouteDraft> { Draft() });
+        var route1 = RouteAt(cfg);
+        CheckTrue("route-save: draft without optional sections saves", () => saved.Ok);
+        CheckTrue("route-save: transport preserved when draft omits it", () =>
+            route1?["transport"] is JsonObject t
+            && t["enabled"]?.GetValue<bool>() == true
+            && t["enforce"]?.GetValue<string>() == "block"
+            && t["graceDays"]?.GetValue<int>() == 14
+            && t["probeHours"]?.GetValue<int>() == 24);
+        CheckTrue("route-save: headers preserved when draft omits them", () =>
+            route1?["headers"] is JsonObject h
+            && h["anthropic-version"]?.GetValue<string>() == "2023-06-01");
+
+        // 2) Explicit empty headers clear the node; transport stays untouched.
+        var (svc2, _, cfg2) = MakeService(NewOptions());
+        Seed(cfg2);
+        var cleared = svc2.ApplyRoutes(new List<RouteDraft>
+        {
+            Draft(headers: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)),
+        });
+        var route2 = RouteAt(cfg2);
+        CheckTrue("route-save: explicit empty headers clears the node", () =>
+            cleared.Ok && route2?["headers"] is JsonObject h2 && h2.Count == 0);
+        CheckTrue("route-save: clearing headers keeps transport", () =>
+            route2?["transport"] is JsonObject t2 && t2["enforce"]?.GetValue<string>() == "block");
+
+        // 3) An edited transport replaces the node (probeHours=0 is omitted).
+        var (svc3, _, cfg3) = MakeService(NewOptions());
+        Seed(cfg3);
+        var edited = svc3.ApplyRoutes(new List<RouteDraft>
+        {
+            Draft(new RouteTransportDraft(Enabled: false, Enforce: "observe", GraceDays: 3, ProbeHours: 0)),
+        });
+        var route3 = RouteAt(cfg3);
+        CheckTrue("route-save: edited transport replaces the node", () =>
+            edited.Ok
+            && route3?["transport"] is JsonObject t3
+            && t3["enabled"]?.GetValue<bool>() == false
+            && t3["enforce"]?.GetValue<string>() == "observe"
+            && t3["graceDays"]?.GetValue<int>() == 3
+            && t3["probeHours"] is null);
+
+        // 4) enabled=null writes no "enabled" key (the route inherits the global switch).
+        var (svc4, _, cfg4) = MakeService(NewOptions());
+        Seed(cfg4);
+        var inherited = svc4.ApplyRoutes(new List<RouteDraft>
+        {
+            Draft(new RouteTransportDraft(Enabled: null, Enforce: "warn", GraceDays: 7)),
+        });
+        var route4 = RouteAt(cfg4);
+        CheckTrue("route-save: enabled null is omitted (inherits global)", () =>
+            inherited.Ok
+            && route4?["transport"] is JsonObject t4
+            && t4["enabled"] is null
+            && t4["enforce"]?.GetValue<string>() == "warn");
+
+        // 5) export -> import keeps the transport section (FromTransportOptions <-> ToObject).
+        var exportOpts = NewOptions();
+        exportOpts.Routes = new List<RouteOptions>
+        {
+            new()
+            {
+                Name = "anthropic",
+                Prefix = "/anthropic",
+                Upstream = "https://api.anthropic.com",
+                KeyRef = "openai-main",
+                Transport = new RouteTransportOptions
+                {
+                    Enabled = true,
+                    Enforce = "block",
+                    GraceDays = 21,
+                    ProbeHours = 12,
+                    TlsFloor = "1.3",
+                    Pins = new List<string> { pin },
+                    ExpectedIps = new List<string> { "10.0.0.0/8" },
+                    PoolLifetimeMinutes = 30,
+                },
+            },
+        };
+        var (exportSvc, _, _) = MakeService(exportOpts);
+        var exported = exportSvc.Export();
+        var bundle = exported.Data as JsonObject;
+        CheckTrue("route-save: export carries the transport section", () =>
+            exported.Ok
+            && bundle?["routes"] is JsonArray ex
+            && ex[0]?["transport"] is JsonObject et
+            && et["enforce"]?.GetValue<string>() == "block"
+            && et["graceDays"]?.GetValue<int>() == 21
+            && et["pins"] is JsonArray ep && ep.Count == 1 && ep[0]?.GetValue<string>() == pin
+            && et["expectedIps"] is JsonArray ei && ei.Count == 1 && ei[0]?.GetValue<string>() == "10.0.0.0/8");
+
+        var (importSvc, _, cfgImport) = MakeService(NewOptions());
+        var imported = importSvc.Import(bundle!, "admin-primary-key");
+        var routeImport = RouteAt(cfgImport);
+        CheckTrue("route-save: import applies the exported bundle", () => imported.Ok);
+        CheckTrue("route-save: export -> import keeps transport", () =>
+            routeImport?["transport"] is JsonObject it
+            && it["enabled"]?.GetValue<bool>() == true
+            && it["enforce"]?.GetValue<string>() == "block"
+            && it["graceDays"]?.GetValue<int>() == 21
+            && it["probeHours"]?.GetValue<int>() == 12
+            && it["tlsFloor"]?.GetValue<string>() == "1.3"
+            && it["poolLifetimeMinutes"]?.GetValue<int>() == 30
+            && it["pins"] is JsonArray ip && ip.Count == 1 && ip[0]?.GetValue<string>() == pin);
+
+        // 6) A brand-new route (no match in the stored table) inherits nothing.
+        var (svcNew, _, cfgNew) = MakeService(NewOptions());
+        Seed(cfgNew);
+        var addedNew = svcNew.ApplyRoutes(new List<RouteDraft>
+        {
+            new("brand-new", "/brand-new", "https://api.example.com", "", null, 0, 0, null, null),
+        });
+        var routeNew = RouteAt(cfgNew);
+        CheckTrue("route-save: new route saves", () => addedNew.Ok);
+        CheckTrue("route-save: new route does not inherit transport/headers", () =>
+            routeNew?["name"]?.GetValue<string>() == "brand-new"
+            && routeNew?["transport"] is null
+            && routeNew?["headers"] is null);
+
+        // 7) No routes.json yet: the save creates it and still writes no optional sections.
+        var (svcNoFile, _, cfgNoFile) = MakeService(NewOptions());
+        var created = svcNoFile.ApplyRoutes(new List<RouteDraft> { Draft() });
+        CheckTrue("route-save: missing routes.json is created", () =>
+            created.Ok && File.Exists(Path.Combine(cfgNoFile, "routes.json")));
+        CheckTrue("route-save: missing routes.json yields no transport/headers", () =>
+            RouteAt(cfgNoFile)?["transport"] is null && RouteAt(cfgNoFile)?["headers"] is null);
+    }
+
+    static void TestAttestationAdmin()
+    {
+        var adminKey = "admin-primary-key";
+        var root = TempRoot();
+        var paths = new DashboardPaths(root, root, Path.Combine(root, "data"));
+        var backups = new ConfigBackup(paths);
+        var opts = NewOptions();
+        var store = new TransportStore();
+        var baseline = new BaselineStore(paths);
+        var monitor = new TestOptionsMonitor<ProxyOptions>(opts);
+        var provider = new TransportPolicyProvider(monitor);
+        var drift = new DriftStore();
+        var learned = new LearnedPinStore(paths);
+        var recorder = new AttestationRecorder(provider, learned, drift, store, baseline,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<AttestationRecorder>.Instance);
+        var probe = new EndpointProbe(provider, recorder,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<EndpointProbe>.Instance);
+        var svc = new DashboardAdminService(
+            monitor, paths, backups, new ReloadConfirmer(backups),
+            new KeyMetaStore(paths), new AuditLog(paths), new ActivityStore(),
+            new FakeEventLogStore(), new DetectionStore(),
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<DashboardAdminService>.Instance,
+            drift, learned, probe, baseline);
+
+        var hex = string.Concat(Enumerable.Repeat("ab", 32));
+        var b64 = B64UrlOfHex(hex);
+
+        // Every write action re-checks the primary local key.
+        var noAuth = svc.AcceptAttestationPin("openai", b64, null);
+        CheckTrue("attestation-admin: accept requires admin key", () => !noAuth.Ok && noAuth.ErrorType == AdminResult.TypeAuthentication);
+        var wrong = svc.AcceptAttestationPin("openai", b64, "wrong-key");
+        CheckTrue("attestation-admin: accept wrong key rejected", () => !wrong.Ok && wrong.ErrorType == AdminResult.TypeAuthentication);
+
+        // Unknown route -> not found; bad SPKI -> validation.
+        var unknown = svc.AcceptAttestationPin("no-such-route", b64, adminKey);
+        CheckTrue("attestation-admin: unknown route not found", () => !unknown.Ok && unknown.ErrorType == AdminResult.TypeNotFound);
+        var badSpki = svc.AcceptAttestationPin("openai", "not-a-pin", adminKey);
+        CheckTrue("attestation-admin: bad spki rejected", () => !badSpki.Ok && badSpki.ErrorType == AdminResult.TypeValidation);
+
+        // Valid accept persists (pins.json) and audits.
+        var accepted = svc.AcceptAttestationPin("openai", b64, adminKey);
+        CheckTrue("attestation-admin: accept ok", () => accepted.Ok
+            && learned.GetForRoute("openai") is { Count: 1 } p && p[0] == b64);
+        CheckTrue("attestation-admin: accept audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("attestation.pin.accept", StringComparison.Ordinal));
+        var dup = svc.AcceptAttestationPin("openai", b64, adminKey);
+        CheckTrue("attestation-admin: duplicate accept reported", () => dup.Ok && dup.Message.Contains("already pinned", StringComparison.Ordinal));
+
+        // Accept with no SPKI = the latest observed endpoint from the durable baseline.
+        var second = B64UrlOfHex(string.Concat(Enumerable.Repeat("cd", 32)));
+        baseline.Record(new EndpointIdentity(
+            "openai", "api.openai.com", "93.184.216.34", 443, second, "certshatest",
+            "CN=api.openai.com", DateTimeOffset.UtcNow.AddDays(-30), DateTimeOffset.UtcNow.AddDays(30),
+            "TLS 1.3", "TLS_AES_128_GCM_SHA256", null, DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddHours(-1), "learn"));
+        var acceptedDefault = svc.AcceptAttestationPin("openai", null, adminKey);
+        CheckTrue("attestation-admin: default pin from baseline", () => acceptedDefault.Ok && learned.GetForRoute("openai").Contains(second));
+
+        // Learn now: an unknown route cannot be probed.
+        var learnUnknown = svc.LearnAttestationNowAsync("no-such-route", adminKey).GetAwaiter().GetResult();
+        CheckTrue("attestation-admin: learn unknown route fails", () => !learnUnknown.Ok && learnUnknown.ErrorType == AdminResult.TypeInternal);
+
+        // Clear pins: route-scoped then global.
+        var clearedRoute = svc.ClearAttestationPins("openai", adminKey);
+        CheckTrue("attestation-admin: clear route pins ok", () => clearedRoute.Ok && learned.GetForRoute("openai").Count == 0);
+        var clearedAll = svc.ClearAttestationPins(null, adminKey);
+        CheckTrue("attestation-admin: clear all pins ok", () => clearedAll.Ok && learned.GetRoutes().Count == 0);
+
+        // Clear drift (destructive, audited).
+        drift.TryAlert("openai", "10.0.0.1", "spki-mismatch", "high", DateTimeOffset.UtcNow);
+        CheckTrue("attestation-admin: drift seeded", () => drift.Count == 1);
+        var clearedDrift = svc.ClearAttestationDrift(adminKey);
+        CheckTrue("attestation-admin: clear drift ok", () => clearedDrift.Ok && drift.Count == 0);
+        CheckTrue("attestation-admin: clear drift audited", () =>
+            File.ReadAllText(Path.Combine(root, "data", "audit.log")).Contains("attestation.drift.clear", StringComparison.Ordinal));
+    }
 }
 
 /// <summary>Minimal IOptionsMonitor implementation for the harness (no host DI).</summary>

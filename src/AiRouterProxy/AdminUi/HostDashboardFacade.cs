@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using AiRouterProxy.AdminPersistence;
 using AiRouterProxy.AdminServices;
+using AiRouterProxy.AdminValidation;
 using AiRouterProxy.Dashboard.Models;
 using Microsoft.Extensions.Options;
 using AIRouterProxy;
@@ -21,6 +22,11 @@ public sealed class HostDashboardFacade : IDashboardFacade
     private readonly DashboardPaths _paths;
     private readonly KeyMetaStore _keyMeta;
     private readonly IDetectionStore _detections;
+    private readonly TransportStore? _transportStore;
+    private readonly BaselineStore? _baseline;
+    private readonly DriftStore? _drift;
+    private readonly LearnedPinStore? _learnedPins;
+    private readonly TransportPolicyProvider? _policies;
     private readonly DateTimeOffset _started;
     private readonly string _version;
 
@@ -29,13 +35,23 @@ public sealed class HostDashboardFacade : IDashboardFacade
         ActivityStore activity,
         DashboardPaths paths,
         KeyMetaStore keyMeta,
-        IDetectionStore detections)
+        IDetectionStore detections,
+        TransportStore? transportStore = null,
+        BaselineStore? baseline = null,
+        DriftStore? drift = null,
+        LearnedPinStore? learnedPins = null,
+        TransportPolicyProvider? policies = null)
     {
         _options = options;
         _activity = activity;
         _paths = paths;
         _keyMeta = keyMeta;
         _detections = detections;
+        _transportStore = transportStore;
+        _baseline = baseline;
+        _drift = drift;
+        _learnedPins = learnedPins;
+        _policies = policies;
 
         try
         {
@@ -99,7 +115,11 @@ public sealed class HostDashboardFacade : IDashboardFacade
                 Active: key is not null,
                 r.AllowedPaths.Count > 0 ? r.AllowedPaths : new List<string> { "*" },
                 r.RequestTimeoutMs > 0 ? r.RequestTimeoutMs : live.RequestTimeoutMs,
-                RouteResolver.EffectiveMaxBodySize(r, live.MaxBodySize));
+                RouteResolver.EffectiveMaxBodySize(r, live.MaxBodySize),
+                r.Headers is { Count: > 0 }
+                    ? new Dictionary<string, string>(r.Headers, StringComparer.OrdinalIgnoreCase)
+                    : null,
+                RouteDraftJson.FromTransportOptions(r.Transport));
         }).ToList();
     }
 
@@ -107,26 +127,11 @@ public sealed class HostDashboardFacade : IDashboardFacade
     {
         var o = _options.CurrentValue;
         var routes = o.Routes ?? new List<RouteOptions>();
-        var list = new List<KeyRefView>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var route in routes)
-        {
-            var keyRef = route.KeyRef ?? string.Empty;
-            if (keyRef.Length == 0 || !seen.Add(keyRef))
-            {
-                continue;
-            }
-
-            var configured = o.RouteKeys is not null
-                && o.RouteKeys.TryGetValue(keyRef, out var value)
-                && !string.IsNullOrWhiteSpace(value);
-
-            var usage = routes.Count(x => string.Equals(x.KeyRef, keyRef, StringComparison.Ordinal));
-            list.Add(new KeyRefView(keyRef, configured, usage, route.Name));
-        }
-
-        return list;
+        // The catalog is the union of declared RouteKeys and the refs routes use, so a
+        // key added on the Keys screen is selectable before any route references it.
+        var sources = routes.Select(r => new RouteKeyRefSource(r.KeyRef, r.Name)).ToList();
+        return RouteKeyRefCatalog.Build(sources, o.RouteKeys);
     }
 
     public IReadOnlyList<KeyMetaView> GetKeyMeta()
@@ -175,7 +180,8 @@ public sealed class HostDashboardFacade : IDashboardFacade
             e.ExpectedHash ?? "-",
             e.Route ?? "-",
             e.UA ?? "-",
-            e.RedactionKinds ?? "-")).ToList();
+            e.RedactionKinds ?? "-",
+            e.Transport ?? "-")).ToList();
     }
 
     public int LocalKeyCount() => AuthenticationPolicy.LocalKeyCount(_options.CurrentValue.Keys);
@@ -423,5 +429,126 @@ public sealed class HostDashboardFacade : IDashboardFacade
                           ?? (IReadOnlyList<RouteOptions>)(live.Routes ?? new List<RouteOptions>());
 
         return MapKeysOverview(usageRoutes, routeKeys, keys, meta, localLabels);
+    }
+
+    // ----------------------------------------------------------
+    // Transport/Endpoint attestation: per-route status built from the live ring buffer
+    // (recent connections), the durable baseline, the learned pins and the drift feed
+    // (Phase 2). Metadata only. Null stores (instances constructed without the transport
+    // singletons) yield an empty list; the production DI always injects them.
+    // ----------------------------------------------------------
+
+    public IReadOnlyList<AttestationRouteView> GetAttestation()
+    {
+        var o = _options.CurrentValue;
+        var recent = _transportStore?.Recent(200) ?? Array.Empty<TransportObservation>();
+        var driftAll = _drift?.Recent(100) ?? Array.Empty<DriftEpisode>();
+
+        var names = o.Routes is { Count: > 0 }
+            ? o.Routes.Select(r => (Name: r.Name ?? string.Empty, Host: SafeHost(r.Upstream))).ToList()
+            : new List<(string Name, string Host)> { ("default", SafeHost(o.Upstream)) };
+
+        var rows = new List<AttestationRouteView>(names.Count);
+        foreach (var (name, host) in names)
+        {
+            var live = recent.Where(x => string.Equals(x.Route, name, StringComparison.Ordinal)).ToList();
+            var baseline = _baseline?.GetRoute(name);
+            var entries = baseline?.Entries ?? Array.Empty<EndpointIdentity>();
+
+            // Latest live observation wins; warn/blocked statuses are preserved so the
+            // page surfaces the enforcement state even while drift is active.
+            var lastLive = live.OrderByDescending(x => x.Timestamp).FirstOrDefault();
+            var status = lastLive is not null
+                ? (lastLive.Status is "warn" or "blocked" ? lastLive.Status : "observed")
+                : entries.Count > 0
+                    ? "baseline"
+                    : "none";
+
+            DateTimeOffset? lastSeen = null;
+            foreach (var e in entries)
+            {
+                if (lastSeen is null || e.LastSeen > lastSeen.Value)
+                {
+                    lastSeen = e.LastSeen;
+                }
+            }
+
+            foreach (var x in live)
+            {
+                if (lastSeen is null || x.Timestamp > lastSeen.Value)
+                {
+                    lastSeen = x.Timestamp;
+                }
+            }
+
+            var drift = driftAll
+                .Where(d => string.Equals(d.Route, name, StringComparison.Ordinal))
+                .Select(d => new DriftView(d.Route, d.Ip, d.Reason, d.Severity, d.FirstSeen, d.LastAlerted, d.AlertCount))
+                .ToList();
+
+            rows.Add(new AttestationRouteView(
+                name,
+                string.IsNullOrWhiteSpace(host) ? "-" : host,
+                status,
+                lastSeen,
+                entries.Select(e => new AttestationEntryView(
+                    e.Ip,
+                    e.Port,
+                    e.SpkiHash,
+                    e.SpkiHashShort,
+                    e.CertSha256,
+                    e.Issuer,
+                    e.NotBefore,
+                    e.NotAfter,
+                    e.TlsVersion,
+                    e.CipherSuite,
+                    e.Alpn,
+                    e.FirstSeen,
+                    e.LastSeen,
+                    e.Source)).ToList(),
+                drift,
+                BuildPolicyView(name)));
+        }
+
+        return rows;
+    }
+
+    private AttestationPolicyView? BuildPolicyView(string routeName)
+    {
+        if (_policies is null)
+        {
+            return null;
+        }
+
+        var p = _policies.ForRoute(routeName);
+        if (p is null)
+        {
+            return null;
+        }
+
+        var configured = p.Pins ?? Array.Empty<string>();
+        var effectiveCount = AttestationRecorder.EffectivePins(
+            p, routeName, _learnedPins?.GetForRoute(routeName) ?? Array.Empty<string>()).Count;
+
+        return new AttestationPolicyView(
+            p.Enforce,
+            p.GraceDays,
+            p.ProbeHours,
+            p.ExpectedIps ?? Array.Empty<string>(),
+            p.TlsFloor,
+            configured.ToList(),
+            effectiveCount);
+    }
+
+    private static string SafeHost(string? upstream)
+    {
+        try
+        {
+            return new Uri(upstream ?? string.Empty).Host;
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 }

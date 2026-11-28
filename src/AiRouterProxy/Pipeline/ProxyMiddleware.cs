@@ -10,7 +10,7 @@ public sealed class ProxyMiddleware
 {
     private readonly ILogger<ProxyMiddleware> _logger;
     private readonly IOptionsMonitor<ProxyOptions> _options;
-    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly TransportClientFactory _transportClientFactory;
     private readonly ActivityStore _activity;
     private readonly RateLimiter _rateLimiter;
     private readonly IDetectionStore _detections;
@@ -31,14 +31,14 @@ public sealed class ProxyMiddleware
         RequestDelegate _next,
         ILogger<ProxyMiddleware> logger,
         IOptionsMonitor<ProxyOptions> options,
-        IHttpClientFactory httpClientFactory,
+        TransportClientFactory transportClientFactory,
         ActivityStore activity,
         RateLimiter rateLimiter,
         IDetectionStore detections)
     {
         _logger = logger;
         _options = options;
-        _httpClientFactory = httpClientFactory;
+        _transportClientFactory = transportClientFactory;
         _activity = activity;
         _rateLimiter = rateLimiter;
         _detections = detections;
@@ -434,8 +434,18 @@ public sealed class ProxyMiddleware
             }
         }
 
-        var client = _httpClientFactory.CreateClient("AIRouter");
-        client.Timeout = TimeSpan.FromMilliseconds(requestTimeoutMs);
+        // Route with an active transport policy -> dedicated client (attested handshake);
+        // otherwise the shared default client (no custom handler - previous behavior).
+        // The deadline is PER REQUEST, never a mutation of the (shared) client's Timeout:
+        // clients are reused across requests and routes, so writing Timeout per request
+        // used to let two concurrent routes with different requestTimeoutMs race on the
+        // shared property. A CTS linked to the client-abort token + CancelAfter gives this
+        // request its own deadline; the clients' instance Timeout stays InfiniteTimeSpan
+        // (set once at creation) so this CTS is the single source of truth, and a timeout
+        // surfaces as OperationCanceledException just like before (mapped to 502 below).
+        var client = _transportClientFactory.GetClient(routeName ?? string.Empty, activeRoute, requestTimeoutMs);
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+        timeoutCts.CancelAfter(requestTimeoutMs);
 
         if (options.Verbose)
         {
@@ -449,7 +459,7 @@ public sealed class ProxyMiddleware
         try
         {
             upstreamResponse = await client.SendAsync(
-                upstreamRequest, HttpCompletionOption.ResponseHeadersRead, context.RequestAborted);
+                upstreamRequest, HttpCompletionOption.ResponseHeadersRead, timeoutCts.Token);
 
             var contentType = upstreamResponse.Content.Headers.ContentType?.ToString();
 
@@ -464,6 +474,15 @@ public sealed class ProxyMiddleware
             finalStatus = (int)upstreamResponse.StatusCode;
             ForwardResponseHeaders(upstreamResponse, context.Response);
 
+            // Phase 2 attestation: a warn verdict from the route's last connection tags the
+            // response ("route:severity"). Block is handled by the AttestationException path
+            // below (526 + X-AIRouterProxy-Attestation: block) and never reaches here.
+            var attestationHeader = _transportClientFactory.LastEnforcementHeader(routeName ?? string.Empty);
+            if (attestationHeader is not null)
+            {
+                context.Response.Headers["X-AIRouterProxy-Attestation"] = attestationHeader;
+            }
+
             // Redaction occurred: signal it in the header and, if configured, inject a
             // readable notice at the end of the response (SSE before [DONE]; JSON in the last choice).
             // In the normal case (no redaction) the response is streamed byte by byte.
@@ -472,10 +491,11 @@ public sealed class ProxyMiddleware
                 context.Response.Headers["X-AIRouter-Redacted"] = redactionCount.ToString();
             }
 
-            if (redactionCount > 0 && options.Redaction.NotifyInResponse)
-            {
-                var mediaType = contentType ?? string.Empty;
+            var mediaType = contentType ?? string.Empty;
+            var injectNotice = redactionCount > 0 && options.Redaction.NotifyInResponse;
 
+            if (injectNotice)
+            {
                 if (mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
                 {
                     // Incremental SSE: the notice is streamed in just before "[DONE]" without
@@ -526,8 +546,48 @@ public sealed class ProxyMiddleware
                     "Could not reach the AI Router.", "proxy_error", requestId);
             }
         }
+        catch (AttestationException ex)
+        {
+            // Phase 2 pinning: the connected endpoint failed attestation (metadata-only
+            // reason). HTTP 526 + the attestation header, exactly as the spec documents.
+            // This catch handles a DIRECT throw; on .NET 10 SocketsHttpHandler wraps
+            // ConnectCallback exceptions in HttpRequestException, so most real blocks
+            // arrive wrapped and are mapped by the generic catch below via
+            // TransportErrorMapper.
+            finalStatus = 526;
+            _logger.LogWarning("ATTESTATION BLOCKED | Id={Id} Route={Route} Reason={Reason}",
+                requestId, ex.Route, ex.Reason);
+
+            if (!context.Response.HasStarted)
+            {
+                context.Response.Headers["X-AIRouterProxy-Attestation"] = "block";
+                await SendErrorAsync(context, 526,
+                    "Upstream endpoint attestation failed.", "attestation_error");
+            }
+        }
         catch (Exception ex)
         {
+            // SocketsHttpHandler wraps ConnectCallback exceptions in HttpRequestException
+            // (ConnectHelper.CreateWrappedException), so a "block" verdict surfaces as an
+            // INNER AttestationException, never the top-level type. Map it to HTTP 526
+            // exactly like the direct catch above - the pure TransportErrorMapper helper
+            // (walking the InnerException chain) keeps this unit-testable in isolation.
+            if (TransportErrorMapper.TryGetAttestation(ex, out var attestation))
+            {
+                finalStatus = 526;
+                _logger.LogWarning("ATTESTATION BLOCKED | Id={Id} Route={Route} Reason={Reason}",
+                    requestId, attestation.Route, attestation.Reason);
+
+                if (!context.Response.HasStarted)
+                {
+                    context.Response.Headers["X-AIRouterProxy-Attestation"] = "block";
+                    await SendErrorAsync(context, 526,
+                        "Upstream endpoint attestation failed.", "attestation_error");
+                }
+
+                return;
+            }
+
             finalStatus = StatusCodes.Status502BadGateway;
             _logger.LogError(ex, "REQUEST ERROR | Id={Id} DurationMs={Duration}",
                 requestId, startedAt.ElapsedMilliseconds);
@@ -567,6 +627,12 @@ public sealed class ProxyMiddleware
                 PresentedHash = presentedHash,
                 ExpectedHash = expectedHash,
                 UA = authRefused ? Truncate(context.Request.Headers.UserAgent.ToString(), 120) : null,
+                // Transport attestation summary (metadata only; null when the route has no
+                // active policy or nothing was observed - keeps the log small). The summary
+                // is the LAST endpoint observed for the route; per-request correlation is
+                // intentionally not attempted (see TransportClientFactory doc).
+                Transport = BuildTransportSummary(
+                    _transportClientFactory.LastObservationSummary(routeName ?? string.Empty)),
             });
         }
     }
@@ -583,6 +649,20 @@ public sealed class ProxyMiddleware
         }
 
         return value.Length <= max ? value : value[..max];
+    }
+
+    /// <summary>
+    /// Combined one-line transport summary: the route's last attested endpoint. Metadata
+    /// only, bounded to 200 chars; null when there is nothing to report.
+    /// </summary>
+    private static string? BuildTransportSummary(string? summary)
+    {
+        if (string.IsNullOrWhiteSpace(summary))
+        {
+            return null;
+        }
+
+        return summary.Length <= 200 ? summary : summary[..200];
     }
 
     private static async Task<byte[]> ReadBodyWithLimitAsync(Stream body, long maxSize, CancellationToken cancellationToken)

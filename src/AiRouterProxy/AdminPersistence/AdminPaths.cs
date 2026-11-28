@@ -23,9 +23,28 @@ public sealed record DashboardPaths(string BaseDir, string ConfigDir, string Dat
     /// The "data" folder lives NEXT TO the config folder:
     ///  - deploy: configDir = baseDir\config  -> data = baseDir\data
     ///  - dev:    configDir = baseDir         -> data = baseDir\data
+    /// See <see cref="ResolveDataDir(string, string, string?)"/> for the environment override.
     /// </summary>
     public static string ResolveDataDir(string configDir, string baseDir)
+        => ResolveDataDir(configDir, baseDir, envOverride: null);
+
+    /// <summary>
+    /// Resolves the runtime data folder (baseline, pins, audit log, key meta, backups).
+    /// When <paramref name="envOverride"/> (env var <c>AIROUTER_DATA_DIR</c>, e.g. "/data"
+    /// in the Docker image) is not empty it takes precedence over the layout below; the value
+    /// is normalized with <see cref="Path.GetFullPath(string)"/>. Empty/whitespace overrides
+    /// are ignored (the env var being absent keeps full compatibility). Otherwise:
+    /// the "data" folder lives NEXT TO the config folder:
+    ///  - deploy: configDir = baseDir\config  -> data = baseDir\data
+    ///  - dev:    configDir = baseDir         -> data = baseDir\data
+    /// </summary>
+    public static string ResolveDataDir(string configDir, string baseDir, string? envOverride)
     {
+        if (!string.IsNullOrWhiteSpace(envOverride))
+        {
+            return Path.GetFullPath(envOverride.Trim());
+        }
+
         var configName = Path.GetFileName(configDir?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) ?? string.Empty);
         var root = string.Equals(configName, ConfigPaths.ConfigFolderName, StringComparison.OrdinalIgnoreCase)
             ? Path.GetDirectoryName(configDir)
