@@ -27,13 +27,6 @@ public sealed class ActivityEntry
     /// (or nothing was observed yet). Bounded to 200 chars by the caller.
     /// </summary>
     public string? Transport { get; init; }
-
-    /// <summary>
-    /// Provider attribution (Phase 3): the provider that served the route's most recent
-    /// response (aggregator routes with blocklist.attribution on). Metadata only - a
-    /// provider NAME (bounded to 120 chars by the caller), never content, never keys.
-    /// </summary>
-    public string? ServedBy { get; init; }
 }
 
 /// <summary>

@@ -14,7 +14,6 @@ public sealed class ProxyMiddleware
     private readonly ActivityStore _activity;
     private readonly RateLimiter _rateLimiter;
     private readonly IDetectionStore _detections;
-    private readonly AttributionStore _attribution;
 
     private static readonly string[] HeadersToForward =
         { "content-type", "cache-control", "retry-after", "x-request-id",
@@ -28,15 +27,6 @@ public sealed class ProxyMiddleware
           "anthropic-ratelimit-tokens-limit", "anthropic-ratelimit-tokens-remaining",
           "anthropic-ratelimit-tokens-reset" };
 
-    /// <summary>
-    /// Phase 3 attribution ceiling: responses larger than this are forwarded unchanged
-    /// in streaming mode (nothing buffered) and attribution is SKIPPED for them (ServedBy
-    /// stays null - the dashboard shows "—"), never an error to the client. A code
-    /// constant (a per-route Blocklist option is a documented future refinement) so the
-    /// attribution path can never buffer unbounded bodies.
-    /// </summary>
-    private const int AttributionBufferCapBytes = 32 * 1024 * 1024; // 32 MB
-
     public ProxyMiddleware(
         RequestDelegate _next,
         ILogger<ProxyMiddleware> logger,
@@ -44,8 +34,7 @@ public sealed class ProxyMiddleware
         TransportClientFactory transportClientFactory,
         ActivityStore activity,
         RateLimiter rateLimiter,
-        IDetectionStore detections,
-        AttributionStore attribution)
+        IDetectionStore detections)
     {
         _logger = logger;
         _options = options;
@@ -53,7 +42,6 @@ public sealed class ProxyMiddleware
         _activity = activity;
         _rateLimiter = rateLimiter;
         _detections = detections;
-        _attribution = attribution;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -86,7 +74,6 @@ public sealed class ProxyMiddleware
         List<SecretRedactor.RedactionPreview>? redactionPreviews = null;
         string? routeName = null;
         RouteOptions? activeRoute = null;
-        string? servedByProvider = null;
 
         try
         {
@@ -242,32 +229,6 @@ public sealed class ProxyMiddleware
                     "Endpoint not allowed by the proxy.", "invalid_request_error");
                 return;
             }
-        }
-
-        // 3b. Provider blocklist (Phase 3): the two-tier decision for this route + feed.
-        //     The route's "transport.blocklist" section gates every tier (zero cost when
-        //     the route has no active policy). A "block" host verdict stops the request
-        //     before the body is read; "warn"/"info" only tag the response header.
-        var blocklist = activeRoute?.Transport?.Blocklist;
-        var blocklistDecision = ProviderBlocklist.DecideForRoute(activeRoute, options.Providers);
-        var isAggregatorHost = blocklist is { Enabled: true }
-            && ProviderBlocklist.IsAggregatorHost(ProviderBlocklist.HostOf(upstreamBase), blocklist.Aggregators);
-        var attributionActive = blocklist is { Enabled: true, Attribution: true } && isAggregatorHost;
-
-        if (blocklistDecision.HostTier is not "none")
-        {
-            if (blocklistDecision.HostTier == "block"
-                && !(blocklist?.AllowBlocked ?? false))
-            {
-                finalStatus = StatusCodes.Status403Forbidden;
-                _logger.LogWarning("PROVIDER BLOCKED | Id={Id} Route={Route} Tier=block",
-                    requestId, routeName);
-                await SendErrorAsync(context, StatusCodes.Status403Forbidden,
-                    "This provider is blocked by policy.", "provider_blocked");
-                return;
-            }
-
-            context.Response.Headers["X-AIRouterProxy-Blocklist"] = blocklistDecision.HostTier;
         }
 
         // 4. Request body - fail-closed inspection.
@@ -442,31 +403,6 @@ public sealed class ProxyMiddleware
             }
         }
 
-        // 4c. Provider-blocklist merge (Phase 3): fold the decision into the request's
-        //     "provider" object (ignore/zdr/data_collection). In strict mode a client
-        //     that explicitly overrides the policy (blocked slug in only/order, or
-        //     zdr:false) is rejected here - nothing is forwarded. The merge rewrites the
-        //     body ONLY when something actually changed (byte-identical otherwise).
-        if (HttpMethods.IsPost(context.Request.Method)
-            && forwardedBody.Length > 0
-            && (blocklistDecision.ProviderSlugsToIgnore.Count > 0 || blocklistDecision.RequireZdr || blocklistDecision.DenyDataCollection)
-            && blocklist is { Enabled: true }
-            && InspectionPolicy.IsJson(context.Request.ContentType))
-        {
-            var merge = ProviderBodyPolicy.MergeProvider(forwardedBody, blocklistDecision, blocklist);
-            if (merge.Conflict)
-            {
-                finalStatus = StatusCodes.Status400BadRequest;
-                _logger.LogWarning("PROVIDER POLICY CONFLICT | Id={Id} Route={Route} Reason={Reason}",
-                    requestId, routeName, merge.Reason);
-                await SendErrorAsync(context, StatusCodes.Status400BadRequest,
-                    "The request conflicts with the provider policy for this route.", "provider_policy_conflict");
-                return;
-            }
-
-            forwardedBody = merge.Body;
-        }
-
         // 5. Prepare request for the route upstream
         var upstreamUri = new Uri(upstreamBase + upstreamPath + context.Request.QueryString, UriKind.Absolute);
 
@@ -478,14 +414,6 @@ public sealed class ProxyMiddleware
         RouteHeaders.Apply(upstreamRequest, activeRoute?.Headers);
 
         upstreamRequest.Headers.TryAddWithoutValidation("Authorization", "Bearer " + upstreamKey);
-
-        // Phase 3 attribution opt-in: the aggregator only reports which provider served
-        // each response when asked (X-OpenRouter-Metadata: enabled). Metadata only -
-        // the response is parsed for provider NAMES, never content.
-        if (attributionActive)
-        {
-            upstreamRequest.Headers.TryAddWithoutValidation("X-OpenRouter-Metadata", "enabled");
-        }
 
         var accept = context.Request.Headers.Accept.ToString();
         upstreamRequest.Headers.TryAddWithoutValidation("Accept",
@@ -566,62 +494,7 @@ public sealed class ProxyMiddleware
             var mediaType = contentType ?? string.Empty;
             var injectNotice = redactionCount > 0 && options.Redaction.NotifyInResponse;
 
-            // Phase 3 attribution: attribution-active routes buffer the whole body UP TO
-            // AttributionBufferCapBytes (documented trade-off) so the provider that
-            // actually served the response can be extracted - names only, stored per
-            // route. The bytes are then replayed verbatim (plus the configured notice,
-            // when redaction happened). An OVERSIZED body is forwarded unchanged in
-            // streaming mode and attribution is skipped for it (servedBy stays null ->
-            // the activity log / dashboard show "—") - never an error to the client.
-            // Every other route keeps streaming byte by byte.
-            if (attributionActive)
-            {
-                var fullBody = await TryBufferAttributionAsync(
-                    upstreamResponse.Content, context, context.RequestAborted, AttributionBufferCapBytes);
-
-                if (fullBody is null)
-                {
-                    // Oversized response: already forwarded byte-for-byte above, nothing
-                    // buffered, attribution unavailable for this response.
-                    servedByProvider = null;
-                }
-                else
-                {
-                    servedByProvider = mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase)
-                        ? AttributionExtractor.ExtractProviderFromSseFinal(fullBody)
-                        : mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase)
-                            ? AttributionExtractor.ExtractProviderFromJson(fullBody).ServedBy
-                            : null;
-                    if (servedByProvider is not null)
-                    {
-                        _attribution.Set(routeName ?? string.Empty, servedByProvider);
-                    }
-
-                    if (injectNotice)
-                    {
-                        var notice = RedactionNotice.Build(redactionCount, redactionKinds, options.Redaction.WarnTemplate, redactionPreviews);
-                        if (mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
-                        {
-                            await using var sseStream = new MemoryStream(fullBody, writable: false);
-                            await SseStreamProcessor.ProcessAsync(sseStream, context.Response.Body, notice, context.RequestAborted);
-                        }
-                        else if (mediaType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
-                        {
-                            var injected = NoticeInjector.Inject(fullBody, mediaType, notice);
-                            await context.Response.Body.WriteAsync(injected ?? fullBody, context.RequestAborted);
-                        }
-                        else
-                        {
-                            await context.Response.Body.WriteAsync(fullBody, context.RequestAborted);
-                        }
-                    }
-                    else
-                    {
-                        await context.Response.Body.WriteAsync(fullBody, context.RequestAborted);
-                    }
-                }
-            }
-            else if (injectNotice)
+            if (injectNotice)
             {
                 if (mediaType.Contains("text/event-stream", StringComparison.OrdinalIgnoreCase))
                 {
@@ -757,15 +630,9 @@ public sealed class ProxyMiddleware
                 // Transport attestation summary (metadata only; null when the route has no
                 // active policy or nothing was observed - keeps the log small). The summary
                 // is the LAST endpoint observed for the route; per-request correlation is
-                // intentionally not attempted (see TransportClientFactory doc). Phase 3
-                // attribution appends " servedBy=<provider>" (also metadata only).
+                // intentionally not attempted (see TransportClientFactory doc).
                 Transport = BuildTransportSummary(
-                    _transportClientFactory.LastObservationSummary(routeName ?? string.Empty),
-                    servedByProvider),
-                // Provider attribution (Phase 3): who actually served this route's most
-                // recent response (aggregator routes with blocklist.attribution on).
-                // Bounded to 120 chars; never content, never keys.
-                ServedBy = servedByProvider is null ? null : Truncate(servedByProvider, 120),
+                    _transportClientFactory.LastObservationSummary(routeName ?? string.Empty)),
             });
         }
     }
@@ -785,24 +652,17 @@ public sealed class ProxyMiddleware
     }
 
     /// <summary>
-    /// Combined one-line transport summary: the route's last attested endpoint plus the
-    /// Phase 3 served-by provider name ("ip=... cert=... servedBy=OpenRouter"). Metadata
+    /// Combined one-line transport summary: the route's last attested endpoint. Metadata
     /// only, bounded to 200 chars; null when there is nothing to report.
     /// </summary>
-    private static string? BuildTransportSummary(string? summary, string? servedBy)
+    private static string? BuildTransportSummary(string? summary)
     {
-        if (string.IsNullOrWhiteSpace(summary) && string.IsNullOrWhiteSpace(servedBy))
+        if (string.IsNullOrWhiteSpace(summary))
         {
             return null;
         }
 
-        var text = summary ?? string.Empty;
-        if (!string.IsNullOrWhiteSpace(servedBy))
-        {
-            text = text.Length == 0 ? "servedBy=" + servedBy : text + " servedBy=" + servedBy;
-        }
-
-        return text.Length <= 200 ? text : text[..200];
+        return summary.Length <= 200 ? summary : summary[..200];
     }
 
     private static async Task<byte[]> ReadBodyWithLimitAsync(Stream body, long maxSize, CancellationToken cancellationToken)
@@ -933,49 +793,6 @@ public sealed class ProxyMiddleware
         });
 
         await context.Response.Body.WriteAsync(json, context.RequestAborted);
-    }
-
-    /// <summary>
-    /// Bounded buffering for the attribution path: reads the upstream body up to
-    /// <paramref name="cap"/> bytes and returns it (for "served by" extraction). When
-    /// the body is known-oversized (ContentLength) or overflows mid-read, the whole
-    /// body is forwarded to the caller's response VERBATIM in streaming mode and null is
-    /// returned, so the caller knows attribution was skipped. Never an error to the
-    /// client - the body always reaches it, byte for byte.
-    /// </summary>
-    private static async Task<byte[]?> TryBufferAttributionAsync(
-        HttpContent content,
-        HttpContext context,
-        CancellationToken cancellationToken,
-        int cap)
-    {
-        // Known length already over the cap: pure streaming, nothing buffered.
-        if (content.Headers.ContentLength is { } known && known > cap)
-        {
-            await content.CopyToAsync(context.Response.Body, cancellationToken).ConfigureAwait(false);
-            return null;
-        }
-
-        await using var body = await content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        using var buffer = new MemoryStream();
-        var chunk = new byte[81920];
-        int read;
-        while ((read = await body.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
-        {
-            if (buffer.Length + read > cap)
-            {
-                // Overflowed mid-read: forward the buffered prefix, the current chunk and
-                // the unread tail in streaming mode (byte-for-byte) - attribution skipped.
-                await context.Response.Body.WriteAsync(buffer.ToArray(), cancellationToken).ConfigureAwait(false);
-                await context.Response.Body.WriteAsync(chunk.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
-                await body.CopyToAsync(context.Response.Body, cancellationToken).ConfigureAwait(false);
-                return null;
-            }
-
-            await buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
-        }
-
-        return buffer.ToArray();
     }
 
     private sealed class PayloadTooLargeException : Exception;

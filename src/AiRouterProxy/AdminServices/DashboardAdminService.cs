@@ -22,7 +22,6 @@ public sealed class DashboardAdminService : IDashboardAdminService
     private const string ServerFile = "appsettings.Server.json";
     private const string RoutesFile = "routes.json";
     private const string RedactionFile = "redaction.json";
-    private const string ProvidersFile = "providers.json";
     private const string EventLogName = "AIRouterProxy";
 
     private static readonly JsonSerializerOptions JsonRead = new() { PropertyNameCaseInsensitive = true };
@@ -48,7 +47,6 @@ public sealed class DashboardAdminService : IDashboardAdminService
     private readonly LearnedPinStore? _learnedPins;
     private readonly EndpointProbe? _probe;
     private readonly BaselineStore? _baseline;
-    private readonly IHttpClientFactory? _http;
     private readonly ILogger<DashboardAdminService> _logger;
 
     // Serializes every config write (backup -> write -> confirm -> audit) because the
@@ -72,8 +70,7 @@ public sealed class DashboardAdminService : IDashboardAdminService
         DriftStore? drift = null,
         LearnedPinStore? learnedPins = null,
         EndpointProbe? probe = null,
-        BaselineStore? baseline = null,
-        IHttpClientFactory? httpClientFactory = null)
+        BaselineStore? baseline = null)
     {
         _options = options;
         _paths = paths;
@@ -88,7 +85,6 @@ public sealed class DashboardAdminService : IDashboardAdminService
         _learnedPins = learnedPins;
         _probe = probe;
         _baseline = baseline;
-        _http = httpClientFactory;
         _logger = logger;
     }
 
@@ -127,7 +123,9 @@ public sealed class DashboardAdminService : IDashboardAdminService
             _backups.Backup(_paths.ConfigDir, RoutesFile);
             var root = LoadOrCreateConfig(RoutesFile);
             var proxy = EnsureObject(root, "Proxy");
-            proxy["Routes"] = RouteDraftJson.ToArray(routes);
+            var newRoutes = RouteDraftJson.ToArray(routes);
+            MergePreservedRouteNodes(proxy["Routes"] as JsonArray, newRoutes, routes);
+            proxy["Routes"] = newRoutes;
             AtomicJsonWriter.SaveAtomic(ConfigPaths.ResolveFile(RoutesFile, _paths.ConfigDir), root);
 
             var confirmed = _confirmer.Confirm(_paths.ConfigDir, RoutesFile, RoutesShape);
@@ -156,210 +154,66 @@ public sealed class DashboardAdminService : IDashboardAdminService
         }
     }
 
-    // ----------------------------------------------------------
-    // Provider blocklist feed (non-sensitive: providers.json, hot reload)
-    // ----------------------------------------------------------
-
-    public AdminResult ApplyProviders(IReadOnlyList<ProviderEntryDraft> providers, string? authKey = null)
-    {
-        lock (_writeLock)
-        {
-            return ApplyProvidersCore(providers, authKey);
-        }
-    }
-
-    private AdminResult ApplyProvidersCore(IReadOnlyList<ProviderEntryDraft> providers, string? authKey)
-    {
-        if (!string.IsNullOrEmpty(authKey) && !VerifyAdminKey(authKey))
-        {
-            return AdminResult.Failure("Invalid admin key.", AdminResult.TypeAuthentication);
-        }
-
-        var entries = (providers ?? new List<ProviderEntryDraft>())
-            .Select(ToProviderEntryOptions)
-            .ToList();
-
-        if (!ProviderFeedValidator.Validate(entries, out var errors))
-        {
-            return AdminResult.Failure("Provider feed is invalid - nothing was written.", AdminResult.TypeValidation, errors.ToArray());
-        }
-
-        try
-        {
-            _backups.Backup(_paths.ConfigDir, ProvidersFile);
-            var root = LoadOrCreateConfig(ProvidersFile);
-            var proxy = EnsureObject(root, "Proxy");
-            var feed = proxy["Providers"] as JsonObject ?? new JsonObject();
-            var array = new JsonArray();
-            foreach (var entry in entries)
-            {
-                array.Add(JsonSerializer.SerializeToNode(entry, JsonWrite));
-            }
-
-            feed["Entries"] = array;
-            proxy["Providers"] = feed;
-            AtomicJsonWriter.SaveAtomic(ConfigPaths.ResolveFile(ProvidersFile, _paths.ConfigDir), root);
-
-            var confirmed = _confirmer.Confirm(_paths.ConfigDir, ProvidersFile, ProvidersShape);
-            if (!confirmed)
-            {
-                RecoverAfterFailedConfirm(ProvidersFile);
-                _audit.Append("providers.update", ProvidersFile, "restored", Actor(authKey));
-                return AdminResult.Failure(
-                    "providers.json failed to reload after the write - the previous version was restored.",
-                    AdminResult.TypeInternal, restored: true);
-            }
-
-            _audit.Append("providers.update", ProvidersFile, "ok", Actor(authKey));
-            var message = entries.Count switch
-            {
-                0 => "Provider feed cleared and the engine reloaded.",
-                1 => "1 provider feed entry saved and the engine reloaded.",
-                _ => $"{entries.Count} provider feed entries saved and the engine reloaded.",
-            };
-            return AdminResult.Success(message);
-        }
-        catch (Exception)
-        {
-            _audit.Append("providers.update", ProvidersFile, "error", Actor(authKey));
-            return AdminResult.Failure("Could not write providers.json - the previous version was kept.", AdminResult.TypeInternal);
-        }
-    }
-
-    // ----------------------------------------------------------
-    // Provider attribution origin (Phase 3 read; the route's key never leaves the process)
-    // ----------------------------------------------------------
-
-    public async Task<AdminResult> LookupGenerationOriginAsync(string generationId, string? authKey = null)
-    {
-        var auth = Authorize(authKey);
-        if (auth is not null)
-        {
-            return auth;
-        }
-
-        if (string.IsNullOrWhiteSpace(generationId))
-        {
-            return AdminResult.Failure("The 'generationId' query parameter is required.", AdminResult.TypeUnprocessable);
-        }
-
-        if (generationId.Length > AttestationOrigin.MaxGenerationIdLength)
-        {
-            return AdminResult.Failure($"'generationId' must be at most {AttestationOrigin.MaxGenerationIdLength} characters.", AdminResult.TypeUnprocessable);
-        }
-
-        var opts = _options.CurrentValue;
-        (RouteOptions? Route, string? UpstreamBase, string? Key) aggregator = FindAggregator(opts);
-        if (aggregator.Route is null)
-        {
-            return AdminResult.Failure(
-                "No route is configured as an aggregator (transport.blocklist.aggregators) with an active key - nothing to ask.",
-                AdminResult.TypeUnprocessable);
-        }
-
-        if (string.IsNullOrWhiteSpace(aggregator.Key))
-        {
-            return AdminResult.Failure("The aggregator route has no configured key - cannot call the generation API.", AdminResult.TypeBadGateway);
-        }
-
-        var url = AttestationOrigin.BuildGenerationUrl(aggregator.UpstreamBase ?? string.Empty, generationId);
-        if (string.IsNullOrWhiteSpace(url) || !Uri.TryCreate(url, UriKind.Absolute, out _))
-        {
-            return AdminResult.Failure("The aggregator route's upstream is not a usable base URL.", AdminResult.TypeBadGateway);
-        }
-
-        try
-        {
-            // The key is used ONLY on the outbound Authorization header; it is never
-            // echoed back, logged or included in any result.
-            var client = _http?.CreateClient() ?? new HttpClient();
-            client.Timeout = TimeSpan.FromSeconds(AttestationOrigin.TimeoutSeconds);
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + aggregator.Key);
-
-            using var response = await client.SendAsync(
-                request, HttpCompletionOption.ResponseHeadersRead, CancellationToken.None).ConfigureAwait(false);
-
-            var body = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-            var status = (int)response.StatusCode;
-            if (status is < 200 or >= 300)
-            {
-                return status is >= 400 and < 500
-                    ? AdminResult.Failure("The aggregator rejected the generation request.", AdminResult.TypeValidation)
-                    : AdminResult.Failure("The aggregator could not answer the generation request.", AdminResult.TypeBadGateway);
-            }
-
-            var view = AttestationOrigin.ParseResponse(body);
-            if (view is null)
-            {
-                return AdminResult.Failure("The aggregator response did not match the expected generation shape.", AdminResult.TypeBadGateway);
-            }
-
-            return AdminResult.Success(
-                "Generation origin resolved (provider_name/model/upstream_id only).",
-                data: JsonSerializer.SerializeToNode(new
-                {
-                    provider_name = view.ProviderName,
-                    model = view.Model,
-                    upstream_id = view.UpstreamId,
-                }));
-        }
-        catch (OperationCanceledException)
-        {
-            return AdminResult.Failure("The aggregator did not answer in time.", AdminResult.TypeBadGateway);
-        }
-        catch (Exception)
-        {
-            return AdminResult.Failure("Could not reach the aggregator's generation endpoint.", AdminResult.TypeBadGateway);
-        }
-    }
-
     /// <summary>
-    /// Finds the aggregator route: the first route whose upstream host matches an
-    /// aggregator entry of its own blocklist section and has a resolvable key.
-    /// Returns the route, its upstream base and the (in-process only) key.
+    /// Carries over the route fields a draft did not supply. The dashboard edits only a
+    /// subset of each route: a partial/older client may send Headers=null or Transport=null
+    /// because it never loaded them, and the UI sends null for a section the operator did
+    /// not touch. Writing the draft as-is would erase those nodes from routes.json, so this
+    /// merge is the server-side safety net. A supplied Transport section replaces the stored
+    /// one as a whole - there is no field-by-field merge inside it (GET returns the full
+    /// section for a round-trip). Match is by route name, Ordinal, with surrounding
+    /// whitespace ignored on both sides: routes.json is hand-editable, so a stored
+    /// " anthropic " must still match the draft's trimmed "anthropic" (the UI trims the
+    /// name before saving) instead of losing its headers/transport. Names are the stable
+    /// identifier used by the logs and attestation, and RouteValidator already rejects
+    /// duplicates case-sensitively. An explicit empty Headers object is not null and
+    /// therefore replaces the old node - that is how the operator clears every header.
     /// </summary>
-    private (RouteOptions? Route, string? UpstreamBase, string? Key) FindAggregator(ProxyOptions opts)
+    private static void MergePreservedRouteNodes(JsonArray? existingRoutes, JsonArray newRoutes, IReadOnlyList<RouteDraft> drafts)
     {
-        if (opts?.Routes is not { Count: > 0 })
+        if (existingRoutes is null || existingRoutes.Count == 0)
         {
-            return (null, null, null);
+            return;
         }
 
-        foreach (var route in opts.Routes)
+        var byName = new Dictionary<string, JsonObject>(StringComparer.Ordinal);
+        foreach (var entry in existingRoutes)
         {
-            var aggregators = route.Transport?.Blocklist?.Aggregators;
-            if (aggregators is not { Count: > 0 })
+            if (entry is not JsonObject old
+                || SectionProp(old, "name") is not JsonValue nameValue
+                || !nameValue.TryGetValue<string>(out var oldName))
             {
                 continue;
             }
 
-            var host = ProviderBlocklist.HostOf(route.Upstream);
-            if (host.Length == 0 || !AttestationOrigin.IsAggregatorHost(host, aggregators))
+            var key = oldName.Trim();
+            if (byName.ContainsKey(key))
             {
                 continue;
             }
 
-            var key = RouteResolver.GetRouteKey(route, opts.RouteKeys, opts.Keys?.UpstreamKey);
-            return (route, route.Upstream, key);
+            byName[key] = old;
         }
 
-        return (null, null, null);
+        for (var i = 0; i < newRoutes.Count && i < drafts.Count; i++)
+        {
+            if (newRoutes[i] is not JsonObject target
+                || !byName.TryGetValue((drafts[i].Name ?? string.Empty).Trim(), out var old))
+            {
+                continue;
+            }
+
+            if (drafts[i].Transport is null && SectionProp(old, "transport") is { } transport)
+            {
+                target["transport"] = transport.DeepClone();
+            }
+
+            if (drafts[i].Headers is null && SectionProp(old, "headers") is { } headers)
+            {
+                target["headers"] = headers.DeepClone();
+            }
+        }
     }
-
-    private static ProviderEntryOptions ToProviderEntryOptions(ProviderEntryDraft d)
-        => new()
-        {
-            Id = d.Id ?? string.Empty,
-            Name = d.Name ?? string.Empty,
-            Hosts = new List<string>(d.SafeHosts),
-            ProviderSlugs = new List<string>(d.SafeProviderSlugs),
-            Reason = d.Reason ?? string.Empty,
-            Severity = string.IsNullOrWhiteSpace(d.Severity) ? "info" : d.Severity,
-            Until = d.Until,
-            ZdrOnly = d.ZdrOnly,
-            DataCollectionDeny = d.DataCollectionDeny,
-        };
 
     // ----------------------------------------------------------
     // Route key secrets (sensitive: writes appsettings.Server.json)
@@ -1236,11 +1090,10 @@ public sealed class DashboardAdminService : IDashboardAdminService
 
             if (problems.Count == 0)
             {
-                var opts = _options.CurrentValue;
-                var declared = new HashSet<string>(DeclaredKeyRefs(opts), StringComparer.Ordinal);
-                var configured = new HashSet<string>(
-                    declared.Where(k => opts.RouteKeys is not null && !string.IsNullOrWhiteSpace(opts.RouteKeys[k])),
-                    StringComparer.Ordinal);
+                // Known keyRefs = live snapshot UNION appsettings.Server.json on disk, the same
+                // set ApplyRoutes validates against - otherwise a ref just declared (write ahead
+                // of the watcher reload) would warn here but not on save.
+                var (declared, configured) = KnownKeyRefs(_options.CurrentValue);
                 RouteValidator.Validate(drafts, declared, out var routeErrors, out var routeWarnings, configured);
                 problems.AddRange(routeErrors);
                 warnings.AddRange(routeWarnings);
@@ -1368,7 +1221,9 @@ public sealed class DashboardAdminService : IDashboardAdminService
                 parts.Add("redaction/inspection");
             }
 
-            return AdminResult.Success($"Import applied: {string.Join(" + ", parts)} written and the engine reloaded.");
+            return AdminResult.Success(
+                $"Import applied: {string.Join(" + ", parts)} written and the engine reloaded.",
+                check.Warnings is { Length: > 0 } ? check.Warnings : null);
         }
         catch (InvalidOperationException)
         {
@@ -1417,7 +1272,6 @@ public sealed class DashboardAdminService : IDashboardAdminService
 
         CheckFile("routes.json", RoutesShape, problems, ref restoredAny, ref restoreFailedAny);
         CheckFile("redaction.json", RedactionShape, problems, ref restoredAny, ref restoreFailedAny);
-        CheckFile("providers.json", ProvidersShape, problems, ref restoredAny, ref restoreFailedAny);
         CheckFile(ServerFile, ServerShape, problems, ref restoredAny, ref restoreFailedAny);
 
         if (problems.Count > 0)
@@ -1463,10 +1317,11 @@ public sealed class DashboardAdminService : IDashboardAdminService
     /// currently on disk in appsettings.Server.json. The monitor reloads through a
     /// FileSystemWatcher debounce, so right after EnsureRouteKeyRef/SetRouteKeySecret wrote
     /// the file the live snapshot does not yet contain the new ref - validating against the
-    /// live snapshot alone would reject with "keyRef does not exist" a route that was just
-    /// made saveable (Add keyRef -> Add route -> Save immediately). Only key NAMES and the
-    /// empty/non-empty classification of the on-disk values are consulted; secret values
-    /// never leave the process (never in results, warnings or the audit log).
+    /// live snapshot alone would emit a false "not declared in the Keys panel" warning for a
+    /// route that was just made saveable (Add keyRef -> Add route -> Save immediately).
+    /// Only key NAMES and the empty/non-empty classification of the on-disk values are
+    /// consulted; secret values never leave the process (never in results, warnings or the
+    /// audit log).
     /// </summary>
     private (HashSet<string> Declared, HashSet<string> Configured) KnownKeyRefs(ProxyOptions opts)
     {
@@ -1657,12 +1512,6 @@ public sealed class DashboardAdminService : IDashboardAdminService
            && (root["Proxy"] is null || (root["Proxy"] is JsonObject proxy
                && (proxy["Redaction"] is null || proxy["Redaction"] is JsonObject)
                && (proxy["Inspection"] is null || proxy["Inspection"] is JsonObject)));
-
-    private static bool ProvidersShape(JsonNode node)
-        => node is JsonObject root
-           && (root["Proxy"] is null || (root["Proxy"] is JsonObject proxy
-               && (proxy["Providers"] is null || (proxy["Providers"] is JsonObject feed
-                   && (feed["Entries"] is null || feed["Entries"] is JsonArray)))));
 
     private static bool ServerShape(JsonNode node)
         => node is JsonObject root

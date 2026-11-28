@@ -50,7 +50,6 @@
                     {
                         <text>&middot; last seen <span class="mono">@TimeText(last)</span></text>
                     }
-                    <text>&middot; served by <span class="mono">@(string.IsNullOrEmpty(route.ServedBy) ? "—" : route.ServedBy)</span></text>
                 </p>
                 @if (route.Policy is { } policy)
                 {
@@ -167,81 +166,6 @@
     </div>
 }
 
-<div class="panel" style="margin-top: 18px;">
-    <h2>Providers (blocklist &amp; ZDR)</h2>
-    <div class="h2-rule"></div>
-    <p class="head-desc">
-        Saved as a whole set with <b>Save providers</b> (admin key re-authenticates) into <code class="path">providers.json</code>, hot-reloaded.
-        <span class="mono">hosts</span> = route-level tier (<b>block</b> rejects with 403 <span class="mono">provider_blocked</span> + header
-        <span class="mono">X-AIRouterProxy-Blocklist</span>); <span class="mono">providerSlugs</span> = provider tier, applied inside aggregator
-        routes (merges <span class="mono">provider.ignore</span>, forces <span class="mono">zdr: true</span> and
-        <span class="mono">data_collection: "deny"</span> on the request body; <span class="mono">providerPolicy: strict</span> rejects conflicts with
-        400 <span class="mono">provider_policy_conflict</span>).
-    </p>
-
-    @if (_providers.Count == 0)
-    {
-        <div class="empty">No provider entries - the blocklist is off. Add the first entry below.</div>
-    }
-    else
-    {
-        <div class="tbl-wrap">
-            <table class="editable">
-                <thead>
-                    <tr>
-                        <th>Id</th>
-                        <th>Name</th>
-                        <th>Severity</th>
-                        <th>Hosts</th>
-                        <th>Provider slugs</th>
-                        <th>Until</th>
-                        <th>Flags</th>
-                        <th>Reason</th>
-                        <th></th>
-                    </tr>
-                </thead>
-                <tbody>
-                    @for (var i = 0; i < _providers.Count; i++)
-                    {
-                        var idx = i;
-                        var row = _providers[idx];
-                        <tr>
-                            <td><input class="cell-input mono-cell" @bind="row.Id" placeholder="blocked-provider" /></td>
-                            <td><input class="cell-input" @bind="row.Name" placeholder="display name" /></td>
-                            <td>
-                                <div class="form-line">
-                                    <span class="chip @ProviderSeverityChip(row.Severity)"><i class="d" style="@ProviderSeverityDot(row.Severity)"></i>@row.Severity</span>
-                                    <select class="cell-input" style="width: 74px;" @bind="row.Severity">
-                                        <option value="info">info</option>
-                                        <option value="warn">warn</option>
-                                        <option value="block">block</option>
-                                    </select>
-                                </div>
-                            </td>
-                            <td><input class="cell-input wide" @bind="row.Hosts" placeholder="bad.test *.cdn.test (space separated)" /></td>
-                            <td><input class="cell-input wide" @bind="row.ProviderSlugs" placeholder="openrouter/auto (space separated)" /></td>
-                            <td><input class="cell-input" @bind="row.Until" placeholder="yyyy-MM-dd" /></td>
-                            <td>
-                                <label class="fcheck"><input type="checkbox" @bind="row.ZdrOnly" /> <span>zdr only</span></label>
-                                <label class="fcheck"><input type="checkbox" @bind="row.DataCollectionDeny" /> <span>deny data&nbsp;collection</span></label>
-                            </td>
-                            <td><input class="cell-input wide" @bind="row.Reason" placeholder="why (admin only)" /></td>
-                            <td>
-                                <button class="btn small" type="button" @onclick="() => RemoveProviderRow(idx)" title="Removes this entry from the feed. Saved when you click 'Save providers'.">Remove</button>
-                            </td>
-                        </tr>
-                    }
-                </tbody>
-            </table>
-        </div>
-    }
-
-    <div class="tbl-actions">
-        <button class="btn ghost" type="button" @onclick="AddProviderRow">+ Add entry</button>
-        <button class="btn primary" type="button" disabled="@_busy" @onclick="AskSaveProviders">Save providers</button>
-    </div>
-</div>
-
 <ConfirmDialog @bind-Visible="_confirmVisible"
                Title="@_confirmTitle"
                Message="@_confirmMessage"
@@ -268,12 +192,9 @@
     private string _promptMessage = "Attestation pinning and clears are security-posture changes. The primary local key re-authenticates this operation.";
     private Func<string, Task<AdminResult>>? _pendingPrompt;
 
-    private List<ProviderRow> _providers = new();
-
     protected override void OnInitialized()
     {
         Refresh();
-        RefreshProviders();
     }
 
     private void Refresh()
@@ -282,19 +203,11 @@
         StateHasChanged();
     }
 
-    private void RefreshProviders()
-    {
-        _providers = (Facade.GetProvidersFromDisk() ?? Facade.GetProviders())
-            .Select(ProviderRow.FromView)
-            .ToList();
-    }
-
     private void OnPromptCompleted(AdminResult result)
     {
         _result = result;
         _pendingPrompt = null;
         Refresh(); // pins/drift/status must reflect the action
-        RefreshProviders(); // the provider feed was saved just now (or left untouched)
         StateHasChanged();
     }
 
@@ -352,122 +265,6 @@
         _pendingPrompt = key => RunSync(() => Admin.ClearAttestationDrift(key));
         _confirmVisible = true;
     }
-
-    // ----------------------------------------------------------
-    // Providers (blocklist & ZDR) editing - inline rows, saved as a whole set with the
-    // same confirm + admin-key re-auth as every other security-posture write.
-    // ----------------------------------------------------------
-
-    private void AddProviderRow()
-    {
-        _result = null;
-        // A prefilled id so the row is unique even before the user types; the server
-        // revalidates everything (id required/unique, hosts/slugs bounds, severity).
-        _providers.Add(new ProviderRow { Id = Guid.NewGuid().ToString("N")[..8], Severity = "info" });
-    }
-
-    private void RemoveProviderRow(int index)
-    {
-        if (index >= 0 && index < _providers.Count)
-        {
-            _providers.RemoveAt(index);
-        }
-    }
-
-    private void AskSaveProviders()
-    {
-        _result = null;
-
-        var (drafts, error) = BuildDrafts();
-        if (error is not null)
-        {
-            _result = AdminResult.Failure(error, AdminResult.TypeValidation);
-            return;
-        }
-
-        _confirmTitle = "Save provider feed?";
-        _confirmMessage = "Replaces the whole blocklist feed in providers.json (hot-reloaded). Host-tier entries reject with 403; " +
-                          "provider slugs merge inside aggregator routes. Admin key required.";
-        _pendingPrompt = key => Task.FromResult(Admin.ApplyProviders(drafts, key));
-        _confirmVisible = true;
-    }
-
-    /// <summary>
-    /// Light client-side validation mirroring ProviderFeedValidator, so invalid rows are
-    /// caught before the modal opens (the server still revalidates and refuses on PUT).
-    /// Returns the drafts plus the first problem found (null = clean).
-    /// </summary>
-    private (List<ProviderEntryDraft> Drafts, string? Error) BuildDrafts()
-    {
-        var drafts = new List<ProviderEntryDraft>(_providers.Count);
-        var ids = new HashSet<string>(StringComparer.Ordinal);
-
-        for (var i = 0; i < _providers.Count; i++)
-        {
-            var row = _providers[i];
-            var id = (row.Id ?? string.Empty).Trim();
-            if (string.IsNullOrWhiteSpace(id))
-            {
-                return (drafts, $"Entry #{i + 1}: 'id' is required.");
-            }
-            if (id.Length > 64)
-            {
-                return (drafts, $"Entry '{id}': 'id' must be at most 64 characters.");
-            }
-            if (!ids.Add(id))
-            {
-                return (drafts, $"Entry '{id}': duplicated 'id'.");
-            }
-
-            if (row.Severity is not ("info" or "warn" or "block"))
-            {
-                return (drafts, $"Entry '{id}': 'severity' must be one of info|warn|block.");
-            }
-
-            var hosts = SplitList(row.Hosts);
-            var slugs = SplitList(row.ProviderSlugs);
-            if (hosts.Count == 0 && slugs.Count == 0)
-            {
-                return (drafts, $"Entry '{id}': at least one of 'hosts' or 'providerSlugs' is required.");
-            }
-            if (hosts.Count > 32 || slugs.Count > 32)
-            {
-                return (drafts, $"Entry '{id}': 'hosts'/'providerSlugs' are limited to 32 entries each.");
-            }
-            if (hosts.Any(h => h.Length > 128) || slugs.Any(s => s.Length > 128))
-            {
-                return (drafts, $"Entry '{id}': host / providerSlug entries are limited to 128 characters.");
-            }
-
-            DateTimeOffset? until = null;
-            if (!string.IsNullOrWhiteSpace(row.Until))
-            {
-                if (!DateTimeOffset.TryParse(row.Until, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.None, out var parsed))
-                {
-                    return (drafts, $"Entry '{id}': 'until' must be a date (yyyy-MM-dd).");
-                }
-                until = parsed;
-            }
-
-            drafts.Add(new ProviderEntryDraft(
-                Id: id,
-                Name: (row.Name ?? string.Empty).Trim(),
-                Hosts: hosts,
-                ProviderSlugs: slugs,
-                Reason: (row.Reason ?? string.Empty).Trim(),
-                Severity: row.Severity,
-                Until: until,
-                ZdrOnly: row.ZdrOnly,
-                DataCollectionDeny: row.DataCollectionDeny));
-        }
-
-        return (drafts, null);
-    }
-
-    private static List<string> SplitList(string? text)
-        => string.IsNullOrWhiteSpace(text)
-            ? new List<string>()
-            : text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
 
     private async Task<AdminResult> RunSync(Func<AdminResult> operation)
     {
@@ -539,44 +336,4 @@
 
     private static string Trunc(string? value, int max)
         => string.IsNullOrEmpty(value) ? "-" : value.Length <= max ? value : value[..max] + "…";
-
-    private static string ProviderSeverityChip(string severity) => severity switch
-    {
-        "block" => "bad",
-        "info" => "ok",
-        _ => "",
-    };
-
-    private static string? ProviderSeverityDot(string severity) => severity switch
-    {
-        "warn" => "--c: var(--amber);",
-        "info" => "--c: var(--green);",
-        _ => null,
-    };
-
-    private sealed class ProviderRow
-    {
-        public string Id = string.Empty;
-        public string Name = string.Empty;
-        public string Hosts = string.Empty;
-        public string ProviderSlugs = string.Empty;
-        public string Reason = string.Empty;
-        public string Severity = "info";
-        public string Until = string.Empty;
-        public bool ZdrOnly;
-        public bool DataCollectionDeny;
-
-        public static ProviderRow FromView(ProviderEntryView v) => new()
-        {
-            Id = v.Id ?? string.Empty,
-            Name = v.Name ?? string.Empty,
-            Hosts = string.Join(" ", v.Hosts ?? Array.Empty<string>()),
-            ProviderSlugs = string.Join(" ", v.ProviderSlugs ?? Array.Empty<string>()),
-            Reason = v.Reason ?? string.Empty,
-            Severity = string.IsNullOrWhiteSpace(v.Severity) ? "info" : v.Severity,
-            Until = v.Until?.ToString("yyyy-MM-dd") ?? string.Empty,
-            ZdrOnly = v.ZdrOnly,
-            DataCollectionDeny = v.DataCollectionDeny,
-        };
-    }
 }

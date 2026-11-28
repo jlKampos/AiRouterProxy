@@ -1,3 +1,4 @@
+using AIRouterProxy;
 using AiRouterProxy.Dashboard.Models;
 
 namespace AiRouterProxy.AdminValidation;
@@ -7,8 +8,13 @@ namespace AiRouterProxy.AdminValidation;
 /// startup validation in Program.cs.ValidateRoutes (name required, prefix starts with
 /// '/', unique prefixes, absolute http/https upstream) and extends it with the
 /// dashboard rules: at most one "" (default) prefix, segment-boundary-aware prefix
-/// conflicts, coherent allowed paths, reserved header names, and keyRef references
-/// that must resolve to a declared route key.
+/// conflicts, coherent allowed paths, reserved header names, and keyRef references.
+/// A keyRef that is not declared is a <b>warning</b>, not an error: the route still matches
+/// incoming requests but the proxy answers 502 for it until the key is declared/set. This
+/// mirrors the startup validation (the proxy boots and warns instead of failing) so the
+/// dashboard never blocks a table the engine accepts. A malformed keyRef (whitespace or
+/// characters outside the keyRef alphabet) IS an error: the kernel would never resolve it
+/// as a RouteKeys name and the route would silently fall back to the global key.
 /// </summary>
 public static class RouteValidator
 {
@@ -16,7 +22,9 @@ public static class RouteValidator
     /// Known keyRefs = every keyRef declared in the server config (RouteKeys dictionary
     /// keys - presence, not the value). <paramref name="configuredKeyRefs"/> (optional)
     /// is the subset whose secret value is actually set; a route whose keyRef is declared
-    /// but left without a value is inactive until the key is written.
+    /// but left without a value is inactive until the key is written. A keyRef absent from
+    /// <paramref name="knownKeyRefs"/> produces the same kind of warning (inactive until it is
+    /// declared in the Keys panel), never an error - the save is not blocked.
     /// </summary>
     public static void Validate(
         IReadOnlyList<RouteDraft> routes,
@@ -33,6 +41,10 @@ public static class RouteValidator
         }
 
         var names = new HashSet<string>(StringComparer.Ordinal);
+        // The route-section merge (headers/transport on PUT) and the dashboard rename logic
+        // key routes by trimmed name, so "a" and " a " would collide there. Reject the
+        // ambiguity at the source instead of resolving it silently in the merge.
+        var trimmedNames = new HashSet<string>(StringComparer.Ordinal);
         var prefixes = new List<(string Prefix, string Name)>();
 
         foreach (var route in routes)
@@ -45,6 +57,10 @@ public static class RouteValidator
             else if (!names.Add(name))
             {
                 errors.Add($"Route name '{name}' is duplicated.");
+            }
+            else if (!trimmedNames.Add(name.Trim()))
+            {
+                errors.Add($"Route name '{name}' is duplicated: route names must be unique (ignoring surrounding whitespace).");
             }
 
             var prefix = route.Prefix ?? string.Empty;
@@ -79,7 +95,7 @@ public static class RouteValidator
                     continue;
                 }
 
-                if (HeaderReserved.Contains(key))
+                if (RouteHeaders.Reserved.Contains(key))
                 {
                     errors.Add($"Route '{NameOf(route)}': header '{key}' is reserved (the proxy injects it itself).");
                 }
@@ -88,9 +104,21 @@ public static class RouteValidator
             var keyRef = route.KeyRef;
             if (!string.IsNullOrEmpty(keyRef))
             {
-                if (knownKeyRefs is null || !knownKeyRefs.Contains(keyRef))
+                if (!KeyValidator.ValidateRef(keyRef, out _))
                 {
-                    errors.Add($"Route '{NameOf(route)}': keyRef '{keyRef}' does not exist - add the key in the Keys panel first.");
+                    // A whitespace-only ref (" ") is not empty, so the kernel would NOT fall
+                    // back to the global key: it would look up a RouteKeys entry that can
+                    // never exist (names never contain whitespace) and the route would be
+                    // permanently inactive. Reject the shape instead of silently accepting a
+                    // key that does not work - and do not also emit the "not declared" warning.
+                    errors.Add($"Route '{NameOf(route)}': keyRef '{keyRef}' is invalid - use a valid keyRef name or leave it empty for the global key.");
+                }
+                else if (knownKeyRefs is null || !knownKeyRefs.Contains(keyRef))
+                {
+                    // Declaring first is the normal edit order (Add keyRef -> Add route -> Save),
+                    // so an unknown ref is not a structural error. The route is saved but stays
+                    // inactive (the proxy returns 502 for it) until the keyRef exists and has a key.
+                    warnings.Add($"Route '{NameOf(route)}' (keyRef '{keyRef}') is inactive until the keyRef is declared in the Keys panel (Add keyRef) and a key is set.");
                 }
                 else if (configuredKeyRefs is not null && !configuredKeyRefs.Contains(keyRef))
                 {
@@ -132,13 +160,6 @@ public static class RouteValidator
         }
     }
 
-    private static readonly HashSet<string> HeaderReserved = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "authorization",
-        "content-type",
-        "accept",
-    };
-
     // ----------------------------------------------------------
     // Per-route transport section (Phase 2 - pinning + drift). Stricter than the
     // startup validation on purpose: the dashboard must not persist a section the
@@ -160,14 +181,28 @@ public static class RouteValidator
             errors.Add($"Route '{name}': transport.enforce must be one of observe|warn|block.");
         }
 
-        if (t.GraceDays is < 0 or > 365)
+        if (t.GraceDays is < 1 or > 365)
         {
-            errors.Add($"Route '{name}': transport.graceDays must be between 0 and 365.");
+            // 0 is rejected on purpose: writes never persist a value the UI would have to
+            // reinterpret. The read side (RouteDraftJson.FromTransportOptions) projects a
+            // hand-edited 0 as the kernel's effective 7, so GET/UI/export stay coherent and
+            // a GET -> PUT round-trip keeps 7 instead of clamping to 1.
+            errors.Add($"Route '{name}': transport.graceDays must be between 1 and 365 (0 is not a valid window - the proxy would apply its 7-day default).");
         }
 
         if (t.ProbeHours is < 0 or > 720)
         {
             errors.Add($"Route '{name}': transport.probeHours must be between 0 and 720.");
+        }
+
+        if (t.PoolLifetimeMinutes is < 0)
+        {
+            // Mirrors the kernel (Program.cs warns and ignores negatives) and probeHours.
+            // Deliberately asymmetric with the read side: FromTransportOptions projects a
+            // hand-edited <= 0 as null (the effective value, so the save of a field the UI
+            // does not edit cannot fail), while a write must never persist a negative the
+            // kernel would silently ignore.
+            errors.Add($"Route '{name}': transport.poolLifetimeMinutes must be >= 0.");
         }
 
         if (t.TlsFloor is not null && !string.IsNullOrWhiteSpace(t.TlsFloor) && t.TlsFloor is not ("1.2" or "1.3"))
@@ -189,33 +224,6 @@ public static class RouteValidator
             {
                 errors.Add($"Route '{name}': expected IP '{ip}' must be an IP or CIDR (e.g. 10.0.0.0/8).");
             }
-        }
-
-        // Per-route provider-blocklist policy (Phase 3): light checks only - the feed
-        // itself is validated by ProviderFeedValidator. Values that do not parse must
-        // never take the route table down (the proxy ignores invalid sections anyway).
-        var b = t.Blocklist;
-        if (b is null)
-        {
-            return;
-        }
-
-        if (!string.IsNullOrWhiteSpace(b.ProviderPolicy) && b.ProviderPolicy is not ("merge" or "strict"))
-        {
-            errors.Add($"Route '{name}': transport.blocklist.providerPolicy must be one of merge|strict.");
-        }
-
-        foreach (var aggregator in b.SafeAggregators)
-        {
-            if (string.IsNullOrWhiteSpace(aggregator))
-            {
-                errors.Add($"Route '{name}': transport.blocklist.aggregators must not contain empty entries.");
-            }
-        }
-
-        if (b.Attribution && b.SafeAggregators.Count == 0)
-        {
-            errors.Add($"Route '{name}': transport.blocklist.attribution requires at least one 'aggregators' entry.");
         }
     }
 

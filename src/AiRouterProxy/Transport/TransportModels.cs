@@ -28,7 +28,7 @@ public sealed record EndpointIdentity(
     string? Alpn,
     DateTimeOffset FirstSeen,
     DateTimeOffset LastSeen,
-    /// <summary>"learn" (Phase 1) | "config" | "probe" (reserved).</summary>
+    /// <summary>"learn" (captured on a real connection) | "config" | "probe" (periodic endpoint probe).</summary>
     string Source)
 {
     /// <summary>First 16 hex chars of the SPKI hash - display span for the UI/API (never used for matching).</summary>

@@ -90,3 +90,8 @@ publish-tmp/
 deploy-update.log
 
 .vs
+
+# Local Docker test state (bind-mounts; never versioned)
+/config/
+/data/
+/docker-compose.override.yml

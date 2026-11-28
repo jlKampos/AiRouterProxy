@@ -40,11 +40,6 @@
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <TargetPath>config\routes.json</TargetPath>
     </Content>
-    <Content Update="Config\providers.json" Condition="Exists('Config\providers.json')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
-      <TargetPath>config\providers.json</TargetPath>
-    </Content>
     <!-- Default app config + dev overrides + server template all land in config/. -->
     <Content Update="Config\appsettings.json" Condition="Exists('Config\appsettings.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

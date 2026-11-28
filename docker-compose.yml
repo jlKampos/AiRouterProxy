@@ -1,0 +1,27 @@
+# Local HTTPS proxy - Docker Compose (see docs/docker.md for the full guide).
+#
+# Zero-step: the container generates a self-signed certificate on first start and
+# falls back to "dummy" keys/port 4000, so `docker compose up -d --build` works on a
+# clean machine. Override any default from the host environment or a .env file.
+services:
+  airouterproxy:
+    build: .
+    container_name: airouterproxy
+    ports:
+      # Host port is configurable (HOST_PORT); the container port stays 4000.
+      # Host-only (127.0.0.1) - no LAN exposure; the cert is for localhost.
+      - "127.0.0.1:${HOST_PORT:-4000}:4000"
+    volumes:
+      # Host folders: config is your editable setup (routes/redaction/appsettings/certs),
+      # data is created automatically (baseline, pins, audit, backups).
+      - ./config:/config
+      - ./data:/data
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      # The "dummy" defaults only exist so the first start (smoke test) never fails on
+      # variable interpolation - replace them with real keys for upstream calls:
+      #   AIROUTER_API_KEY=... LOCAL_PROXY_KEY=... docker compose up -d
+      AIROUTER_API_KEY: ${AIROUTER_API_KEY:-dummy}
+      LOCAL_PROXY_KEY: ${LOCAL_PROXY_KEY:-dummy}
+      Proxy__Port: "4000"
+    restart: unless-stopped

@@ -33,7 +33,6 @@ public static class MapAdminApiV1Extensions
     private sealed record LookupBody(string? hash);
     private sealed record LocalKeyLabelBody(string? label);
     private sealed record AcceptPinBody(string? spki);
-    private sealed record ProvidersBody(IReadOnlyList<ProviderEntryDraft>? providers);
 
     public static WebApplication MapAdminApiV1(this WebApplication app)
     {
@@ -61,7 +60,7 @@ public static class MapAdminApiV1Extensions
             var drafts = (opts.Routes ?? new List<RouteOptions>())
                 .Select(RouteDraftJson.FromRouteOptions)
                 .ToList();
-            return Results.Ok(new { routes = drafts.Select(ToJson) });
+            return Results.Ok(new { routes = drafts.Select(RouteDraftJson.ToAdminJson) });
         });
 
         app.MapPut("/admin/api/v1/routes", async (IDashboardAdminService svc, HttpContext ctx) =>
@@ -78,30 +77,6 @@ public static class MapAdminApiV1Extensions
             }
 
             return Respond(svc.ApplyRoutes(body.routes, Bearer(ctx)), ctx);
-        });
-
-        // Provider blocklist feed (Phase 3): metadata-only, non-secret, hot-reloaded.
-        app.MapGet("/admin/api/v1/providers", (IOptionsMonitor<ProxyOptions> optsMonitor) =>
-        {
-            var opts = optsMonitor.CurrentValue;
-            var entries = opts.Providers?.Entries ?? new List<ProviderEntryOptions>();
-            return Results.Ok(new { providers = entries.Select(ToProviderJson) });
-        });
-
-        app.MapPut("/admin/api/v1/providers", async (IDashboardAdminService svc, HttpContext ctx) =>
-        {
-            var (invalid, body) = await ReadAsync<ProvidersBody>(ctx);
-            if (invalid)
-            {
-                return Error(400, "validation_error", "Invalid JSON body.");
-            }
-
-            if (body?.providers is null)
-            {
-                return Error(400, "validation_error", "Body must contain a 'providers' array.");
-            }
-
-            return Respond(svc.ApplyProviders(body.providers, Bearer(ctx)), ctx);
         });
 
         app.MapGet("/admin/api/v1/keys", (IDashboardFacade facade, KeyMetaStore metaStore, IOptionsMonitor<ProxyOptions> optsMonitor) =>
@@ -299,28 +274,6 @@ public static class MapAdminApiV1Extensions
 
         app.MapDelete("/admin/api/v1/attestation/drift", (IDashboardAdminService svc, HttpContext ctx) =>
             Respond(svc.ClearAttestationDrift(Bearer(ctx)), ctx));
-
-        // Phase 3 provider attribution: resolves the origin of one generation through the
-        // aggregator route (server-side; the route's key never leaves the process). Only
-        // provider_name/model/upstream_id are returned - the payload is strictly filtered.
-        app.MapGet("/admin/api/v1/attestation/origin", async (IDashboardAdminService svc, HttpContext ctx, string generationId) =>
-        {
-            var result = await svc.LookupGenerationOriginAsync(generationId, Bearer(ctx));
-            if (result.Ok)
-            {
-                return Results.Json(result.Data ?? new JsonObject(), statusCode: StatusCodes.Status200OK);
-            }
-
-            // Aggregator-origin errors map to their own statuses (422 validation_error /
-            // 502 bad_gateway), still in the project's error envelope.
-            return result.ErrorType switch
-            {
-                AdminResult.TypeAuthentication => Error(StatusCodes.Status401Unauthorized, AdminResult.TypeAuthentication, result.Message),
-                AdminResult.TypeUnprocessable => Error(StatusCodes.Status422UnprocessableEntity, "validation_error", result.Message),
-                AdminResult.TypeBadGateway => Error(StatusCodes.Status502BadGateway, "bad_gateway", result.Message),
-                _ => Error(StatusCodes.Status500InternalServerError, AdminResult.TypeInternal, "Internal error."),
-            };
-        });
 
         app.MapPost("/admin/api/v1/keys/lookup", async (HttpContext ctx, IOptionsMonitor<ProxyOptions> optsMonitor, KeyMetaStore metaStore) =>
         {
@@ -559,31 +512,11 @@ public static class MapAdminApiV1Extensions
         return Results.Json(new { error = new { type, message } }, statusCode: status);
     }
 
-    private static object ToJson(RouteDraft draft) => new
-    {
-        name = draft.Name,
-        prefix = draft.Prefix ?? string.Empty,
-        upstream = draft.Upstream,
-        keyRef = draft.KeyRef ?? string.Empty,
-        allowedPaths = draft.SafePaths,
-        requestTimeoutMs = draft.RequestTimeoutMs,
-        maxBodySize = draft.MaxBodySize,
-        headers = draft.SafeHeaders,
-    };
-
-    /// <summary>Provider feed entry projection for the read API (metadata only, camelCase like the config).</summary>
-    private static object ToProviderJson(ProviderEntryOptions e) => new
-    {
-        id = e.Id,
-        name = e.Name,
-        hosts = e.Hosts ?? new List<string>(),
-        providerSlugs = e.ProviderSlugs ?? new List<string>(),
-        reason = e.Reason,
-        severity = e.Severity,
-        until = e.Until,
-        zdrOnly = e.ZdrOnly,
-        dataCollectionDeny = e.DataCollectionDeny,
-    };
+    // GET shape of one route lives in RouteDraftJson.ToAdminJson (shared with the
+    // dashboard/tests). The optional "transport" section is projected through the same
+    // builder used by export/import, so the GET returns the complete table (round-trip):
+    // pins are public SPKI fingerprints and expectedIps/policy fields are non-sensitive
+    // metadata. A route without a section returns transport = null.
 
     // ----------------------------------------------------------
     // Transport/Endpoint attestation read model (metadata only)

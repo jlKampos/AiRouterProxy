@@ -15,8 +15,10 @@ using Microsoft.Extensions.Options;
 using Microsoft.OpenApi;
 
 var baseDir = AppContext.BaseDirectory;
-var configDir = ConfigPaths.ResolveConfigDir(baseDir);
-var dataDir = DashboardPaths.ResolveDataDir(configDir, baseDir);
+// AIROUTER_CONFIG_DIR / AIROUTER_DATA_DIR let the Docker image redirect the layouts
+// (env vars take precedence over the auto-detect; absent = full compatibility).
+var configDir = ConfigPaths.ResolveConfigDir(baseDir, Environment.GetEnvironmentVariable("AIROUTER_CONFIG_DIR"));
+var dataDir = DashboardPaths.ResolveDataDir(configDir, baseDir, Environment.GetEnvironmentVariable("AIROUTER_DATA_DIR"));
 var dashboardPaths = new DashboardPaths(baseDir, configDir, dataDir);
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
@@ -35,21 +37,20 @@ var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 // Server-specific config (keys/certificates) - lives only on the target machine.
 builder.Configuration.AddJsonFile("appsettings.Server.json", optional: true, reloadOnChange: true);
 
-// Non-secret config (redaction, routes and the provider blocklist feed) - editable
-// without restart (hot reload). No keys here: values live in appsettings.Server.json
-// or env vars.
+// Non-secret config (redaction, routes) - editable without restart (hot reload).
+// No keys here: values live in appsettings.Server.json or env vars.
 builder.Configuration.AddJsonFile("redaction.json", optional: true, reloadOnChange: true);
 builder.Configuration.AddJsonFile("routes.json", optional: true, reloadOnChange: true);
-builder.Configuration.AddJsonFile("providers.json", optional: true, reloadOnChange: true);
 
 builder.Services.Configure<ProxyOptions>(builder.Configuration.GetSection(ProxyOptions.SectionName));
-builder.Services.AddHttpClient();
 builder.Services.AddWindowsService(options => options.ServiceName = "AIRouterProxy");
 
 builder.Services.AddSingleton<ActivityStore>();
 builder.Services.AddSingleton<DetectionStore>();
 builder.Services.AddSingleton<IDetectionStore>(sp => sp.GetRequiredService<DetectionStore>());
-builder.Services.AddSingleton<IEventLogStore, WindowsEventLogStore>();
+builder.Services.AddSingleton<IEventLogStore>(_ => OperatingSystem.IsWindows()
+    ? new WindowsEventLogStore()
+    : new UnavailableEventLogStore());
 
 // Transport/Endpoint Attestation (Phase 1: capture/observation, metadata only).
 // The baseline writes into data\ at runtime; nothing is persisted unless a route
@@ -67,11 +68,6 @@ builder.Services.AddSingleton<EndpointProbe>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<EndpointProbe>());
 
 builder.Services.AddSingleton<TransportClientFactory>();
-
-// Phase 3 provider attribution: per-route "who served the last response" cell (metadata
-// only - provider names in memory, never content, never keys). Fed by the middleware on
-// aggregator routes that opt in via transport.blocklist.attribution.
-builder.Services.AddSingleton<AttributionStore>();
 
 // Admin dashboard UI - Blazor Web App served under /admin/ui in the same process.
 builder.Services.AddDashboard(DashboardExtensions.BasePath);
@@ -139,7 +135,6 @@ if (string.IsNullOrWhiteSpace(proxyOptions.Keys.UpstreamKey)
 }
 
 ValidateRoutes(proxyOptions);
-ValidateProviderFeed(proxyOptions);
 
 var certificate = LoadServerCertificate(proxyOptions, configDir);
 
@@ -154,7 +149,11 @@ builder.WebHost.ConfigureKestrel(kestrel =>
 
 var app = builder.Build();
 
-EnsureEventLogExists();
+// Windows-only: on Linux/macOS there is no Event Log (docker/console captures stdout).
+if (OperatingSystem.IsWindows())
+{
+    EnsureEventLogExists();
+}
 
 // Admin UI (Blazor) lives under /admin/ui: the path base is stripped here so the Blazor
 // router sees relative paths inside the subtree. UsePathBase only touches /admin/ui requests.
@@ -289,6 +288,17 @@ app.MapGet("/admin/refusals", (ActivityStore store, int hours = 6, int limit = 5
 
 app.MapGet("/admin/logs", (ILoggerFactory loggerFactory, int hours = 6, int limit = 50) =>
 {
+    // Windows-only: the container has no Event Log - logs go to stdout (`docker logs`).
+    if (!OperatingSystem.IsWindows())
+    {
+        return Results.Ok(new
+        {
+            count = 0,
+            entries = Array.Empty<object>(),
+            note = "Event Log is Windows-only; use 'docker logs'.",
+        });
+    }
+
     limit = Math.Clamp(limit, 1, 200);
     hours = Math.Clamp(hours, 1, 24 * 30);
 
@@ -356,6 +366,12 @@ app.Run();
 
 static void EnsureEventLogExists()
 {
+    // Defense-in-depth: callers gate on OperatingSystem.IsWindows() already.
+    if (!OperatingSystem.IsWindows())
+    {
+        return;
+    }
+
     const string source = "AIRouterProxy";
     const string log = "AIRouterProxy";
 
@@ -515,50 +531,6 @@ static void ValidateRouteTransport(AIRouterProxy.RouteOptions route)
         if (!IsPinLike(pin))
         {
             Console.WriteLine($"[WARNING] Route '{route.Name}': transport.pin '{pin}' is not a hex/base64url hash - ignored.");
-        }
-    }
-
-    // Phase 3 per-route provider-blocklist policy: advisory only. A bad section is
-    // ignored with a warning - it must never crash the proxy or fail the route table.
-    var b = t.Blocklist;
-    if (b is null)
-    {
-        return;
-    }
-
-    if (string.IsNullOrWhiteSpace(b.ProviderPolicy)
-        || b.ProviderPolicy is not ("merge" or "strict"))
-    {
-        Console.WriteLine($"[WARNING] Route '{route.Name}': transport.blocklist.providerPolicy '{b.ProviderPolicy}' is invalid (merge|strict) - ignored.");
-    }
-
-    foreach (var aggregator in b.Aggregators ?? new List<string>())
-    {
-        if (string.IsNullOrWhiteSpace(aggregator))
-        {
-            Console.WriteLine($"[WARNING] Route '{route.Name}': transport.blocklist.aggregators contains an empty entry - ignored.");
-        }
-    }
-}
-
-/// <summary>
-/// Validates the provider blocklist feed (Phase 3, providers.json "Proxy.Providers").
-/// Bad entries are reported as startup warnings but never crash the proxy: the feed is
-/// advisory metadata, and routes without an active transport.blocklist section ignore
-/// it entirely. The admin write path (ProviderFeedValidator) is stricter.
-/// </summary>
-static void ValidateProviderFeed(ProxyOptions options)
-{
-    if (options.Providers?.Entries is not { Count: > 0 })
-    {
-        return;
-    }
-
-    if (!ProviderFeedValidator.Validate(options.Providers.Entries, out var errors))
-    {
-        foreach (var error in errors)
-        {
-            Console.WriteLine($"[WARNING] providers.json: {error}");
         }
     }
 }

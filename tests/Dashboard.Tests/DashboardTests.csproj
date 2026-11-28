@@ -38,6 +38,8 @@
     <Compile Include="..\..\src\AiRouterProxy\AdminServices\AdminHash.cs" Link="AdminServices\AdminHash.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminServices\DashboardAdminService.cs" Link="AdminServices\DashboardAdminService.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\ProxyOptions.cs" Link="Routing\ProxyOptions.cs" />
+    <!-- RouteValidator reuses RouteHeaders.Reserved as the single source of reserved names. -->
+    <Compile Include="..\..\src\AiRouterProxy\Routing\RouteHeaders.cs" Link="Routing\RouteHeaders.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\ConfigPaths.cs" Link="Routing\ConfigPaths.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\RouteResolver.cs" Link="Routing\RouteResolver.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Policies\AuthenticationPolicy.cs" Link="Policies\AuthenticationPolicy.cs" />
@@ -49,6 +51,7 @@
     <Compile Include="..\..\src\AiRouterProxy\Detection\SecretRedactor.cs" Link="Detection\SecretRedactor.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Detection\DetectionFingerprint.cs" Link="Detection\DetectionFingerprint.cs" />
     <Compile Include="..\..\src\AiRouterProxy.Dashboard\Models\DashboardModels.cs" Link="Models\DashboardModels.cs" />
+    <Compile Include="..\..\src\AiRouterProxy.Dashboard\Models\RouteKeyRefCatalog.cs" Link="Models\RouteKeyRefCatalog.cs" />
     <Compile Include="..\..\src\AiRouterProxy.Dashboard\Models\IDashboardAdminService.cs" Link="Models\IDashboardAdminService.cs" />
     <!-- Real host facade: the security round-trip test asserts the view the UI reads. -->
     <Compile Include="..\..\src\AiRouterProxy\AdminUi\HostDashboardFacade.cs" Link="AdminUi\HostDashboardFacade.cs" />
@@ -67,18 +70,6 @@
     <Compile Include="..\..\src\AiRouterProxy\Transport\TransportCapture.cs" Link="Transport\TransportCapture.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Transport\AttestationRecorder.cs" Link="Transport\AttestationRecorder.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Transport\EndpointProbe.cs" Link="Transport\EndpointProbe.cs" />
-    <!-- Phase 3: provider feed validation + draft conversions, and the origin-read
-         helpers the admin service calls (providers.json write + aggregator origin). -->
-    <Compile Include="..\..\src\AiRouterProxy\Transport\ProviderBlocklist.cs" Link="Transport\ProviderBlocklist.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\Transport\AttestationOrigin.cs" Link="Transport\AttestationOrigin.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\Transport\AttributionStore.cs" Link="Transport\AttributionStore.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\Transport\AttributionExtractor.cs" Link="Transport\AttributionExtractor.cs" />
-    <!-- AttributionExtractor's SSE overloads parse raw chunks with the core Sse parser
-         (self-contained - no SseProtocol adapters needed by the dashboard harness). -->
-    <Compile Include="..\..\src\AiRouterProxy\Sse\SseEvent.cs" Link="Sse\SseEvent.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\Sse\SseParser.cs" Link="Sse\SseParser.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\ProviderFeedValidator.cs" Link="AdminValidation\ProviderFeedValidator.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\ProviderEntryDraftJson.cs" Link="AdminValidation\ProviderEntryDraftJson.cs" />
   </ItemGroup>
 
   <ItemGroup>

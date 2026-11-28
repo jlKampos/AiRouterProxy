@@ -139,8 +139,7 @@ public sealed class PlaceholderDashboardFacade : IDashboardFacade
             "openrouter.ai",
             "baseline",
             DateTimeOffset.UtcNow.AddDays(-1),
-            new[] { DemoEntry("104.26.8.132") },
-            ServedBy: "OpenRouter (primary)"),
+            new[] { DemoEntry("104.26.8.132") }),
         new AttestationRouteView(
             "anthropic",
             "api.anthropic.com",
@@ -148,44 +147,6 @@ public sealed class PlaceholderDashboardFacade : IDashboardFacade
             null,
             Array.Empty<AttestationEntryView>()),
     };
-
-    // Provider blocklist feed (Phase 3): demo entries so the Providers panel renders in
-    // standalone dev - one warn (host tier), one block (provider slugs) and one ZDR-only sink.
-    public IReadOnlyList<ProviderEntryView> GetProviders() => new[]
-    {
-        new ProviderEntryView(
-            "laggy-core",
-            "Core latency provider",
-            new[] { "laggy.test" },
-            Array.Empty<string>(),
-            "Measured 2.4s median TTFT over the last 7 days",
-            "warn",
-            null,
-            false,
-            false),
-        new ProviderEntryView(
-            "banned-reforward",
-            "Provider violating re-forward policy",
-            new[] { "broken.test" },
-            new[] { "openrouter/auto", "openrouter/auto-52b" },
-            "Internal re-forwarding detected via attribution",
-            "block",
-            null,
-            false,
-            true),
-        new ProviderEntryView(
-            "zdr-sink",
-            "Zero-data-retention sink",
-            Array.Empty<string>(),
-            new[] { "openrouter/zdr" },
-            "Only routes traffic to ZDR endpoints",
-            "info",
-            null,
-            true,
-            false),
-    };
-
-    public IReadOnlyList<ProviderEntryView>? GetProvidersFromDisk() => GetProviders();
 
     private static AttestationEntryView DemoEntry(string ip) => new(
         ip, 443,

@@ -26,7 +26,9 @@ public sealed record RouteView(
     bool Active,
     IReadOnlyList<string> AllowedPaths,
     int RequestTimeoutMs,
-    long MaxBodySize);
+    long MaxBodySize,
+    IReadOnlyDictionary<string, string>? Headers = null,
+    RouteTransportDraft? Transport = null);
 
 /// <summary>Proxy-level route defaults: values inherited by routes whose own timeout/max body is 0.</summary>
 public sealed record RouteDefaultsView(
@@ -92,10 +94,6 @@ public sealed record AdminResult(
     public const string TypeNotFound = "not_found";
     public const string TypeInternal = "internal_error";
 
-    /// <summary>Aggregator-origin errors (Phase 3 origin endpoint only): the caller maps these to 422/502.</summary>
-    public const string TypeUnprocessable = "unprocessable";
-    public const string TypeBadGateway = "bad_gateway";
-
     public static AdminResult Success(string message, string[]? warnings = null, JsonNode? data = null)
         => new(true, message, false, null, warnings, TypeOk, data);
 
@@ -106,7 +104,9 @@ public sealed record AdminResult(
 /// <summary>
 /// A route as edited by the dashboard. A draft carries NO secret values - the key is
 /// referenced by name only (<see cref="KeyRef"/>), the value stays in the server config.
-/// <see cref="Transport"/> is the per-route attestation section (Phase 1: observe only).
+/// <see cref="Headers"/> null means "not supplied" (the server preserves the existing
+/// routes.json node); an empty dictionary is an explicit "remove every header".
+/// <see cref="Transport"/> null means "no per-route section supplied" (also preserved).
 /// </summary>
 public sealed record RouteDraft(
     string Name,
@@ -137,62 +137,32 @@ public sealed record RouteTransportDraft(
     int GraceDays = 7,
     string Enforce = "observe",
     List<string>? Pins = null,
-    int ProbeHours = 0,
-    RouteBlocklistDraft? Blocklist = null)
+    int ProbeHours = 0)
 {
     public List<string> SafeExpectedIps => ExpectedIps ?? new List<string>();
     public List<string> SafePins => Pins ?? new List<string>();
 }
 
 /// <summary>
-/// Per-route provider-blocklist policy (Phase 3, routes.json "transport.blocklist") as
-/// edited through the API/config bundle. All off by default - a route without this
-/// section behaves exactly as before. Mirrors the host's RouteBlocklistOptions.
+/// Edit-state rules for the routes table, kept out of the Razor page so they can be
+/// unit-tested. The server preserves the optional "headers"/"transport" sections by
+/// route NAME (<c>DashboardAdminService.MergePreservedRouteNodes</c>): a route that is
+/// renamed must therefore resend every section it already has, otherwise the merge finds
+/// no match and the section is dropped from routes.json.
 /// </summary>
-public sealed record RouteBlocklistDraft(
-    bool Enabled = false,
-    bool AllowBlocked = false,
-    List<string>? Aggregators = null,
-    bool Attribution = false,
-    string ProviderPolicy = "merge")
+public static class RouteEditRules
 {
-    public List<string> SafeAggregators => Aggregators ?? new List<string>();
+    /// <summary>
+    /// True when the operator actually changed the route name (Ordinal, surrounding
+    /// whitespace ignored - the draft trims the name before saving). A new row (no
+    /// original name) counts as a rename once it receives a name.
+    /// </summary>
+    public static bool NameChanged(string? originalName, string? currentName)
+        => !string.Equals(
+            (originalName ?? string.Empty).Trim(),
+            (currentName ?? string.Empty).Trim(),
+            StringComparison.Ordinal);
 }
-
-/// <summary>
-/// One provider-feed entry as edited through the API (Phase 3). Metadata only - human
-/// names/reasons, never content, never keys. Validated by ProviderFeedValidator and
-/// written into providers.json ("Proxy.Providers.Entries").
-/// </summary>
-public sealed record ProviderEntryDraft(
-    string Id,
-    string Name,
-    List<string>? Hosts = null,
-    List<string>? ProviderSlugs = null,
-    string Reason = "",
-    string Severity = "info",
-    DateTimeOffset? Until = null,
-    bool ZdrOnly = false,
-    bool DataCollectionDeny = false)
-{
-    public List<string> SafeHosts => Hosts ?? new List<string>();
-    public List<string> SafeProviderSlugs => ProviderSlugs ?? new List<string>();
-}
-
-/// <summary>
-/// One provider-feed entry as shown by the dashboard (Phase 3). Mirror of
-/// <see cref="ProviderEntryDraft"/> for reading - metadata only, never secrets.
-/// </summary>
-public sealed record ProviderEntryView(
-    string Id,
-    string Name,
-    IReadOnlyList<string> Hosts,
-    IReadOnlyList<string> ProviderSlugs,
-    string Reason,
-    string Severity,
-    DateTimeOffset? Until,
-    bool ZdrOnly,
-    bool DataCollectionDeny);
 
 /// <summary>Admin-only metadata for a route key reference. Never holds the secret value.</summary>
 public sealed record KeyMeta(string Owner, string Purpose);
@@ -345,14 +315,6 @@ public interface IDashboardFacade
     // Transport/Endpoint attestation (Phase 1 - read only): who answered each TLS
     // connection, per route. Metadata only - never request content, never keys.
     IReadOnlyList<AttestationRouteView> GetAttestation();
-
-    // Provider blocklist feed (Phase 3 - read only, metadata only): the entries edited
-    // through the Attestation page's Providers panel and written via ApplyProviders.
-    IReadOnlyList<ProviderEntryView> GetProviders();
-
-    /// <summary>Provider feed straight from providers.json (the post-save truth - the live
-    /// snapshot reloads with a debounce). Null when the file is absent or unreadable.</summary>
-    IReadOnlyList<ProviderEntryView>? GetProvidersFromDisk();
 }
 
 /// <summary>Per-route attestation card (read-only): status, policy posture, drift episodes + the persistent baseline entries.</summary>
@@ -364,9 +326,7 @@ public sealed record AttestationRouteView(
     DateTimeOffset? LastSeen,
     IReadOnlyList<AttestationEntryView> Entries,
     IReadOnlyList<DriftView>? Drift = null,
-    AttestationPolicyView? Policy = null,
-    /// <summary>Last attributed provider name on this route (Phase 3) or null when never recorded.</summary>
-    string? ServedBy = null);
+    AttestationPolicyView? Policy = null);
 
 /// <summary>Policy posture of one route as the attestation page shows it (metadata only).</summary>
 public sealed record AttestationPolicyView(

@@ -77,11 +77,4 @@ public sealed class PlaceholderDashboardAdminService : IDashboardAdminService
         => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
 
     public AdminResult ReloadConfirm() => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
-
-    // Phase 3: provider feed + aggregator-origin reads - unavailable in standalone mode.
-    public AdminResult ApplyProviders(IReadOnlyList<ProviderEntryDraft> providers, string? authKey = null)
-        => AdminResult.Failure(Unavailable, AdminResult.TypeInternal);
-
-    public Task<AdminResult> LookupGenerationOriginAsync(string generationId, string? authKey = null)
-        => Task.FromResult(AdminResult.Failure(Unavailable, AdminResult.TypeInternal));
 }

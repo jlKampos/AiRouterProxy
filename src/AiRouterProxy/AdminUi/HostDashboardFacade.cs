@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Reflection;
 using AiRouterProxy.AdminPersistence;
 using AiRouterProxy.AdminServices;
+using AiRouterProxy.AdminValidation;
 using AiRouterProxy.Dashboard.Models;
 using Microsoft.Extensions.Options;
 using AIRouterProxy;
@@ -26,7 +27,6 @@ public sealed class HostDashboardFacade : IDashboardFacade
     private readonly DriftStore? _drift;
     private readonly LearnedPinStore? _learnedPins;
     private readonly TransportPolicyProvider? _policies;
-    private readonly AttributionStore? _attribution;
     private readonly DateTimeOffset _started;
     private readonly string _version;
 
@@ -40,8 +40,7 @@ public sealed class HostDashboardFacade : IDashboardFacade
         BaselineStore? baseline = null,
         DriftStore? drift = null,
         LearnedPinStore? learnedPins = null,
-        TransportPolicyProvider? policies = null,
-        AttributionStore? attribution = null)
+        TransportPolicyProvider? policies = null)
     {
         _options = options;
         _activity = activity;
@@ -53,7 +52,6 @@ public sealed class HostDashboardFacade : IDashboardFacade
         _drift = drift;
         _learnedPins = learnedPins;
         _policies = policies;
-        _attribution = attribution;
 
         try
         {
@@ -117,7 +115,11 @@ public sealed class HostDashboardFacade : IDashboardFacade
                 Active: key is not null,
                 r.AllowedPaths.Count > 0 ? r.AllowedPaths : new List<string> { "*" },
                 r.RequestTimeoutMs > 0 ? r.RequestTimeoutMs : live.RequestTimeoutMs,
-                RouteResolver.EffectiveMaxBodySize(r, live.MaxBodySize));
+                RouteResolver.EffectiveMaxBodySize(r, live.MaxBodySize),
+                r.Headers is { Count: > 0 }
+                    ? new Dictionary<string, string>(r.Headers, StringComparer.OrdinalIgnoreCase)
+                    : null,
+                RouteDraftJson.FromTransportOptions(r.Transport));
         }).ToList();
     }
 
@@ -125,26 +127,11 @@ public sealed class HostDashboardFacade : IDashboardFacade
     {
         var o = _options.CurrentValue;
         var routes = o.Routes ?? new List<RouteOptions>();
-        var list = new List<KeyRefView>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (var route in routes)
-        {
-            var keyRef = route.KeyRef ?? string.Empty;
-            if (keyRef.Length == 0 || !seen.Add(keyRef))
-            {
-                continue;
-            }
-
-            var configured = o.RouteKeys is not null
-                && o.RouteKeys.TryGetValue(keyRef, out var value)
-                && !string.IsNullOrWhiteSpace(value);
-
-            var usage = routes.Count(x => string.Equals(x.KeyRef, keyRef, StringComparison.Ordinal));
-            list.Add(new KeyRefView(keyRef, configured, usage, route.Name));
-        }
-
-        return list;
+        // The catalog is the union of declared RouteKeys and the refs routes use, so a
+        // key added on the Keys screen is selectable before any route references it.
+        var sources = routes.Select(r => new RouteKeyRefSource(r.KeyRef, r.Name)).ToList();
+        return RouteKeyRefCatalog.Build(sources, o.RouteKeys);
     }
 
     public IReadOnlyList<KeyMetaView> GetKeyMeta()
@@ -520,8 +507,7 @@ public sealed class HostDashboardFacade : IDashboardFacade
                     e.LastSeen,
                     e.Source)).ToList(),
                 drift,
-                BuildPolicyView(name),
-                ServedBy: _attribution?.Get(name)));
+                BuildPolicyView(name)));
         }
 
         return rows;
@@ -565,31 +551,4 @@ public sealed class HostDashboardFacade : IDashboardFacade
             return string.Empty;
         }
     }
-
-    // ----------------------------------------------------------
-    // Provider blocklist feed (Phase 3): reads the entries from the live monitor or
-    // straight from providers.json (the post-save truth, same pattern as the routes
-    // panel). Metadata only - ids/hosts/slugs/reasons, never content, never keys.
-    // ----------------------------------------------------------
-
-    public IReadOnlyList<ProviderEntryView> GetProviders()
-        => MapProviders(_options.CurrentValue.Providers?.Entries ?? new List<ProviderEntryOptions>());
-
-    public IReadOnlyList<ProviderEntryView>? GetProvidersFromDisk()
-    {
-        var disk = ConfigFileReader.ReadProviders(_paths.ConfigDir);
-        return disk is null ? null : MapProviders(disk);
-    }
-
-    private static IReadOnlyList<ProviderEntryView> MapProviders(IReadOnlyList<ProviderEntryOptions> entries)
-        => entries.Select(e => new ProviderEntryView(
-            e.Id ?? string.Empty,
-            e.Name ?? string.Empty,
-            e.Hosts ?? new List<string>(),
-            e.ProviderSlugs ?? new List<string>(),
-            e.Reason ?? string.Empty,
-            e.Severity ?? "info",
-            e.Until,
-            e.ZdrOnly,
-            e.DataCollectionDeny)).ToList();
 }

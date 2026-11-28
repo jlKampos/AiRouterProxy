@@ -7,6 +7,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>RedactorTests</RootNamespace>
     <AssemblyName>RedactorTests</AssemblyName>
+    <!-- The harness compiles Observability\IEventLogStore.cs (Windows-only EventLog API);
+         same suppression as the host (the store is replaced by UnavailableEventLogStore
+         on non-Windows). -->
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,6 +18,8 @@
     <Compile Include="..\..\src\AiRouterProxy\Detection\SecretRedactor.cs" Link="SecretRedactor.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Detection\DetectionFingerprint.cs" Link="Detection\DetectionFingerprint.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\DetectionStore.cs" Link="Observability\DetectionStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\IEventLogStore.cs" Link="Observability\IEventLogStore.cs" />
+    <Compile Include="..\..\src\AiRouterProxy\Observability\UnavailableEventLogStore.cs" Link="Observability\UnavailableEventLogStore.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\RedactionNotice.cs" Link="Observability\RedactionNotice.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Observability\NoticeInjector.cs" Link="NoticeInjector.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Routing\RouteResolver.cs" Link="RouteResolver.cs" />
@@ -57,13 +63,6 @@
     <Compile Include="..\..\src\AiRouterProxy\Transport\TransportCapture.cs" Link="Transport\TransportCapture.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Transport\AttestationRecorder.cs" Link="Transport\AttestationRecorder.cs" />
     <Compile Include="..\..\src\AiRouterProxy\Transport\EndpointProbe.cs" Link="Transport\EndpointProbe.cs" />
-    <!-- Phase 3 (provider blocklist + attribution): pure, no new dependencies. -->
-    <Compile Include="..\..\src\AiRouterProxy\Transport\ProviderBlocklist.cs" Link="Transport\ProviderBlocklist.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\Transport\ProviderBodyPolicy.cs" Link="Transport\ProviderBodyPolicy.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\Transport\AttributionExtractor.cs" Link="Transport\AttributionExtractor.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\Transport\AttributionStore.cs" Link="Transport\AttributionStore.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\Transport\AttestationOrigin.cs" Link="Transport\AttestationOrigin.cs" />
-    <Compile Include="..\..\src\AiRouterProxy\AdminValidation\ProviderFeedValidator.cs" Link="AdminValidation\ProviderFeedValidator.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AdminPaths.cs" Link="AdminPersistence\AdminPaths.cs" />
     <Compile Include="..\..\src\AiRouterProxy\AdminPersistence\AtomicJsonWriter.cs" Link="AdminPersistence\AtomicJsonWriter.cs" />
   </ItemGroup>

@@ -45,7 +45,7 @@
                         var idx = i;
                         var row = _rows[idx];
                         <tr>
-                            <td><input class="cell-input" @bind="row.Name" placeholder="route name" /></td>
+                            <td><input class="cell-input" @bind="row.Name" @bind:after="() => row.OnNameChanged()" placeholder="route name" /></td>
                             <td><input class="cell-input mono-cell" @bind="row.Prefix" placeholder="/openrouter" /></td>
                             <td><input class="cell-input wide" @bind="row.Upstream" placeholder="https://api.example.com" /></td>
                             <td>
@@ -77,6 +77,63 @@
                             </td>
                             <td>
                                 <button class="btn small" type="button" @onclick="() => RemoveRouteRow(idx)" title="Removes this row from the table. Saved when you click 'Save routes'.">Remove</button>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td colspan="9" style="padding: 0;">
+                                <details class="note" style="margin: 8px 12px;">
+                                    <summary>Headers (@row.Headers.Count) &middot; transport @(row.HasTransport ? "configured" : "none")</summary>
+
+                                    <div class="head-desc" style="margin: 0 0 6px 0;"><b>Static headers</b> - merged into every request on this route. Reserved names (Authorization, Content-Type, Content-Length, Transfer-Encoding, Accept, Host, Connection) are rejected on save.</div>
+                                    @if (row.Headers.Count == 0)
+                                    {
+                                        <div class="hint" style="margin-bottom: 8px;">No headers on this route.</div>
+                                    }
+                                    else
+                                    {
+                                        @for (var h = 0; h < row.Headers.Count; h++)
+                                        {
+                                            var hi = h;
+                                            var header = row.Headers[hi];
+                                            <div class="form-line" style="margin-bottom: 6px;">
+                                                <input class="cell-input" @bind="header.Name" @bind:after="() => row.HeadersTouched = true" placeholder="header-name" />
+                                                <input class="cell-input wide" @bind="header.Value" @bind:after="() => row.HeadersTouched = true" placeholder="value" />
+                                                <button class="btn small" type="button" @onclick="() => { row.Headers.RemoveAt(hi); row.HeadersTouched = true; }">Remove</button>
+                                            </div>
+                                        }
+                                    }
+                                    <button class="btn ghost small" type="button" @onclick="() => { row.Headers.Add(new HeaderRow()); row.HeadersTouched = true; }">+ Add header</button>
+
+                                    <div class="head-desc" style="margin: 18px 0 6px 0;"><b>Transport policy</b> - per-route attestation section. Only <b>Enabled</b> inherits the global switch; an empty Enforce becomes observe, an empty Grace becomes 7 days, an empty Probe disables probing, and empty Pins/Expected IPs add no constraint. Editing any field creates the section; a route without one stays without one. Set Enabled to off to disable the policy without removing it.</div>
+                                    <div class="form-line" style="margin-bottom: 6px;">
+                                        <label class="hint">Enabled</label>
+                                        <select class="cell-input" aria-label="Transport enabled (inherit global, on, off)" @bind="row.Transport.Enabled" @bind:after="() => row.MarkTransportTouched()">
+                                            <option value="">inherit global</option>
+                                            <option value="on">on</option>
+                                            <option value="off">off</option>
+                                        </select>
+                                        <label class="hint">Enforce</label>
+                                        <select class="cell-input" aria-label="Transport enforce mode (observe, warn, block)" @bind="row.Transport.Enforce" @bind:after="() => row.MarkTransportTouched()">
+                                            <option value="observe">observe</option>
+                                            <option value="warn">warn</option>
+                                            <option value="block">block</option>
+                                        </select>
+                                        <label class="hint">Grace (days)</label>
+                                        <input class="cell-input num" type="number" min="1" max="365" aria-label="Transport grace days (1-365)" @bind="row.Transport.GraceDays" @bind:after="() => row.MarkTransportTouched()" />
+                                        <label class="hint">Probe (hours)</label>
+                                        <input class="cell-input num" type="number" min="0" max="720" aria-label="Transport probe hours (0-720, 0 disables)" @bind="row.Transport.ProbeHours" @bind:after="() => row.MarkTransportTouched()" />
+                                    </div>
+                                    <div class="form-line" style="margin-bottom: 6px;">
+                                        <label class="hint">TLS floor</label>
+                                        <input class="cell-input" style="max-width: 110px;" aria-label="Transport TLS floor (1.2 or 1.3)" @bind="row.Transport.TlsFloor" @bind:after="() => row.MarkTransportTouched()" placeholder="1.2 / 1.3" />
+                                        <label class="hint">Pins</label>
+                                        <input class="cell-input wide" aria-label="Transport SPKI pins" @bind="row.Transport.Pins" @bind:after="() => row.MarkTransportTouched()" placeholder="SPKI fingerprints (space or comma separated)" />
+                                    </div>
+                                    <div class="form-line">
+                                        <label class="hint">Expected IPs</label>
+                                        <input class="cell-input wide" aria-label="Transport expected IPs or CIDRs" @bind="row.Transport.ExpectedIps" @bind:after="() => row.MarkTransportTouched()" placeholder="10.0.0.5 192.168.0.0/16 (space or comma separated)" />
+                                    </div>
+                                </details>
                             </td>
                         </tr>
                     }
@@ -573,18 +630,81 @@
         public string AllowedPaths = string.Empty;
         public string TimeoutMs = string.Empty;
         public string MaxBody = string.Empty;
-        public Dictionary<string, string> Headers = new(StringComparer.OrdinalIgnoreCase);
+        public List<HeaderRow> Headers = new();
+
+        // Name the row had when it was loaded from routes.json. The server preserves the
+        // optional sections by route NAME, so a rename must resend them (see OnNameChanged).
+        public string OriginalName = string.Empty;
+
+        // True once the operator adds, edits or removes a header on this row (or renames the
+        // route). A route left untouched sends Headers = null, so the server preserves
+        // whatever is on disk - no cosmetic "headers": {} and no lost update when routes.json
+        // changed elsewhere. Removing the last header still sets it, so "clear every header"
+        // sends {}.
+        public bool HeadersTouched;
+
+        // True when the route already has a transport section or the operator edited one of
+        // its fields. Drives the "configured" label only - the draft carries the section when
+        // TransportTouched is set.
+        public bool HasTransport;
+
+        // True when the operator edited a transport field (or renamed a route that has a
+        // section). An untouched section is not resent: Transport = null and the server
+        // preserves the stored node byte-for-byte. Turning the policy off is enabled=off
+        // (the section stays); null is never used to delete an existing section.
+        public bool TransportTouched;
+
+        public TransportRow Transport = new();
 
         public static RouteRow FromView(RouteView v) => new()
         {
             Name = v.Name,
+            OriginalName = v.Name,
             Prefix = v.Prefix,
             Upstream = v.Upstream,
             KeyRef = v.KeyRef,
             AllowedPaths = v.AllowedPaths.Count == 1 && v.AllowedPaths[0] == "*" ? string.Empty : string.Join(" ", v.AllowedPaths),
             TimeoutMs = v.RequestTimeoutMs > 0 ? v.RequestTimeoutMs.ToString() : string.Empty,
             MaxBody = v.MaxBodySize > 0 ? v.MaxBodySize.ToString() : string.Empty,
+            // Pre-fill the editor without marking HeadersTouched: an untouched row must send
+            // null so the server keeps the section currently in routes.json.
+            Headers = v.Headers is { Count: > 0 }
+                ? v.Headers.Select(h => new HeaderRow { Name = h.Key, Value = h.Value }).ToList()
+                : new List<HeaderRow>(),
+            Transport = TransportRow.From(v.Transport),
+            HasTransport = v.Transport is not null,
+            TransportTouched = false,
         };
+
+        /// <summary>
+        /// Called after the name field changes. A real rename resends the sections this route
+        /// already has: the server merges by route name, so a renamed draft with null sections
+        /// would lose them. Rows without a section stay without one (nothing to preserve).
+        /// </summary>
+        public void OnNameChanged()
+        {
+            if (!RouteEditRules.NameChanged(OriginalName, Name))
+            {
+                return;
+            }
+
+            if (Headers.Count > 0)
+            {
+                HeadersTouched = true;
+            }
+
+            if (HasTransport)
+            {
+                TransportTouched = true;
+            }
+        }
+
+        /// <summary>Marks the transport section as edited: it becomes visible and is sent.</summary>
+        public void MarkTransportTouched()
+        {
+            HasTransport = true;
+            TransportTouched = true;
+        }
 
         public RouteDraft ToDraft() => new(
             Name: Name?.Trim() ?? string.Empty,
@@ -594,11 +714,87 @@
             AllowedPaths: SplitPaths(AllowedPaths),
             RequestTimeoutMs: int.TryParse(TimeoutMs, out var t) ? Math.Max(0, t) : 0,
             MaxBodySize: long.TryParse(MaxBody, out var mb) ? Math.Max(0, mb) : 0,
-            Headers: Headers);
+            Headers: HeadersTouched ? BuildHeaders() : null,
+            Transport: TransportTouched ? Transport.ToDraft() : null);
+
+        /// <summary>
+        /// Concrete dictionary built from the edited rows (an empty dictionary clears the
+        /// route's headers). Only called when <see cref="HeadersTouched"/> is true.
+        /// </summary>
+        private Dictionary<string, string> BuildHeaders()
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var header in Headers)
+            {
+                var name = header.Name?.Trim();
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    map[name] = header.Value ?? string.Empty;
+                }
+            }
+
+            return map;
+        }
 
         private static List<string> SplitPaths(string? text)
             => string.IsNullOrWhiteSpace(text)
                 ? new List<string>()
                 : text.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
+        internal static List<string> SplitList(string? text)
+            => string.IsNullOrWhiteSpace(text)
+                ? new List<string>()
+                : text.Split(new[] { ' ', ',', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+    }
+
+    private sealed class HeaderRow
+    {
+        public string Name = string.Empty;
+        public string Value = string.Empty;
+    }
+
+    private sealed class TransportRow
+    {
+        // "" = inherit the global switch, "on" = true, "off" = false.
+        public string Enabled = string.Empty;
+        public string Enforce = "observe";
+        public string GraceDays = "7";
+        public string TlsFloor = string.Empty;
+        public string ProbeHours = string.Empty;
+        public string Pins = string.Empty;
+        public string ExpectedIps = string.Empty;
+
+        // Not editable on this page; carried through so a save never drops it.
+        public int? PoolLifetimeMinutes;
+
+        public static TransportRow From(RouteTransportDraft? t) => t is null
+            ? new TransportRow()
+            : new TransportRow
+            {
+                Enabled = t.Enabled is null ? string.Empty : t.Enabled.Value ? "on" : "off",
+                Enforce = string.IsNullOrWhiteSpace(t.Enforce) ? "observe" : t.Enforce,
+                GraceDays = t.GraceDays.ToString(),
+                TlsFloor = t.TlsFloor ?? string.Empty,
+                ProbeHours = t.ProbeHours > 0 ? t.ProbeHours.ToString() : string.Empty,
+                Pins = string.Join(" ", t.SafePins),
+                ExpectedIps = string.Join(" ", t.SafeExpectedIps),
+                PoolLifetimeMinutes = t.PoolLifetimeMinutes,
+            };
+
+        // Parsed values are passed through untouched: RouteValidator is the single source
+        // of rejection (an explicit "must be between 1 and 365" beats silently rewriting
+        // 400 to 365, which also kept the UI and the API from agreeing). Empty and
+        // unparseable inputs are therefore distinguished: an empty box means "use the
+        // default", while a non-integer is sent as -1 so the validator rejects it
+        // instead of the save quietly persisting a misleading default.
+        public RouteTransportDraft ToDraft() => new(
+            Enabled: Enabled switch { "on" => true, "off" => false, _ => null },
+            PoolLifetimeMinutes: PoolLifetimeMinutes,
+            ExpectedIps: RouteRow.SplitList(ExpectedIps),
+            TlsFloor: string.IsNullOrWhiteSpace(TlsFloor) ? null : TlsFloor.Trim(),
+            GraceDays: string.IsNullOrWhiteSpace(GraceDays) ? 7 : int.TryParse(GraceDays, out var g) ? g : -1,
+            Enforce: string.IsNullOrWhiteSpace(Enforce) ? "observe" : Enforce,
+            Pins: RouteRow.SplitList(Pins),
+            ProbeHours: string.IsNullOrWhiteSpace(ProbeHours) ? 0 : int.TryParse(ProbeHours, out var p) ? p : -1);
     }
 }

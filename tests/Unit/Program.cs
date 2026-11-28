@@ -10,7 +10,6 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using AiRouterProxy.AdminPersistence;
-using AiRouterProxy.AdminValidation;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using AIRouterProxy;
@@ -44,6 +43,7 @@ class Program
         TestExtendedDetection();
         TestRedactionGaps();
         TestConfigPaths();
+        TestEventLogUnavailable();
         TestRedactionAllow();
         TestBase64ImageExemption();
         TestPreviews();
@@ -77,11 +77,6 @@ class Program
         TestLearnedPinStore();
         TestAttestationRecorderPins();
         TestEndpointProbe();
-        TestProvidersFeed();
-        TestBlocklist();
-        TestProviderMerge();
-        TestAttribution();
-        TestOriginParse();
         Console.WriteLine();
         Console.WriteLine($"RESULT: {_passed} PASS, {_failed} FAIL");
         Environment.ExitCode = _failed == 0 ? 0 : 1;
@@ -631,11 +626,40 @@ class Program
 
             // "../" escapes back to the deploy root (one level above config)
             CheckTrue("cfg ../ escapes to root", () => ConfigPaths.ResolveFile("..\\proxy-cert.pem", cfg) == Path.Combine(tmp, "proxy-cert.pem"));
+
+            // AIROUTER_CONFIG_DIR override: a non-empty env value wins over the auto-detect
+            // (absolute values are kept, normalized with Path.GetFullPath).
+            var envCfg = Path.Combine(tmp, "custom-cfg");
+            CheckTrue("cfg env override wins", () => ConfigPaths.ResolveConfigDir(tmp, envCfg) == envCfg);
+            CheckTrue("cfg env override beats config/ folder", () => ConfigPaths.ResolveConfigDir(tmp, envCfg) != cfg);
+
+            // Empty / whitespace override -> ignored, auto-detect applies.
+            CheckTrue("cfg empty override ignored", () => ConfigPaths.ResolveConfigDir(tmp, "") == cfg);
+            CheckTrue("cfg whitespace override ignored", () => ConfigPaths.ResolveConfigDir(tmp, "   ") == cfg);
+
+            // Same for AIROUTER_DATA_DIR.
+            var envData = Path.Combine(tmp, "custom-data");
+            CheckTrue("data env override wins", () => DashboardPaths.ResolveDataDir(cfg, tmp, envData) == envData);
+            CheckTrue("data env override beats layout", () => DashboardPaths.ResolveDataDir(cfg, tmp, envData) != Path.Combine(tmp, "data"));
+            CheckTrue("data empty override ignored", () => DashboardPaths.ResolveDataDir(cfg, tmp, "  ") == Path.Combine(tmp, "data"));
+            CheckTrue("data deploy layout (next to config)", () => DashboardPaths.ResolveDataDir(cfg, tmp) == Path.Combine(tmp, "data"));
+            CheckTrue("data dev layout (under base)", () => DashboardPaths.ResolveDataDir(tmp, tmp) == Path.Combine(tmp, "data"));
         }
         finally
         {
             try { Directory.Delete(tmp, recursive: true); } catch { }
         }
+    }
+
+    // --------------------------------------------------------------
+    static void TestEventLogUnavailable()
+    {
+        // Non-Windows placeholder: no log, no entries, clearing is a no-op that never throws.
+        var store = new UnavailableEventLogStore();
+        CheckTrue("unavailable: exists false", () => !store.Exists("AIRouterProxy"));
+        CheckTrue("unavailable: exists false (any name)", () => !store.Exists("Whatever"));
+        CheckTrue("unavailable: count zero", () => store.Count("AIRouterProxy") == 0);
+        CheckTrue("unavailable: clear no-op", () => { store.Clear("AIRouterProxy"); return true; });
     }
 
     // --------------------------------------------------------------
@@ -3480,284 +3504,6 @@ class Program
         {
             try { Directory.Delete(root, recursive: true); } catch { /* cleanup only */ }
         }
-    }
-
-    // --------------------------------------------------------------
-    // Phase 3: provider blocklist (2 tiers), body merge, attribution
-    // and the aggregator-origin helpers. All metadata only.
-    // --------------------------------------------------------------
-
-    static ProviderEntryOptions Entry(string id, string? sev = null, string[]? hosts = null, string[]? slugs = null, DateTimeOffset? until = null, bool zdr = false, bool deny = false)
-        => new()
-        {
-            Id = id,
-            Name = "pv-" + id,
-            Hosts = hosts is null ? new List<string>() : new List<string>(hosts),
-            ProviderSlugs = slugs is null ? new List<string>() : new List<string>(slugs),
-            Severity = sev ?? "info",
-            Until = until,
-            ZdrOnly = zdr,
-            DataCollectionDeny = deny,
-        };
-
-    static RouteOptions BlocklistRoute(string upstream, string providerPolicy = "merge", bool enabled = true, bool allowBlocked = false, string[]? aggregators = null, bool attribution = false)
-        => new()
-        {
-            Name = "blk-route",
-            Prefix = "/blk",
-            Upstream = upstream,
-            Transport = new RouteTransportOptions
-            {
-                Enabled = true,
-                Blocklist = new RouteBlocklistOptions
-                {
-                    Enabled = enabled,
-                    AllowBlocked = allowBlocked,
-                    ProviderPolicy = providerPolicy,
-                    Aggregators = aggregators is null ? new List<string>() : new List<string>(aggregators),
-                    Attribution = attribution,
-                },
-            },
-        };
-
-    static void TestProvidersFeed()
-    {
-        // Empty / null feed: always valid (the feature defaults to off).
-        CheckTrue("feed: empty valid", () => ProviderFeedValidator.Validate(new List<ProviderEntryOptions>(), out _));
-        CheckTrue("feed: null valid", () => ProviderFeedValidator.Validate(null, out _));
-
-        var ok = new List<ProviderEntryOptions> { Entry("a", "warn", new[] { "bad.test" }, new[] { "openrouter/auto" }) };
-        CheckTrue("feed: valid entry", () => ProviderFeedValidator.Validate(ok, out _));
-
-        // id: required, unique, <= 64.
-        CheckTrue("feed: missing id rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { Entry("") }, out var e1) && e1.Count > 0);
-        var dup = new List<ProviderEntryOptions> { Entry("x"), Entry("x") };
-        CheckTrue("feed: duplicate id rejected", () => !ProviderFeedValidator.Validate(dup, out _));
-        var longId = Entry(new string('i', 65), "warn", new[] { "x.test" });
-        CheckTrue("feed: >64 id rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { longId }, out _));
-
-        // At least one of hosts / providerSlugs.
-        CheckTrue("feed: no hosts or slugs rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { Entry("n") }, out _));
-
-        // Severity whitelist.
-        var badSev = new List<ProviderEntryOptions> { Entry("s", "nuclear", new[] { "x.test" }) };
-        CheckTrue("feed: bad severity rejected", () => !ProviderFeedValidator.Validate(badSev, out _));
-
-        // List bounds: <= 32 entries, each <= 128 chars; no empties / duplicates.
-        var tooMany = Entry("many", "warn", Enumerable.Range(0, 40).Select(i => "h" + i + ".test").ToArray());
-        CheckTrue("feed: >32 hosts rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { tooMany }, out _));
-        var tooLong = Entry("long", "warn", new[] { new string('h', 200) + ".test" });
-        CheckTrue("feed: >128 host rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { tooLong }, out _));
-        var emptyHost = Entry("empty", "warn", new[] { "  " });
-        CheckTrue("feed: empty host rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { emptyHost }, out _));
-        var dupSlug = Entry("d", "warn", null, new[] { "s/1", "s/1" });
-        CheckTrue("feed: duplicate slug rejected", () => !ProviderFeedValidator.Validate(new List<ProviderEntryOptions> { dupSlug }, out _));
-    }
-
-    static void TestBlocklist()
-    {
-        var feed = new ProviderFeedOptions
-        {
-            Entries = new List<ProviderEntryOptions>
-            {
-                Entry("host-block", "block", new[] { "bad.test" }),
-                Entry("host-warn", "warn", new[] { "*.warny.test" }),
-                Entry("host-info", "info", new[] { "info.test" }),
-                Entry("slug-warn", "warn", null, new[] { "openrouter/auto", "openrouter/auto" }),
-                Entry("zdr", "info", null, new[] { "openrouter/zdr" }, zdr: true),
-                Entry("deny", "info", null, new[] { "openrouter/dc" }, deny: true),
-            },
-        };
-
-        // No route policy -> nothing applies (zero cost when off).
-        var noPolicy = ProviderBlocklist.DecideForRoute(new RouteOptions { Name = "r", Upstream = "https://bad.test" }, feed);
-        CheckTrue("blocklist: no policy = none", () => noPolicy == BlocklistDecision.None);
-
-        // Host tier: strongest severity wins + reasons collected.
-        var blocked = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://bad.test"), feed);
-        CheckTrue("blocklist: host block tier", () => blocked.HostTier == "block" && blocked.Reasons.Count > 0 && blocked.IsActive);
-
-        // Wildcard "*.domain" matches subdomains and the apex.
-        var wildcard = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://api.warny.test"), feed);
-        CheckTrue("blocklist: wildcard subdomain warn", () => wildcard.HostTier == "warn");
-        var apex = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://warny.test"), feed);
-        CheckTrue("blocklist: wildcard apex warn", () => apex.HostTier == "warn");
-
-        // Non-aggregator route: the provider tier stays silent.
-        var notAgg = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://ok.test"), feed);
-        CheckTrue("blocklist: non-aggregator has no slugs", () => notAgg.ProviderSlugsToIgnore.Count == 0 && !notAgg.RequireZdr);
-
-        // Aggregator route: >= warn slugs collected (deduped), flags from slug-matching entries.
-        var aggregator = BlocklistRoute("https://openrouter.ai", aggregators: new[] { "openrouter.ai" });
-        var decision = ProviderBlocklist.DecideForRoute(aggregator, feed);
-        CheckTrue("blocklist: aggregator slugs deduped", () => decision.ProviderSlugsToIgnore.Count == 1
-            && decision.ProviderSlugsToIgnore[0] == "openrouter/auto");
-        CheckTrue("blocklist: aggregator zdr+deny flags", () => decision.RequireZdr && decision.DenyDataCollection);
-
-        // Aggregator entries may be full URLs (host is extracted).
-        var zdrRoute = BlocklistRoute("https://openrouter.ai", aggregators: new[] { "https://openrouter.ai/api" });
-        CheckTrue("blocklist: aggregator url value", () => ProviderBlocklist.DecideForRoute(zdrRoute, feed).RequireZdr);
-
-        // Expired entries are ignored.
-        var expired = new ProviderFeedOptions
-        {
-            Entries = new List<ProviderEntryOptions>
-            {
-                Entry("old", "block", new[] { "expired.test" }, until: DateTimeOffset.UtcNow.AddMinutes(-1)),
-            },
-        };
-        var expiredDecision = ProviderBlocklist.DecideForRoute(BlocklistRoute("https://expired.test"), expired);
-        CheckTrue("blocklist: expired ignored", () => expiredDecision.HostTier == "none");
-
-        // HostOf: URL -> lowercased host; garbage/null -> empty.
-        CheckTrue("blocklist: host of url", () => ProviderBlocklist.HostOf("https://OpenRouter.AI/api") == "openrouter.ai");
-        CheckTrue("blocklist: host of garbage", () => ProviderBlocklist.HostOf("not a url") == string.Empty && ProviderBlocklist.HostOf(null) == string.Empty);
-
-        // AllowBlocked is middleware policy, not decision policy - the decision still says "block".
-        CheckTrue("blocklist: allowBlocked keeps block tier", () =>
-            ProviderBlocklist.DecideForRoute(BlocklistRoute("https://bad.test", allowBlocked: true), feed).HostTier == "block");
-    }
-
-    static void TestProviderMerge()
-    {
-        var slugs = new List<string> { "banned/provider" };
-        var decision = new BlocklistDecision("none", slugs, RequireZdr: true, DenyDataCollection: true, Reasons: new List<string>());
-        var policy = new RouteBlocklistOptions { Enabled = true };
-
-        // Client ignore list preserved; decision slugs appended (client first, stable order).
-        var input = Bytes("{\"model\":\"x\",\"provider\":{\"ignore\":[\"client/slug\"],\"zdr\":false},\"max_tokens\":5}");
-        var merged = ProviderBodyPolicy.MergeProvider(input, decision, policy);
-        CheckTrue("merge: union applied", () => !merged.Conflict && merged.Body is not null);
-        var node = JsonNode.Parse(merged.Body!)!;
-        var ignore = node["provider"]!["ignore"]!.AsArray().Select(x => x!.GetValue<string>()).ToList();
-        CheckTrue("merge: ignore client first", () => ignore.SequenceEqual(new[] { "client/slug", "banned/provider" }));
-        CheckTrue("merge: zdr forced true", () => node["provider"]!["zdr"]!.GetValue<bool>());
-        CheckTrue("merge: data_collection deny", () => node["provider"]!["data_collection"]!.GetValue<string>() == "deny");
-        CheckTrue("merge: other fields kept", () => node["max_tokens"]!.GetValue<int>() == 5 && node["model"]!.GetValue<string>() == "x");
-
-        // Byte-identical when nothing changes (client already carries the full policy).
-        var full = Bytes("{\"provider\":{\"ignore\":[\"client/slug\",\"banned/provider\"],\"zdr\":true,\"data_collection\":\"deny\"}}");
-        var noChange = ProviderBodyPolicy.MergeProvider(full, decision, policy);
-        CheckTrue("merge: byte-identical when nothing changes", () => !noChange.Conflict && full.SequenceEqual(noChange.Body));
-
-        // No provider-tier decision -> unchanged.
-        var nothing = ProviderBodyPolicy.MergeProvider(full, BlocklistDecision.None, policy);
-        CheckTrue("merge: none decision unchanged", () => nothing.Body.SequenceEqual(full));
-
-        // Policy off -> unchanged even with an active decision.
-        var off = ProviderBodyPolicy.MergeProvider(input, decision, new RouteBlocklistOptions { Enabled = false });
-        CheckTrue("merge: policy off unchanged", () => off.Body.SequenceEqual(input));
-
-        // Strict: provider.only with a blocked slug -> conflict, body untouched.
-        var strict = new RouteBlocklistOptions { Enabled = true, ProviderPolicy = "strict" };
-        var conflictBody = Bytes("{\"provider\":{\"only\":[\"banned/provider\"]}}");
-        var conflict = ProviderBodyPolicy.MergeProvider(conflictBody, decision, strict);
-        CheckTrue("merge: strict only conflict", () => conflict.Conflict && conflict.Reason is not null && conflict.Body.SequenceEqual(conflictBody));
-
-        // Strict: zdr:false while the policy requires zdr -> conflict.
-        var zdrConflict = ProviderBodyPolicy.MergeProvider(Bytes("{\"provider\":{\"zdr\":false}}"), decision, strict);
-        CheckTrue("merge: strict zdr conflict", () => zdrConflict.Conflict);
-
-        // Strict with a clean provider -> merge applies.
-        var cleanStrict = ProviderBodyPolicy.MergeProvider(Bytes("{\"provider\":{\"ignore\":[]}}"), decision, strict);
-        CheckTrue("merge: strict clean applies", () => !cleanStrict.Conflict
-            && JsonNode.Parse(cleanStrict.Body!)!["provider"]!["zdr"]!.GetValue<bool>());
-
-        // Invalid JSON -> unchanged (never crashes, never forwards garbage).
-        var bad = Bytes("{ nope");
-        var badMerge = ProviderBodyPolicy.MergeProvider(bad, decision, policy);
-        CheckTrue("merge: invalid json unchanged", () => badMerge.Body.SequenceEqual(bad));
-    }
-
-    static void TestAttribution()
-    {
-        // JSON: top-level provider wins when no endpoint is selected.
-        var json = Bytes("{\"id\":\"x\",\"provider\":\"OpenRouter (primary)\",\"openrouter_metadata\":{\"endpoints\":[{\"provider_name\":\"Provider B\",\"selected\":false}]}}");
-        var fromJson = AttributionExtractor.ExtractProviderFromJson(json);
-        CheckTrue("attribution: json top-level provider", () => fromJson.ServedBy == "OpenRouter (primary)"
-            && fromJson.Endpoints.Count == 1 && fromJson.Endpoints[0].Provider == "Provider B" && !fromJson.Endpoints[0].Selected);
-
-        // JSON: the selected endpoint wins over the top-level provider.
-        var selected = Bytes("{\"provider\":\"Provider A\",\"openrouter_metadata\":{\"endpoints\":[{\"provider_name\":\"Provider B\",\"selected\":true},{\"provider_name\":\"Provider C\",\"selected\":false}]}}");
-        CheckTrue("attribution: selected endpoint wins", () => AttributionExtractor.ExtractProviderFromJson(selected).ServedBy == "Provider B");
-
-        // Cache hit: metadata without endpoints -> top-level provider only.
-        var cached = Bytes("{\"id\":\"x\",\"provider\":\"OpenRouter\",\"openrouter_metadata\":{\"cache_hit\":true}}");
-        var fromCached = AttributionExtractor.ExtractProviderFromJson(cached);
-        CheckTrue("attribution: cache hit no endpoints", () => fromCached.ServedBy == "OpenRouter" && fromCached.Endpoints.Count == 0);
-
-        // No provider anywhere -> null (not an error).
-        CheckTrue("attribution: no provider null", () => AttributionExtractor.ExtractProviderFromJson(Bytes("{\"choices\":[]}")).ServedBy is null);
-        CheckTrue("attribution: blank name null", () => AttributionExtractor.NormalizeProviderName("  ") is null);
-
-        // Names bounded to 120 chars.
-        CheckTrue("attribution: name bounded", () => AttributionExtractor.NormalizeProviderName(new string('p', 300))!.Length == 120);
-
-        // SSE: last metadata event before [DONE] wins (selected endpoint name).
-        var sseBytes = Bytes(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
-            "data: {\"choices\":[{\"delta\":{}}],\"openrouter_metadata\":{\"endpoints\":[{\"provider_name\":\"Anthropic\",\"selected\":true}]}}\n\n" +
-            "data: [DONE]\n\n");
-        CheckTrue("attribution: sse selected provider", () => AttributionExtractor.ExtractProviderFromSseFinal(sseBytes) == "Anthropic");
-
-        // SSE without metadata (cache hit) -> null.
-        var sseCached = Bytes("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n");
-        CheckTrue("attribution: sse cache hit null", () => AttributionExtractor.ExtractProviderFromSseFinal(sseCached) is null);
-
-        // Store: metadata only, per-route cell, normalized on write.
-        var store = new AttributionStore();
-        store.Set("agg", "Provider X");
-        store.Set("agg", "  Provider Y  ");
-        store.Set("", "ignored");
-        CheckTrue("attribution-store: last wins per route", () => store.Get("agg") == "Provider Y" && store.Count == 1);
-        CheckTrue("attribution-store: snapshot", () => store.Snapshot()["agg"] == "Provider Y");
-    }
-
-    static void TestOriginParse()
-    {
-        // BuildGenerationUrl: base with a path stays; bare base gets /api inserted.
-        CheckTrue("origin: url with path", () => AttestationOrigin.BuildGenerationUrl("https://openrouter.ai/api", "gen-1")
-            == "https://openrouter.ai/api/v1/generation?id=gen-1");
-        CheckTrue("origin: bare url normalized + escaped", () => AttestationOrigin.BuildGenerationUrl("https://openrouter.ai", "gen 1")
-            == "https://openrouter.ai/api/v1/generation?id=gen%201");
-        CheckTrue("origin: empty base", () => AttestationOrigin.BuildGenerationUrl("", "x") == string.Empty);
-
-        // Strict ParseResponse: ONLY the whitelisted string fields survive.
-        var payload = Bytes("{\"provider_name\":\"OpenRouter\",\"model\":\"gpt-4o\",\"upstream_id\":\"gen-123\",\"secret\":\"s3cr3t\",\"details\":{\"x\":1}}");
-        var view = AttestationOrigin.ParseResponse(payload);
-        CheckTrue("origin: whitelist only", () => view is not null
-            && view!.ProviderName == "OpenRouter"
-            && view.Model == "gpt-4o"
-            && view.UpstreamId == "gen-123");
-
-        // Shape guards: no whitelisted fields / malformed / non-object / wrong types -> null.
-        CheckTrue("origin: no whitelisted fields null", () => AttestationOrigin.ParseResponse(Bytes("{\"full\":\"payload\"}")) is null);
-        CheckTrue("origin: malformed json null", () => AttestationOrigin.ParseResponse(Bytes("{ nope")) is null);
-        CheckTrue("origin: non-object null", () => AttestationOrigin.ParseResponse(Bytes("[1,2]")) is null);
-        CheckTrue("origin: non-string values null", () => AttestationOrigin.ParseResponse(Bytes("{\"provider_name\":42,\"model\":true}")) is null);
-
-        // FindAggregatorRoute: only routes whose host matches an aggregator + have a key.
-        var opts = new ProxyOptions
-        {
-            Keys = new KeyOptions { UpstreamKey = "upstream-key-not-a-secret-in-tests" },
-            RouteKeys = new Dictionary<string, string> { ["agg-key"] = "route-key-not-a-secret-in-tests" },
-            Routes = new List<RouteOptions>
-            {
-                new RouteOptions { Name = "plain", Prefix = "/p", Upstream = "https://plain.test" },
-                new RouteOptions
-                {
-                    Name = "agg", Prefix = "/a", Upstream = "https://openrouter.ai/api", KeyRef = "agg-key",
-                    Transport = new RouteTransportOptions
-                    {
-                        Enabled = true,
-                        Blocklist = new RouteBlocklistOptions { Enabled = true, Aggregators = new List<string> { "openrouter.ai" } },
-                    },
-                },
-            },
-        };
-        var found = AttestationOrigin.FindAggregatorRoute(opts, new List<string> { "openrouter.ai" });
-        CheckTrue("origin: aggregator route found", () => found is not null && found!.Name == "agg");
-        CheckTrue("origin: no matching route null", () => AttestationOrigin.FindAggregatorRoute(opts, new List<string> { "other.ai" }) is null);
     }
 
     sealed class TestOptionsMonitor<T> : IOptionsMonitor<T>

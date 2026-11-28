@@ -4,7 +4,9 @@
 {
     @if (r.Ok)
     {
-        <div class="note good" role="alert">
+        @* Warnings mean "applied, but something is inactive/incomplete" - an amber note instead
+           of the plain green success so the operator does not read it as a clean result. *@
+        <div class="note @(r.Warnings is { Length: > 0 } ? "amber" : "good")" role="alert">
             <b>@Title</b> @r.Message
             @if (r.Warnings is { Length: > 0 })
             {
